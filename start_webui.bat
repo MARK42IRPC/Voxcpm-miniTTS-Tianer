@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
     echo VoxCPM virtual environment was not found.
-    echo Expected: %CD%\.venv\Scripts\python.exe
+    echo Run install_and_start.bat for the first installation.
     pause
     exit /b 1
 )

@@ -1,5 +1,7 @@
 <h2 align="center">VoxCPM2：基于连续表征的多语言语音合成、创意音色设计与高保真声音克隆</h2>
 
+> **VoxCPM miniTTS 本地工作台：** Windows 用户首次使用请双击 `install_and_start.bat`，按提示选择轻量、推荐或完整模型集。安装完成后，日常启动只需双击 `start_webui.bat`。安装器可重复运行，已完整安装的依赖和模型会自动跳过。详见 [Windows 一键安装](INSTALL_ZH.md)。
+
 <p align="center">
   <a href="./README.md">English</a> | <b>中文</b>
 </p>

@@ -1,5 +1,7 @@
 <h2 align="center">VoxCPM2: Tokenizer-Free TTS for Multilingual Speech Generation, Creative Voice Design, and True-to-Life Cloning</h2>
 
+> **VoxCPM miniTTS local studio:** On Windows, run `install_and_start.bat` for the first installation and select a model profile. Use `start_webui.bat` for later launches. The installer is resumable and skips complete dependencies and models. See the [Windows installation guide](INSTALL_ZH.md).
+
 <p align="center">
   <b>English</b> | <a href="./README_zh.md">中文</a>
 </p>
