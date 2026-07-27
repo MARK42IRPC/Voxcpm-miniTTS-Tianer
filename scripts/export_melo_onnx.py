@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+import onnx
+import torch
+from onnxruntime.quantization import QuantType, quantize_dynamic
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MELO_ROOT = ROOT / "third_party" / "MeloTTS"
+sys.path.insert(0, str(MELO_ROOT))
+
+from melo.models import SynthesizerTrn
+from melo.text import language_id_map
+from melo.utils import get_hparams_from_file
+
+
+class SherpaMeloWrapper(torch.nn.Module):
+    def __init__(self, model: SynthesizerTrn) -> None:
+        super().__init__()
+        self.model = model
+        self.lang_id = language_id_map["ZH_MIX_EN"]
+
+    def forward(
+        self,
+        x,
+        x_lengths,
+        tones,
+        sid,
+        noise_scale,
+        length_scale,
+        noise_scale_w,
+    ):
+        bert = torch.zeros(x.shape[0], 1024, x.shape[1], dtype=torch.float32)
+        ja_bert = torch.zeros(x.shape[0], 768, x.shape[1], dtype=torch.float32)
+        language = torch.zeros_like(x)
+        language[:, 1::2] = self.lang_id
+        return self.model.infer(
+            x=x,
+            x_lengths=x_lengths,
+            sid=sid,
+            tone=tones,
+            language=language,
+            bert=bert,
+            ja_bert=ja_bert,
+            noise_scale=noise_scale,
+            noise_scale_w=noise_scale_w,
+            length_scale=length_scale,
+        )[0]
+
+
+def _metadata(model_path: Path, values: dict[str, Any]) -> None:
+    model = onnx.load(model_path)
+    while model.metadata_props:
+        model.metadata_props.pop()
+    for key, value in values.items():
+        prop = model.metadata_props.add()
+        prop.key = key
+        prop.value = str(value)
+    onnx.save(model, model_path)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--int8", action="store_true")
+    args = parser.parse_args()
+
+    hps = get_hparams_from_file(str(args.config.resolve()))
+    model = SynthesizerTrn(
+        len(hps.symbols),
+        hps.data.filter_length // 2 + 1,
+        hps.train.segment_size // hps.data.hop_length,
+        n_speakers=hps.data.n_speakers,
+        num_tones=hps.num_tones,
+        num_languages=hps.num_languages,
+        **hps.model,
+    ).cpu()
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    model.eval()
+    model.dec.remove_weight_norm()
+    wrapper = SherpaMeloWrapper(model)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    fp32_path = args.output.with_name(f"{args.output.stem}.fp32.onnx") if args.int8 else args.output
+    if args.int8:
+        fp32_path.unlink(missing_ok=True)
+    x = torch.randint(0, 10, (1, 60), dtype=torch.int64)
+    x_lengths = torch.tensor([60], dtype=torch.int64)
+    tones = torch.zeros_like(x)
+    sid = torch.tensor([1], dtype=torch.int64)
+    scale = torch.tensor([1.0], dtype=torch.float32)
+    try:
+        torch.onnx.export(
+            wrapper,
+            (x, x_lengths, tones, sid, scale, scale, scale),
+            str(fp32_path),
+            opset_version=18,
+            dynamo=False,
+            input_names=["x", "x_lengths", "tones", "sid", "noise_scale", "length_scale", "noise_scale_w"],
+            output_names=["y"],
+            dynamic_axes={
+                "x": {0: "N", 1: "L"},
+                "x_lengths": {0: "N"},
+                "tones": {0: "N", 1: "L"},
+                "y": {0: "N", 1: "S", 2: "T"},
+            },
+        )
+        metadata = {
+            "model_type": "melo-vits",
+            "comment": "melo fine-tuned by VoxCPM distiller",
+            "version": 2,
+            "language": "Chinese + English",
+            "add_blank": int(hps.data.add_blank),
+            "n_speakers": 1,
+            "jieba": 1,
+            "sample_rate": hps.data.sampling_rate,
+            "bert_dim": 1024,
+            "ja_bert_dim": 768,
+            "speaker_id": 1,
+            "lang_id": language_id_map["ZH_MIX_EN"],
+            "tone_start": 0,
+            "url": "https://github.com/myshell-ai/MeloTTS",
+            "license": "MIT",
+            "description": "MeloTTS fine-tuned by VoxCPM distiller",
+            "onnx.infer": "onnxruntime.quant",
+        }
+        _metadata(fp32_path, metadata)
+        if args.int8:
+            quantize_dynamic(
+                str(fp32_path),
+                str(args.output),
+                weight_type=QuantType.QInt8,
+                op_types_to_quantize=["Conv", "MatMul", "Gather"],
+            )
+            _metadata(args.output, metadata)
+    finally:
+        if args.int8:
+            fp32_path.unlink(missing_ok=True)
+    print(json.dumps({"output": str(args.output), "size": args.output.stat().st_size}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

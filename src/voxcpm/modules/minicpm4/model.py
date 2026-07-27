@@ -6,6 +6,14 @@ import math
 from .cache import StaticKVCache
 
 
+def stable_scaled_dot_product_attention(query, key, value, **kwargs):
+    if query.device.type == "cuda":
+        # Fused BF16 SDPA drift compounds across the autoregressive audio loop.
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            return torch.nn.functional.scaled_dot_product_attention(query, key, value, **kwargs)
+    return torch.nn.functional.scaled_dot_product_attention(query, key, value, **kwargs)
+
+
 def rms_layernorm(hidden: torch.Tensor, weight: torch.Tensor, eps: float):
     old_dtype = hidden.dtype
     variance = hidden.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -154,7 +162,7 @@ class MiniCPMAttention(nn.Module):
         query_states = query_states.contiguous()
         key_states = key_states.contiguous()
         value_states = value_states.contiguous()
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output = stable_scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
@@ -205,7 +213,7 @@ class MiniCPMAttention(nn.Module):
         query_states = query_states.contiguous()
         key_cache = key_cache.contiguous()
         value_cache = value_cache.contiguous()
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
+        attn_output = stable_scaled_dot_product_attention(
             query_states,
             key_cache,
             value_cache,

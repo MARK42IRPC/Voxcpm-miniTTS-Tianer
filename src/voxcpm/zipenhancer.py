@@ -8,6 +8,8 @@ Related dependencies are imported only when denoising functionality is needed.
 import os
 import tempfile
 from typing import Optional
+import soundfile as sf
+import torch
 import torchaudio
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
@@ -16,14 +18,20 @@ from modelscope.utils.constant import Tasks
 class ZipEnhancer:
     """ZipEnhancer Audio Denoising Enhancer"""
 
-    def __init__(self, model_path: str = "iic/speech_zipenhancer_ans_multiloss_16k_base"):
+    def __init__(
+        self,
+        model_path: str = "iic/speech_zipenhancer_ans_multiloss_16k_base",
+        device: str | None = None,
+    ):
         """
         Initialize ZipEnhancer
         Args:
             model_path: ModelScope model path or local path
+            device: Optional ModelScope runtime device such as ``"cpu"`` or ``"gpu"``
         """
         self.model_path = model_path
-        self._pipeline = pipeline(Tasks.acoustic_noise_suppression, model=self.model_path)
+        self.device = device
+        self._pipeline = pipeline(Tasks.acoustic_noise_suppression, model=self.model_path, device=device)
 
     def _normalize_loudness(self, wav_path: str):
         """
@@ -32,10 +40,11 @@ class ZipEnhancer:
         Args:
             wav_path: Audio file path
         """
-        audio, sr = torchaudio.load(wav_path)
+        audio_array, sr = sf.read(wav_path, dtype="float32", always_2d=True)
+        audio = torch.from_numpy(audio_array.T)
         loudness = torchaudio.functional.loudness(audio, sr)
         normalized_audio = torchaudio.functional.gain(audio, -20 - loudness)
-        torchaudio.save(wav_path, normalized_audio, sr)
+        sf.write(wav_path, normalized_audio.T.cpu().numpy(), sr)
 
     def enhance(self, input_path: str, output_path: Optional[str] = None, normalize_loudness: bool = True) -> str:
         """

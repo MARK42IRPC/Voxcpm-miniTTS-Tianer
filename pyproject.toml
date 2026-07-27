@@ -25,8 +25,11 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.5.0",
-    "torchaudio>=2.5.0",
+    "torch==2.10.0; sys_platform == 'win32'",
+    "torch>=2.5.0; sys_platform != 'win32'",
+    "torchaudio==2.10.0; sys_platform == 'win32'",
+    "torchaudio>=2.5.0; sys_platform != 'win32'",
+    "triton-windows==3.6.0.post26; sys_platform == 'win32'",
     "torchcodec",
     "transformers>=4.36.2",
     "einops",
@@ -47,8 +50,17 @@ dependencies = [
     "funasr",
     "spaces",
     "argbind",
-    "safetensors"
-
+    "safetensors",
+    "pedalboard>=0.9,<1",
+    "pyloudnorm>=0.1,<1",
+    "piper-tts[train,zh]>=1.6.0",
+    "sherpa-onnx>=1.13.4",
+    "pypinyin>=0.55.0",
+    "cn2an>=0.5.24",
+    "loguru>=0.7.3",
+    "g2p-en>=2.1.0",
+    "num2words>=0.5.14",
+    "pykakasi>=2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -81,6 +93,19 @@ include = ["voxcpm*"]
 
 [tool.setuptools_scm]
 version_scheme = "post-release"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.black]
 line-length = 120

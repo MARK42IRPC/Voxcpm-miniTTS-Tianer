@@ -4,6 +4,7 @@ import re
 import json
 import tempfile
 import numpy as np
+import torch
 from typing import Generator, Optional
 from huggingface_hub import snapshot_download
 from .model.voxcpm import VoxCPMModel, LoRAConfig
@@ -21,6 +22,7 @@ class VoxCPM:
         device: str | None = None,
         lora_config: Optional[LoRAConfig] = None,
         lora_weights_path: Optional[str] = None,
+        denoiser_device: str | None = None,
     ):
         """Initialize VoxCPM TTS pipeline.
 
@@ -35,10 +37,15 @@ class VoxCPM:
             device: Runtime device. If set to ``None`` or ``"auto"``, VoxCPM
                 will choose automatically (preferring CUDA, then MPS, then CPU).
                 If set explicitly, that device is used or a clear error is raised.
+                ``"hybrid"`` keeps language and prompt conditioning on CPU
+                and runs the VoxCPM2 diffusion decoder on CUDA. ``"hybrid-max"``
+                additionally moves the base LM to CUDA, with less deterministic
+                autoregressive output.
             lora_config: LoRA configuration for fine-tuning. If lora_weights_path is
                 provided without lora_config, a default config will be created.
             lora_weights_path: Path to pre-trained LoRA weights (.pth file or directory
                 containing lora_weights.ckpt). If provided, LoRA weights will be loaded.
+            denoiser_device: Optional explicit device for ZipEnhancer.
         """
         print(
             f"voxcpm_model_path: {voxcpm_model_path}, zipenhancer_model_path: {zipenhancer_model_path}, enable_denoiser: {enable_denoiser}",
@@ -62,16 +69,35 @@ class VoxCPM:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         arch = config.get("architecture", "voxcpm").lower()
+        device_mode = (device or "").strip().lower()
+        hybrid = device_mode in {"hybrid", "hybrid-max"}
+        model_device = "cpu" if hybrid else device
 
         if arch == "voxcpm2":
             self.tts_model = VoxCPM2Model.from_local(
                 voxcpm_model_path,
-                optimize=optimize,
-                device=device,
+                optimize=optimize and not hybrid,
+                device=model_device,
                 lora_config=lora_config,
             )
+            if hybrid:
+                self.tts_model.enable_hybrid_inference(
+                    "cuda",
+                    cache_length=2048,
+                    accelerate_base_lm=device_mode == "hybrid-max",
+                    accelerate_residual_lm=False,
+                    residual_cache_length=8192,
+                    # Reference continuation is highly sensitive to feature
+                    # encoder drift; keep this autoregressive boundary on CPU.
+                    accelerate_feat_encoder=False,
+                    accelerate_vae_decoder=device_mode == "hybrid",
+                )
+                if optimize and device_mode == "hybrid":
+                    self.tts_model.optimize_hybrid_decoder()
             print("Loaded VoxCPM2Model", file=sys.stderr)
         elif arch == "voxcpm":
+            if hybrid:
+                raise ValueError("Hybrid inference is only supported by VoxCPM2")
             self.tts_model = VoxCPMModel.from_local(
                 voxcpm_model_path,
                 optimize=optimize,
@@ -91,17 +117,21 @@ class VoxCPM:
         self.text_normalizer = None
         self.denoiser = None
         if enable_denoiser and zipenhancer_model_path is not None:
-            from .zipenhancer import ZipEnhancer
-
-            self.denoiser = ZipEnhancer(zipenhancer_model_path)
-        else:
-            self.denoiser = None
+            self.ensure_denoiser(zipenhancer_model_path, device=denoiser_device)
         if optimize:
             print("Warm up VoxCPMModel...", file=sys.stderr)
             self.tts_model.generate(
                 target_text="Hello, this is the first test sentence.",
                 max_len=10,
             )
+
+    def ensure_denoiser(self, model_path: str, device: str | None = None):
+        """Load ZipEnhancer once and retain it across subsequent requests."""
+        if self.denoiser is None:
+            from .zipenhancer import ZipEnhancer
+
+            self.denoiser = ZipEnhancer(model_path, device=device)
+        return self.denoiser
 
     @classmethod
     def from_pretrained(
@@ -115,6 +145,7 @@ class VoxCPM:
         device: str | None = None,
         lora_config: Optional[LoRAConfig] = None,
         lora_weights_path: Optional[str] = None,
+        denoiser_device: str | None = None,
         **kwargs,
     ):
         """Instantiate ``VoxCPM`` from a Hugging Face Hub snapshot.
@@ -130,13 +161,14 @@ class VoxCPM:
                 to download.
             device: Runtime device. Use ``None``/``"auto"`` for automatic
                 fallback, or an explicit value such as ``"cpu"``, ``"mps"``,
-                ``"cuda"``, or ``"cuda:0"``.
+                ``"cuda"``, ``"cuda:0"``, ``"hybrid"``, or ``"hybrid-max"``.
             lora_config: LoRA configuration for fine-tuning. If lora_weights_path is
                 provided without lora_config, a default config will be created with
                 enable_lm=True and enable_dit=True.
             lora_weights_path: Path to pre-trained LoRA weights (.pth file or directory
                 containing lora_weights.ckpt). If provided, LoRA weights will be loaded
                 after model initialization.
+            denoiser_device: Optional explicit device for ZipEnhancer.
         Kwargs:
             Additional keyword arguments passed to the ``VoxCPM`` constructor.
 
@@ -169,6 +201,7 @@ class VoxCPM:
             enable_denoiser=load_denoiser,
             optimize=optimize,
             device=device,
+            denoiser_device=denoiser_device,
             lora_config=lora_config,
             lora_weights_path=lora_weights_path,
             **kwargs,
@@ -179,6 +212,70 @@ class VoxCPM:
 
     def generate_streaming(self, *args, **kwargs) -> Generator[np.ndarray, None, None]:
         return self._generate(*args, streaming=True, **kwargs)
+
+    def build_prompt_cache(
+        self,
+        prompt_wav_path: str = None,
+        prompt_text: str = None,
+        reference_wav_path: str = None,
+        denoise: bool = False,
+    ) -> dict:
+        """Encode reusable prompt/reference audio features for generation."""
+        if prompt_wav_path is not None and not os.path.exists(prompt_wav_path):
+            raise FileNotFoundError(f"prompt_wav_path does not exist: {prompt_wav_path}")
+        if reference_wav_path is not None and not os.path.exists(reference_wav_path):
+            raise FileNotFoundError(f"reference_wav_path does not exist: {reference_wav_path}")
+        if (prompt_wav_path is None) != (prompt_text is None):
+            raise ValueError("prompt_wav_path and prompt_text must both be provided or both be None")
+        if prompt_wav_path is None and reference_wav_path is None:
+            raise ValueError("At least one prompt/reference audio path must be provided")
+
+        is_v2 = isinstance(self.tts_model, VoxCPM2Model)
+        if reference_wav_path is not None and not is_v2:
+            raise ValueError("reference_wav_path is only supported with VoxCPM2 models")
+
+        temp_files = []
+        actual_prompt_path = prompt_wav_path
+        actual_ref_path = reference_wav_path
+        try:
+            if denoise and self.denoiser is not None:
+                if prompt_wav_path is not None:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                        temp_files.append(tmp.name)
+                    self.denoiser.enhance(prompt_wav_path, output_path=temp_files[-1])
+                    actual_prompt_path = temp_files[-1]
+                if reference_wav_path is not None:
+                    same_source = (
+                        prompt_wav_path is not None
+                        and os.path.abspath(reference_wav_path) == os.path.abspath(prompt_wav_path)
+                    )
+                    if same_source:
+                        actual_ref_path = actual_prompt_path
+                    else:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                            temp_files.append(tmp.name)
+                        self.denoiser.enhance(reference_wav_path, output_path=temp_files[-1])
+                        actual_ref_path = temp_files[-1]
+                if torch.cuda.is_available() and getattr(self.denoiser, "device", None) == "gpu":
+                    torch.cuda.empty_cache()
+
+            if is_v2:
+                return self.tts_model.build_prompt_cache(
+                    prompt_text=prompt_text,
+                    prompt_wav_path=actual_prompt_path,
+                    reference_wav_path=actual_ref_path,
+                )
+            return self.tts_model.build_prompt_cache(
+                prompt_text=prompt_text,
+                prompt_wav_path=actual_prompt_path,
+            )
+        finally:
+            for tmp_path in temp_files:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
     def _generate(
         self,
@@ -197,6 +294,7 @@ class VoxCPM:
         retry_badcase_ratio_threshold: float = 6.0,
         streaming: bool = False,
         seed: Optional[int] = None,
+        prompt_cache: dict = None,
     ) -> Generator[np.ndarray, None, None]:
         """Synthesize speech for the given text and return a single waveform.
 
@@ -220,6 +318,8 @@ class VoxCPM:
             retry_badcase_ratio_threshold: Threshold for audio-to-text ratio.
             streaming: Whether to return a generator of audio chunks.
             seed: Optional random seed for reproducibility.
+            prompt_cache: Optional cache returned by ``build_prompt_cache``.
+                When provided, audio paths and denoising are skipped.
         Returns:
             Generator of numpy.ndarray: 1D waveform array (float32) on CPU.
             Yields audio chunks for each generation step if ``streaming=True``,
@@ -227,6 +327,9 @@ class VoxCPM:
         """
         if not isinstance(text, str) or not text.strip():
             raise ValueError("target text must be a non-empty string")
+
+        if prompt_cache is not None and (prompt_wav_path is not None or reference_wav_path is not None):
+            raise ValueError("prompt_cache cannot be combined with prompt/reference audio paths")
 
         if prompt_wav_path is not None:
             if not os.path.exists(prompt_wav_path):
@@ -245,77 +348,48 @@ class VoxCPM:
 
         text = text.replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
-        temp_files = []
-
-        try:
-            actual_prompt_path = prompt_wav_path
-            actual_ref_path = reference_wav_path
-
-            if denoise and self.denoiser is not None:
-                if prompt_wav_path is not None:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                        temp_files.append(tmp.name)
-                    self.denoiser.enhance(prompt_wav_path, output_path=temp_files[-1])
-                    actual_prompt_path = temp_files[-1]
-                if reference_wav_path is not None:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                        temp_files.append(tmp.name)
-                    self.denoiser.enhance(reference_wav_path, output_path=temp_files[-1])
-                    actual_ref_path = temp_files[-1]
-
-            if actual_prompt_path is not None or actual_ref_path is not None:
-                if is_v2:
-                    fixed_prompt_cache = self.tts_model.build_prompt_cache(
-                        prompt_text=prompt_text,
-                        prompt_wav_path=actual_prompt_path,
-                        reference_wav_path=actual_ref_path,
-                    )
-                else:
-                    fixed_prompt_cache = self.tts_model.build_prompt_cache(
-                        prompt_text=prompt_text,
-                        prompt_wav_path=actual_prompt_path,
-                    )
-            else:
-                fixed_prompt_cache = None
-
-            if normalize:
-                if self.text_normalizer is None:
-                    from .utils.text_normalize import TextNormalizer
-
-                    self.text_normalizer = TextNormalizer()
-                text = self.text_normalizer.normalize(text)
-
-            generate_result = self.tts_model._generate_with_prompt_cache(
-                target_text=text,
-                prompt_cache=fixed_prompt_cache,
-                min_len=min_len,
-                max_len=max_len,
-                inference_timesteps=inference_timesteps,
-                cfg_value=cfg_value,
-                retry_badcase=retry_badcase,
-                retry_badcase_max_times=retry_badcase_max_times,
-                retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-                streaming=streaming,
-                seed=seed,
+        if prompt_cache is not None:
+            fixed_prompt_cache = prompt_cache
+        elif prompt_wav_path is not None or reference_wav_path is not None:
+            fixed_prompt_cache = self.build_prompt_cache(
+                prompt_text=prompt_text,
+                prompt_wav_path=prompt_wav_path,
+                reference_wav_path=reference_wav_path,
+                denoise=denoise,
             )
+        else:
+            fixed_prompt_cache = None
 
-            if streaming:
-                try:
-                    for wav, _, _ in generate_result:
-                        yield wav.squeeze(0).cpu().numpy()
-                finally:
-                    generate_result.close()
-            else:
-                wav, _, _ = next_and_close(generate_result)
-                yield wav.squeeze(0).cpu().numpy()
+        if normalize:
+            if self.text_normalizer is None:
+                from .utils.text_normalize import TextNormalizer
 
-        finally:
-            for tmp_path in temp_files:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+                self.text_normalizer = TextNormalizer()
+            text = self.text_normalizer.normalize(text)
+
+        generate_result = self.tts_model._generate_with_prompt_cache(
+            target_text=text,
+            prompt_cache=fixed_prompt_cache,
+            min_len=min_len,
+            max_len=max_len,
+            inference_timesteps=inference_timesteps,
+            cfg_value=cfg_value,
+            retry_badcase=retry_badcase,
+            retry_badcase_max_times=retry_badcase_max_times,
+            retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
+            streaming=streaming,
+            seed=seed,
+        )
+
+        if streaming:
+            try:
+                for wav, _, _ in generate_result:
+                    yield wav.squeeze(0).cpu().numpy()
+            finally:
+                generate_result.close()
+        else:
+            wav, _, _ = next_and_close(generate_result)
+            yield wav.squeeze(0).cpu().numpy()
 
     # ------------------------------------------------------------------ #
     # LoRA Interface (delegated to VoxCPMModel)

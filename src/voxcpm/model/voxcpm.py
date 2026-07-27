@@ -25,6 +25,7 @@ from typing import Tuple, Union, Generator, List, Optional
 import torch
 import torch.nn as nn
 import torchaudio
+import soundfile as sf
 import warnings
 from einops import rearrange
 from pydantic import BaseModel
@@ -53,6 +54,11 @@ from .utils import (
     pick_runtime_dtype,
     resolve_runtime_device,
 )
+
+
+def _load_audio(path: str) -> tuple[torch.Tensor, int]:
+    audio_array, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    return torch.from_numpy(audio_array.T), sample_rate
 
 
 class VoxCPMEncoderConfig(BaseModel):
@@ -411,7 +417,7 @@ class VoxCPMModel(nn.Module):
             )
             text_length = text_token.shape[0]
 
-            audio, sr = torchaudio.load(prompt_wav_path)
+            audio, sr = _load_audio(prompt_wav_path)
             if audio.size(0) > 1:
                 audio = audio.mean(dim=0, keepdim=True)
 
@@ -525,7 +531,7 @@ class VoxCPMModel(nn.Module):
             raise ValueError("prompt_text and prompt_wav_path are required")
 
         # load audio
-        audio, sr = torchaudio.load(prompt_wav_path)
+        audio, sr = _load_audio(prompt_wav_path)
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
 

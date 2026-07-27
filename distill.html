@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoxCPM 学生模型蒸馏</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f4f6f7;
+      --surface: #fff;
+      --surface-muted: #eef1f2;
+      --ink: #171a1c;
+      --muted: #657078;
+      --line: #d9dfe2;
+      --line-strong: #b9c3c8;
+      --green: #147a55;
+      --green-hover: #0f6848;
+      --teal: #147684;
+      --red: #b43b3b;
+      --amber: #9a6814;
+      --shadow: 0 12px 30px rgba(25, 35, 40, .08);
+    }
+    * { box-sizing: border-box; }
+    html, body { overflow-x: hidden; }
+    body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--canvas); color: var(--ink); font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; letter-spacing: 0; }
+    button, input, select, textarea { min-width: 0; max-width: 100%; font: inherit; letter-spacing: 0; }
+    button, label, select { cursor: pointer; }
+    .topbar { height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 24px; background: var(--surface); border-bottom: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand img { width: 34px; height: 34px; object-fit: contain; }
+    .brand strong { font-size: 17px; white-space: nowrap; }
+    .top-actions { display: flex; align-items: center; gap: 16px; }
+    .nav { display: flex; align-items: center; gap: 4px; padding: 3px; background: var(--surface-muted); border-radius: 6px; }
+    .nav a { padding: 7px 12px; border-radius: 4px; color: var(--muted); font-size: 13px; text-decoration: none; }
+    .nav a.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20, 28, 32, .12); }
+    .device-status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa3a8; }
+    .status-dot.ready { background: var(--green); }
+    .status-dot.running { background: var(--teal); }
+    .status-dot.error { background: var(--red); }
+    .status-dot.warning { background: var(--amber); }
+    main { width: 100%; max-width: 1500px; margin: 0 auto; padding: 24px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 430px; align-items: start; gap: 20px; }
+    .workbench, .side-panel { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); overflow: hidden; }
+    .section { padding: 22px 24px; }
+    .section + .section { border-top: 1px solid var(--line); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .section-title { margin: 0; font-size: 14px; }
+    .section-state { color: var(--muted); font-size: 12px; }
+    .field { display: grid; gap: 7px; min-width: 0; }
+    .field label { font-size: 12px; font-weight: 650; }
+    .field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .field-grid + .field-grid { margin-top: 14px; }
+    .student-family { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 4px; margin-bottom: 18px; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-muted); }
+    .student-family button { min-height: 42px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .student-family button.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 5px rgba(20, 28, 32, .14); }
+    .student-family button:disabled { cursor: not-allowed; opacity: .55; }
+    .section.inactive { background: #fafbfb; }
+    .engine-hidden { display: none !important; }
+    .model-row, .dataset-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; }
+    input[type="text"], input[type="number"], select, textarea { width: 100%; border: 1px solid #c9d0d4; border-radius: 6px; background: var(--surface); color: var(--ink); outline: none; }
+    input[type="text"], input[type="number"], select { height: 40px; padding: 0 11px; }
+    textarea { min-height: 92px; padding: 10px 11px; resize: vertical; line-height: 1.55; }
+    input:focus, select:focus, textarea:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 118, 132, .12); }
+    input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: .58; }
+    .secondary, .primary, .danger, .download-button { height: 40px; display: inline-flex; align-items: center; justify-content: center; padding: 0 14px; border-radius: 6px; font-size: 12px; font-weight: 700; text-decoration: none; white-space: nowrap; }
+    .secondary { border: 1px solid var(--line-strong); background: var(--surface); color: var(--teal); }
+    .secondary:hover { border-color: var(--teal); }
+    .primary { border: 0; background: var(--green); color: #fff; }
+    .primary:hover { background: var(--green-hover); }
+    .danger { border: 1px solid #d8b7b7; background: #fff; color: var(--red); }
+    .download-button { border: 1px solid var(--teal); color: var(--teal); }
+    .secondary:disabled, .primary:disabled, .danger:disabled, .download-button.disabled { cursor: not-allowed; opacity: .5; pointer-events: none; }
+    .model-summary { min-height: 25px; margin-top: 10px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .preview-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, .8fr); gap: 16px; margin-top: 15px; }
+    .preview-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .preview-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+    .preview-result { display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .preview-result.visible { display: block; }
+    .preview-result audio { width: 100%; height: 40px; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .stat { padding: 12px 8px; text-align: center; }
+    .stat + .stat { border-left: 1px solid var(--line); }
+    .stat strong { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .stat span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 40px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
+    .switch input { position: absolute; opacity: 0; }
+    .switch span { position: absolute; inset: 0; border-radius: 12px; background: #bdc5c9; transition: background 120ms; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: transform 120ms; }
+    .switch input:checked + span { background: var(--green); }
+    .switch input:checked + span::after { transform: translateX(18px); }
+    .actionbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; background: #fafbfb; border-top: 1px solid var(--line); }
+    .message { min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .message.error { color: var(--red); }
+    .action-buttons { display: flex; gap: 8px; }
+    .side-panel { position: sticky; top: 20px; max-height: calc(100vh - 40px); display: grid; grid-template-rows: auto minmax(220px, 1fr) auto minmax(180px, .8fr); }
+    .monitor-head, .artifact-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px 17px; border-bottom: 1px solid var(--line); }
+    .run-state { display: flex; align-items: center; gap: 8px; }
+    .run-state strong, .artifact-head strong { font-size: 13px; }
+    .elapsed, .artifact-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .logs { margin: 0; min-height: 220px; padding: 14px; overflow: auto; background: #171a1c; color: #dce4e6; font: 12px/1.55 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .artifact-head { border-top: 1px solid var(--line); }
+    .artifact-list { overflow-y: auto; padding: 0 12px 12px; }
+    .artifact { padding: 12px 4px; border-bottom: 1px solid var(--line); }
+    .artifact:last-child { border-bottom: 0; }
+    .artifact-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+    .artifact-title strong { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+    .kind { flex: 0 0 auto; padding: 2px 5px; border-radius: 3px; background: var(--surface-muted); color: var(--muted); font-size: 9px; }
+    .artifact-meta { margin-top: 4px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+    .artifact-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    .text-action { border: 0; padding: 0; background: transparent; color: var(--teal); font-size: 11px; font-weight: 700; }
+    .text-action.delete { color: var(--red); }
+    .text-action:disabled { opacity: .45; cursor: wait; }
+    .empty { padding: 28px 10px; color: var(--muted); font-size: 12px; text-align: center; }
+    .tooltip-trigger { position: relative; display: inline-flex; width: max-content; max-width: 100%; align-items: center; gap: 5px; outline: 0; }
+    .tooltip-trigger::after { content: "?"; display: inline-grid; place-items: center; flex: 0 0 16px; width: 16px; height: 16px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); font-size: 10px; font-weight: 700; line-height: 1; }
+    .tooltip-trigger:hover::after, .tooltip-trigger:focus-visible::after { border-color: var(--teal); color: var(--teal); }
+    .property-tooltip { position: fixed; z-index: 1000; width: max-content; max-width: min(320px, calc(100vw - 24px)); padding: 8px 10px; border: 1px solid #3e484d; border-radius: 5px; background: #20272a; color: #fff; box-shadow: 0 8px 20px rgba(20, 28, 32, .18); font-size: 12px; line-height: 1.55; pointer-events: none; opacity: 0; transform: translateY(2px); transition: opacity 100ms, transform 100ms; }
+    .property-tooltip.visible { opacity: 1; transform: translateY(0); }
+    @media (max-width: 1100px) { .layout { grid-template-columns: minmax(0, 1fr); } .side-panel { position: static; max-height: 800px; } }
+    @media (max-width: 760px) { .topbar { height: auto; min-height: 64px; padding: 10px 14px; } .brand strong, .device-status { display: none; } main { padding: 12px; } .section { padding: 18px 16px; } .field-grid, .preview-grid { grid-template-columns: minmax(0, 1fr); } .actionbar { align-items: stretch; flex-direction: column; padding: 16px; } .action-buttons { width: 100%; } .action-buttons button { flex: 1; } }
+    @media (max-width: 500px) {
+      .topbar { display: block; width: 100%; padding: 10px 12px; }
+      .brand, .device-status { display: none; }
+      .top-actions, .nav { width: 100%; min-width: 0; }
+      .nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .nav a { min-width: 0; padding: 7px 4px; text-align: center; white-space: nowrap; }
+      main, .layout, .workbench, .side-panel { width: 100%; max-width: calc(100vw - 24px); min-width: 0; }
+      .section { max-width: 100%; overflow: hidden; }
+      .model-row, .dataset-row { grid-template-columns: minmax(0, 1fr); }
+      .stats, .preview-controls { grid-template-columns: 1fr 1fr; }
+      .model-row .secondary, .model-row .download-button, .dataset-row .secondary { width: 100%; }
+      .preview-actions { align-items: stretch; flex-direction: column; }
+      .preview-actions .primary { width: 100%; }
+      .model-summary { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 本地推理</strong></div>
+    <div class="top-actions">
+      <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a class="active" href="/distill">蒸馏</a></nav>
+      <div class="device-status" id="deviceStatus"><span class="status-dot"></span><span>正在检查学生运行时</span></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="layout">
+      <form class="workbench" id="trainingForm">
+        <section class="section">
+          <div class="section-head"><h1 class="section-title">学生模型与试听</h1><span class="section-state" id="modelState">正在扫描</span></div>
+          <div class="student-family" id="studentFamily" role="tablist" aria-label="学生模型架构"></div>
+          <div class="field">
+            <label class="tooltip-trigger" for="onnxModel" tabindex="0" data-tooltip="按上方学生架构筛选 ONNX 模型。试听在 CPU 上运行，不占用 GPU 训练显存。">ONNX 学生模型</label>
+            <div class="model-row"><select id="onnxModel"><option value="">正在读取模型</option></select><button class="secondary" id="refreshModels" type="button">刷新</button><a class="download-button disabled" id="downloadModel" href="#">下载模型</a></div>
+          </div>
+          <div class="model-summary" id="modelSummary">未选择模型</div>
+          <div class="preview-grid">
+            <div class="field"><label class="tooltip-trigger" for="previewText" tabindex="0" data-tooltip="使用选中的 ONNX 模型生成试听音频，最多 500 个字符。">试听文本</label><textarea id="previewText">你好，这是边缘语音模型的试听。Welcome to the bilingual test.</textarea></div>
+            <div class="preview-controls">
+              <div class="field"><label class="tooltip-trigger" for="lengthScale" tabindex="0" data-tooltip="语速比例。数值越小越快，越大越慢。">语速比例</label><input id="lengthScale" type="number" min="0.2" max="3" step="0.05" value="1"></div>
+              <div class="field"><label class="tooltip-trigger" for="noiseScale" tabindex="0" data-tooltip="控制声学采样变化，过高可能增加不稳定和杂音。">音色随机度</label><input id="noiseScale" type="number" min="0" max="2" step="0.05" value="0.667"></div>
+              <div class="field"><label class="tooltip-trigger" for="noiseW" tabindex="0" data-tooltip="控制音素时长变化，影响停顿和韵律随机性。">时长随机度</label><input id="noiseW" type="number" min="0" max="2" step="0.05" value="0.8"></div>
+              <div class="field"><label class="tooltip-trigger" for="volume" tabindex="0" data-tooltip="试听输出的线性音量倍率，1 表示模型原始音量。">音量</label><input id="volume" type="number" min="0.1" max="3" step="0.05" value="1"></div>
+            </div>
+          </div>
+          <div class="preview-actions"><span class="section-state" id="previewState"></span><button class="primary" id="previewButton" type="button" disabled>生成试听</button></div>
+          <div class="preview-result" id="previewResult"><audio id="previewAudio" controls></audio></div>
+        </section>
+
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">训练集设置</h2><span class="section-state" id="datasetState">未检查</span></div>
+          <div class="field">
+            <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="使用包含 WAV 和同名 .lab 的训练集。Piper 会自动重采样并生成音素缓存。">训练集</label>
+            <div class="dataset-row"><select id="datasetDir" name="dataset_dir"><option value="">正在读取训练集</option></select><button class="secondary" id="refreshDatasets" type="button">刷新</button><button class="secondary" id="inspectDataset" type="button">检查训练集</button></div>
+          </div>
+          <div class="stats"><div class="stat"><strong id="fileCount">-</strong><span>训练对</span></div><div class="stat"><strong id="totalMinutes">-</strong><span>分钟</span></div><div class="stat"><strong id="sampleRates">-</strong><span>原采样率</span></div><div class="stat"><strong id="durationRange">-</strong><span>时长范围</span></div></div>
+        </section>
+
+        <section class="section" id="trainingSection">
+          <div class="section-head"><h2 class="section-title" id="trainingTitle">Piper 微调设置</h2><span class="section-state" id="trainingHint">4GB 默认配置</span></div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="outputName" tabindex="0" data-tooltip="任务目录与最终导出模型的名称。留空时使用当前时间。">任务名称</label><input id="outputName" name="output_name" type="text" placeholder="自动按时间命名"></div>
+            <div class="field" id="piperQualityField"><label class="tooltip-trigger" for="quality" tabindex="0" data-tooltip="medium 可复用内置 huayan 中文检查点；x_low 体积和显存最低，但需要从头训练。">模型规格</label><select id="quality" name="quality"><option value="x_low">x_low · 16kHz · 约 20-35MB</option><option value="low">low · 16kHz · 约 50-70MB</option><option value="medium" selected>medium · 22.05kHz · 约 60-80MB</option></select></div>
+            <div class="field"><label class="tooltip-trigger" id="baseCheckpointLabel" for="baseCheckpoint" tabindex="0" data-tooltip="选择与当前学生架构匹配的检查点作为微调起点。">微调起点</label><select id="baseCheckpoint" name="base_checkpoint_id"><option value="">从头训练</option></select></div>
+          </div>
+          <div class="model-row engine-hidden" id="meloBasePanel" style="margin-top:14px"><div class="model-summary" id="meloBaseSummary" style="margin:0;align-self:center">正在检查官方基座</div><button class="secondary" id="downloadMeloBase" type="button">下载官方基座</button></div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" id="epochsLabel" for="numEpochs" tabindex="0" data-tooltip="完整遍历训练集的次数，应结合检查点试听判断是否过拟合。">训练轮数</label><input id="numEpochs" name="num_epochs" type="number" min="1" max="5000" value="100"></div>
+            <div class="field"><label class="tooltip-trigger" id="learningRateLabel" for="learningRate" tabindex="0" data-tooltip="微调步长。MeloTTS 官方基座建议从 0.00005 开始。">学习率</label><input id="learningRate" name="learning_rate" type="number" min="0.000001" max="0.01" step="0.000001" value="0.0001"></div>
+            <div class="field"><label class="tooltip-trigger" for="batchSize" tabindex="0" data-tooltip="直接影响显存峰值。RTX 3050 4GB 默认保持为 1。">批次大小</label><input id="batchSize" name="batch_size" type="number" min="1" max="16" value="1"></div>
+          </div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="validationSplit" tabindex="0" data-tooltip="留作验证和选择检查点的数据比例。400 条左右建议 0.05。">验证集比例</label><input id="validationSplit" name="validation_split" type="number" min="0.01" max="0.3" step="0.01" value="0.05"></div>
+            <div class="field"><label class="tooltip-trigger" for="saveEvery" tabindex="0" data-tooltip="每隔多少轮验证并保存表现较好的检查点，同时始终保留 last.ckpt。">每 N 轮保存</label><input id="saveEvery" name="save_every_epochs" type="number" min="1" max="5000" value="5"></div>
+            <div class="field"><label class="tooltip-trigger" for="numWorkers" tabindex="0" data-tooltip="音频缓存和数据加载线程。Windows 本机默认 1 更稳定。">数据线程</label><input id="numWorkers" name="num_workers" type="number" min="0" max="8" value="1"></div>
+          </div>
+          <div class="field-grid engine-hidden" id="meloOptions" style="margin-top:14px">
+            <div class="field"><label class="tooltip-trigger" for="meloLanguage" tabindex="0" data-tooltip="中英混合前端可保留训练文本中的英文；纯中文前端对全中文数据更简单。">文本前端</label><select id="meloLanguage" name="language"><option value="ZH_MIX_EN" selected>中文 + English</option><option value="ZH">仅中文</option></select></div>
+            <div class="field"><label class="tooltip-trigger" for="segmentSize" tabindex="0" data-tooltip="每次送入判别器的音频采样点。8192 适合 4GB 显存；更长可能略利于连贯性但显著增加显存。">训练片段</label><select id="segmentSize" name="segment_size"><option value="4096">4096 · 最省显存</option><option value="8192" selected>8192 · 4GB 推荐</option><option value="16384">16384 · 官方长度</option></select></div>
+            <div class="field"><label class="tooltip-trigger" for="keepCheckpoints" tabindex="0" data-tooltip="同时保留多少组 G/D/DUR 检查点。每组体积较大，默认只保留最近 5 组。">保留检查点</label><input id="keepCheckpoints" name="keep_checkpoints" type="number" min="1" max="20" value="5"></div>
+          </div>
+          <div class="toggle-row" id="piperTrimRow"><span class="tooltip-trigger" tabindex="0" data-tooltip="预处理时使用 Silero VAD 裁剪长静音，保留语音前后少量余量。首次运行需要准备 VAD 模型。">裁剪首尾静音</span><label class="switch"><input id="trimSilence" name="trim_silence" type="checkbox" checked><span></span></label></div>
+        </section>
+
+        <div class="actionbar"><div class="message" id="message">就绪</div><div class="action-buttons"><button class="danger" id="stopButton" type="button" disabled>停止训练</button><button class="primary" id="startButton" type="submit" disabled>开始 Piper 微调</button></div></div>
+      </form>
+
+      <aside class="side-panel">
+        <div class="monitor-head"><div class="run-state"><span class="status-dot" id="runDot"></span><strong id="runState">未运行</strong></div><span class="elapsed" id="elapsed">00:00:00</span></div>
+        <pre class="logs" id="logs">等待 Piper 训练任务</pre>
+        <div class="artifact-head"><strong>模型与检查点</strong><span class="artifact-count" id="artifactCount">0</span></div>
+        <div class="artifact-list" id="artifactList"><div class="empty">正在扫描</div></div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const form = document.getElementById("trainingForm");
+    const onnxModel = document.getElementById("onnxModel");
+    const studentFamily = document.getElementById("studentFamily");
+    const trainingSection = document.getElementById("trainingSection");
+    const baseCheckpoint = document.getElementById("baseCheckpoint");
+    const datasetDir = document.getElementById("datasetDir");
+    const previewButton = document.getElementById("previewButton");
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const message = document.getElementById("message");
+    const logs = document.getElementById("logs");
+    let statusData = null;
+    let datasetReady = false;
+    let refreshing = false;
+    let selectorsInitialized = false;
+    let currentEngine = "piper";
+    const engineSettings = {
+      piper: { numEpochs: "100", learningRate: "0.0001", batchSize: "1", validationSplit: "0.05", saveEvery: "5", numWorkers: "1" },
+      sherpa_onnx: { numEpochs: "50", learningRate: "0.00005", batchSize: "1", validationSplit: "0.05", saveEvery: "5", numWorkers: "1" },
+    };
+    const checkpointValues = { piper: "", sherpa_onnx: "official-melotts-chinese" };
+
+    const propertyTooltip = document.createElement("div");
+    propertyTooltip.className = "property-tooltip";
+    propertyTooltip.id = "propertyTooltip";
+    propertyTooltip.role = "tooltip";
+    propertyTooltip.setAttribute("aria-hidden", "true");
+    document.body.append(propertyTooltip);
+    let tooltipTimer = null;
+    let activeTooltipTarget = null;
+
+    function positionTooltip(target) {
+      const margin = 12;
+      const rect = target.getBoundingClientRect();
+      const tip = propertyTooltip.getBoundingClientRect();
+      const left = Math.max(margin, Math.min(rect.left + (rect.width - tip.width) / 2, innerWidth - tip.width - margin));
+      let top = rect.top - tip.height - 8;
+      if (top < margin) top = rect.bottom + 8;
+      propertyTooltip.style.left = `${Math.round(left)}px`;
+      propertyTooltip.style.top = `${Math.round(top)}px`;
+    }
+    function showTooltip(target, immediate = false) {
+      clearTimeout(tooltipTimer);
+      const reveal = () => { activeTooltipTarget = target; propertyTooltip.textContent = target.dataset.tooltip; propertyTooltip.classList.add("visible"); propertyTooltip.setAttribute("aria-hidden", "false"); positionTooltip(target); };
+      if (immediate) reveal(); else tooltipTimer = setTimeout(reveal, 350);
+    }
+    function hideTooltip() { clearTimeout(tooltipTimer); activeTooltipTarget = null; propertyTooltip.classList.remove("visible"); propertyTooltip.setAttribute("aria-hidden", "true"); }
+    document.addEventListener("mouseover", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target && target !== activeTooltipTarget) showTooltip(target); });
+    document.addEventListener("mouseout", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target && !target.contains(event.relatedTarget)) hideTooltip(); });
+    document.addEventListener("focusin", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target) showTooltip(target, true); });
+    document.addEventListener("focusout", hideTooltip);
+    window.addEventListener("scroll", hideTooltip, true);
+    window.addEventListener("resize", hideTooltip);
+
+    function formatElapsed(seconds) {
+      const value = Math.max(0, Math.floor(seconds || 0));
+      return `${String(Math.floor(value / 3600)).padStart(2, "0")}:${String(Math.floor((value % 3600) / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+    }
+
+    function selectedModel() { return statusData?.models?.find((item) => item.id === onnxModel.value); }
+    function selectedCheckpoint() { return [...(statusData?.checkpoints || []), ...(statusData?.melo_checkpoints || [])].find((item) => item.id === baseCheckpoint.value); }
+    function visibleModels(data = statusData) { return data?.models?.filter((item) => item.engine === currentEngine) || []; }
+
+    function saveEngineSettings() {
+      const state = engineSettings[currentEngine];
+      if (!state) return;
+      ["numEpochs", "learningRate", "batchSize", "validationSplit", "saveEvery", "numWorkers"].forEach((id) => { state[id] = document.getElementById(id).value; });
+      checkpointValues[currentEngine] = baseCheckpoint.value;
+    }
+
+    function loadEngineSettings() {
+      const state = engineSettings[currentEngine];
+      Object.entries(state).forEach(([id, value]) => { document.getElementById(id).value = value; });
+    }
+
+    function applyControlState(data = statusData) {
+      if (!data) return;
+      form.querySelectorAll("input, select").forEach((input) => { input.disabled = data.running; });
+      const trainable = data.student_engines.some((engine) => engine.id === currentEngine && engine.trainable);
+      trainingSection.querySelectorAll("input, select").forEach((input) => { input.disabled = data.running || !trainable; });
+      studentFamily.querySelectorAll("button").forEach((button) => { button.disabled = data.running; });
+      stopButton.disabled = !data.running;
+      const meloStartReady = currentEngine !== "sherpa_onnx" || baseCheckpoint.value !== "official-melotts-chinese" || data.melo_base?.installed;
+      startButton.disabled = data.running || !trainable || !datasetReady || !data.cuda_available || !meloStartReady;
+      previewButton.disabled = data.running || !selectedModel();
+    }
+
+    function updateTrainingMode() {
+      const isPiper = currentEngine === "piper";
+      trainingSection.classList.remove("inactive");
+      document.getElementById("piperQualityField").classList.toggle("engine-hidden", !isPiper);
+      document.getElementById("piperTrimRow").classList.toggle("engine-hidden", !isPiper);
+      document.getElementById("meloOptions").classList.toggle("engine-hidden", isPiper);
+      document.getElementById("meloBasePanel").classList.toggle("engine-hidden", isPiper);
+      document.getElementById("trainingTitle").textContent = isPiper ? "Piper 微调设置" : "MeloTTS 微调设置";
+      document.getElementById("trainingHint").textContent = isPiper ? "4GB 默认配置" : "44.1kHz · FP16 · 4GB 极限配置";
+      startButton.textContent = isPiper ? "开始 Piper 微调" : "开始 MeloTTS 微调";
+      const baseLabel = document.getElementById("baseCheckpointLabel");
+      baseLabel.dataset.tooltip = isPiper ? "选择 CKPT 作为权重热启动；规格必须与 Piper 模型一致。" : "默认从官方 MeloTTS-Chinese 生成器开始，也可选择已有 G_*.pth 继续微调。";
+      const base = statusData?.melo_base;
+      document.getElementById("meloBaseSummary").textContent = base?.installed
+        ? `${base.name} · ${base.size_mb.toFixed(2)} MB · ${base.sample_rate} Hz · ${base.license}`
+        : "官方 MeloTTS-Chinese 基座尚未下载";
+      document.getElementById("downloadMeloBase").textContent = base?.installed ? "重新校验" : "下载官方基座";
+      applyControlState();
+    }
+
+    function rebuildCheckpointSelector(data) {
+      const isPiper = currentEngine === "piper";
+      const items = isPiper ? data.checkpoints : data.melo_checkpoints;
+      baseCheckpoint.replaceChildren();
+      if (isPiper) {
+        baseCheckpoint.add(new Option("从头训练", ""));
+      } else {
+        const label = data.melo_base?.installed ? `官方 MeloTTS-Chinese · ${data.melo_base.size_mb.toFixed(1)}MB` : "官方 MeloTTS-Chinese · 尚未下载";
+        baseCheckpoint.add(new Option(label, "official-melotts-chinese"));
+      }
+      items.forEach((item) => baseCheckpoint.add(new Option(`${item.recommended ? "推荐 · " : ""}${item.name} · ${item.size_mb.toFixed(1)}MB`, item.id)));
+      let preferred = checkpointValues[currentEngine];
+      if (![...baseCheckpoint.options].some((option) => option.value === preferred)) {
+        preferred = isPiper ? data.checkpoints.find((item) => item.recommended)?.id || "" : "official-melotts-chinese";
+      }
+      baseCheckpoint.value = preferred;
+      checkpointValues[currentEngine] = preferred;
+    }
+
+    function rebuildEngineTabs(data) {
+      studentFamily.replaceChildren();
+      data.student_engines.forEach((engine) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.role = "tab";
+        button.dataset.engine = engine.id;
+        button.textContent = engine.label;
+        button.classList.toggle("active", engine.id === currentEngine);
+        button.setAttribute("aria-selected", String(engine.id === currentEngine));
+        button.onclick = () => {
+          saveEngineSettings();
+          currentEngine = engine.id;
+          loadEngineSettings();
+          rebuildEngineTabs(data);
+          rebuildModelSelector(data);
+          rebuildCheckpointSelector(data);
+          updateTrainingMode();
+        };
+        studentFamily.append(button);
+      });
+    }
+
+    function updateModelSummary() {
+      const model = selectedModel();
+      const download = document.getElementById("downloadModel");
+      previewButton.disabled = !model || statusData?.running;
+      download.classList.toggle("disabled", !model);
+      download.href = model ? `/api/piper/download/${model.id}` : "#";
+      document.getElementById("modelState").textContent = model ? "可试听" : "没有 ONNX 模型";
+      document.getElementById("modelSummary").textContent = model
+        ? `${model.engine_label} · ${model.relative_path} · ${model.size_mb.toFixed(2)} MB · ${model.sample_rate || "?"} Hz · ${model.language || "语言未知"}${model.license ? ` · ${model.license}` : ""}`
+        : "当前架构下没有可用 ONNX 模型";
+    }
+
+    function rebuildModelSelector(data, preferredValue = onnxModel.value) {
+      const models = visibleModels(data);
+      onnxModel.replaceChildren();
+      if (!models.length) onnxModel.add(new Option("当前架构没有可用 ONNX 模型", ""));
+      models.forEach((item) => onnxModel.add(new Option(`${item.name} · ${item.size_mb.toFixed(1)}MB`, item.id)));
+      if ([...onnxModel.options].some((option) => option.value === preferredValue)) onnxModel.value = preferredValue;
+      updateModelSummary();
+    }
+
+    function rebuildSelectors(data) {
+      const modelValue = onnxModel.value;
+      if (selectorsInitialized) checkpointValues[currentEngine] = baseCheckpoint.value;
+      rebuildEngineTabs(data);
+      rebuildModelSelector(data, modelValue);
+      rebuildCheckpointSelector(data);
+      selectorsInitialized = true;
+      updateTrainingMode();
+      updateModelSummary();
+    }
+
+    async function deleteArtifact(item, button) {
+      if (!confirm(`确定删除 ${item.kind === "onnx" ? "模型" : "检查点"}“${item.name}”？此操作不可撤销。`)) return;
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/piper/artifacts/${item.id}`, { method: "DELETE" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "删除失败");
+        message.className = "message";
+        message.textContent = `已删除 ${item.name}`;
+        await refreshStatus(true);
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+        button.disabled = false;
+      }
+    }
+
+    async function exportCheckpoint(item, button) {
+      button.disabled = true;
+      const originalText = button.textContent;
+      button.textContent = "导出中";
+      message.className = "message";
+      message.textContent = `正在导出 ${item.name}，首次导出可能需要一些时间`;
+      try {
+        const response = await fetch(`/api/piper/export/${item.id}`, { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "ONNX 导出失败");
+        message.textContent = `已导出 ${result.artifact.name}`;
+        await refreshStatus(true);
+        currentEngine = result.artifact.engine;
+        rebuildEngineTabs(statusData);
+        rebuildModelSelector(statusData, result.artifact.id);
+        onnxModel.value = result.artifact.id;
+        updateModelSummary();
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+      }
+    }
+
+    async function previewMeloCheckpoint(item, button) {
+      button.disabled = true;
+      const originalText = button.textContent;
+      button.textContent = "生成中";
+      message.className = "message";
+      message.textContent = `正在加载 ${item.name}；首次试听需要加载文本模型`;
+      const data = new FormData();
+      data.set("checkpoint_id", item.id);
+      data.set("text", document.getElementById("previewText").value);
+      data.set("speed", String(1 / Math.max(0.2, Number(document.getElementById("lengthScale").value) || 1)));
+      try {
+        const response = await fetch("/api/melo/preview", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "MeloTTS 检查点试听失败");
+        const audio = document.getElementById("previewAudio");
+        audio.src = `${result.audio_url}?t=${Date.now()}`;
+        audio.load();
+        document.getElementById("previewResult").classList.add("visible");
+        document.getElementById("previewState").textContent = `${item.name} · ${Number(result.duration).toFixed(2)} 秒${result.cached ? " · 缓存" : ""}`;
+        message.textContent = `已生成 ${item.name} 检查点试听`;
+        scrollTo({ top: 0, behavior: "smooth" });
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+      }
+    }
+
+    function renderArtifacts(data) {
+      const items = [...data.models, ...data.checkpoints, ...(data.melo_checkpoints || [])].sort((a, b) => b.modified_at.localeCompare(a.modified_at));
+      const list = document.getElementById("artifactList");
+      document.getElementById("artifactCount").textContent = String(items.length);
+      list.replaceChildren();
+      if (!items.length) { const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "暂无学生模型或检查点"; list.append(empty); return; }
+      items.forEach((item) => {
+        const row = document.createElement("div"); row.className = "artifact";
+        const title = document.createElement("div"); title.className = "artifact-title";
+        const strong = document.createElement("strong"); strong.textContent = item.name;
+        const kind = document.createElement("span"); kind.className = "kind"; kind.textContent = item.kind === "onnx" ? item.engine_label : item.kind === "melo_checkpoint" ? "Melo PTH" : "Piper CKPT";
+        title.append(strong, kind);
+        const meta = document.createElement("div"); meta.className = "artifact-meta"; meta.textContent = `${item.size_mb.toFixed(2)} MB · ${item.language || ""} · ${item.relative_path}`;
+        const actions = document.createElement("div"); actions.className = "artifact-actions";
+        if (item.kind === "onnx") {
+          const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "选中试听"; use.onclick = () => { currentEngine = item.engine; rebuildEngineTabs(statusData); rebuildModelSelector(statusData, item.id); updateTrainingMode(); scrollTo({ top: 0, behavior: "smooth" }); };
+          const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 ZIP";
+          actions.append(use, download);
+        } else if (item.kind === "melo_checkpoint") {
+          const preview = document.createElement("button"); preview.type = "button"; preview.className = "text-action"; preview.textContent = "试听检查点"; preview.onclick = () => previewMeloCheckpoint(item, preview);
+          const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "作为起点"; use.onclick = () => { saveEngineSettings(); currentEngine = "sherpa_onnx"; loadEngineSettings(); checkpointValues.sherpa_onnx = item.id; rebuildSelectors(statusData); baseCheckpoint.value = item.id; };
+          const exportButton = document.createElement("button"); exportButton.type = "button"; exportButton.className = "text-action"; exportButton.textContent = "导出 INT8"; exportButton.onclick = () => exportCheckpoint(item, exportButton);
+          const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 PTH";
+          actions.append(preview, use, exportButton, download);
+        } else {
+          const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "作为起点"; use.onclick = () => { saveEngineSettings(); currentEngine = "piper"; loadEngineSettings(); checkpointValues.piper = item.id; rebuildSelectors(statusData); baseCheckpoint.value = item.id; };
+          const exportButton = document.createElement("button"); exportButton.type = "button"; exportButton.className = "text-action"; exportButton.textContent = "导出 ONNX"; exportButton.onclick = () => exportCheckpoint(item, exportButton);
+          const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 CKPT";
+          actions.append(use, exportButton, download);
+        }
+        const remove = document.createElement("button"); remove.type = "button"; remove.className = "text-action delete"; remove.textContent = "删除"; remove.onclick = () => deleteArtifact(item, remove);
+        actions.append(remove); row.append(title, meta, actions); list.append(row);
+      });
+    }
+
+    function renderStatus(data, rebuild = false) {
+      if (!statusData && data.started_at && data.active_engine) { currentEngine = data.active_engine; loadEngineSettings(); }
+      statusData = data;
+      const labels = { idle: "未运行", running: "训练中", stopping: "正在停止", stopped: "已停止", exporting: "正在导出", completed: "已完成", failed: "训练失败" };
+      document.getElementById("runState").textContent = labels[data.status] || data.status;
+      document.getElementById("runDot").className = `status-dot ${data.running ? "running" : data.status === "failed" ? "error" : data.status === "completed" ? "ready" : ""}`;
+      document.getElementById("elapsed").textContent = formatElapsed(data.elapsed_seconds);
+      const nearBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 48;
+      logs.textContent = data.logs || `等待 ${data.active_engine === "sherpa_onnx" ? "MeloTTS" : "Piper"} 训练任务`;
+      if (nearBottom) logs.scrollTop = logs.scrollHeight;
+      const device = document.getElementById("deviceStatus");
+      device.querySelector(".status-dot").className = `status-dot ${data.cuda_available ? "ready" : "error"}`;
+      device.querySelector("span:last-child").textContent = data.cuda_available ? `${data.gpu_name} · ${data.gpu_memory_gb} GB` : "CUDA 不可用";
+      if (rebuild) rebuildSelectors(data);
+      renderArtifacts(data);
+      updateModelSummary();
+      applyControlState(data);
+    }
+
+    async function refreshStatus(forceRebuild = false) {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const response = await fetch("/api/piper/status", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Piper 状态读取失败");
+        const changed = !statusData || data.models.length !== statusData.models.length || data.checkpoints.length !== statusData.checkpoints.length || (data.melo_checkpoints || []).length !== (statusData.melo_checkpoints || []).length || data.melo_base?.installed !== statusData.melo_base?.installed;
+        renderStatus(data, forceRebuild || changed);
+      } catch (error) {
+        message.className = "message error"; message.textContent = error.message;
+      } finally { refreshing = false; }
+    }
+
+    async function loadDatasets() {
+      const current = datasetDir.value;
+      try {
+        const response = await fetch("/api/training-datasets", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "训练集读取失败");
+        datasetDir.replaceChildren();
+        data.datasets.forEach((item) => datasetDir.add(new Option(`${item.name} · ${item.file_count} 条`, item.path)));
+        datasetDir.value = [...datasetDir.options].some((option) => option.value === current) ? current : data.default || "";
+        if (!datasetDir.options.length) datasetDir.add(new Option("没有可用训练集", ""));
+      } catch (error) { datasetDir.replaceChildren(new Option("训练集列表不可用", "")); }
+    }
+
+    async function inspectDataset() {
+      datasetReady = false;
+      document.getElementById("datasetState").textContent = "检查中";
+      const data = new FormData(); data.set("dataset_dir", datasetDir.value);
+      try {
+        const response = await fetch("/api/piper/dataset", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "训练集检查失败");
+        datasetReady = true;
+        document.getElementById("datasetState").textContent = "可用";
+        document.getElementById("fileCount").textContent = result.file_count;
+        document.getElementById("totalMinutes").textContent = Number(result.total_minutes).toFixed(2);
+        document.getElementById("sampleRates").textContent = Object.keys(result.sample_rates).join("/");
+        document.getElementById("durationRange").textContent = `${Number(result.min_duration).toFixed(1)}-${Number(result.max_duration).toFixed(1)}s`;
+        message.className = "message"; message.textContent = `${result.file_count} 条训练对 · ${Number(result.total_minutes).toFixed(2)} 分钟`;
+      } catch (error) {
+        document.getElementById("datasetState").textContent = "不可用";
+        message.className = "message error"; message.textContent = error.message;
+      }
+      if (statusData) applyControlState(statusData);
+    }
+
+    document.getElementById("refreshModels").addEventListener("click", () => refreshStatus(true));
+    document.getElementById("downloadMeloBase").addEventListener("click", async () => {
+      const button = document.getElementById("downloadMeloBase");
+      button.disabled = true;
+      button.textContent = "下载中";
+      message.className = "message";
+      message.textContent = "正在从镜像校验并下载官方 MeloTTS-Chinese 基座";
+      try {
+        const response = await fetch("/api/melo/base/download", { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "官方基座下载失败");
+        message.textContent = `官方基座已就绪 · ${result.base.size_mb.toFixed(2)} MB`;
+        await refreshStatus(true);
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        updateTrainingMode();
+      }
+    });
+    document.getElementById("refreshDatasets").addEventListener("click", async () => { await loadDatasets(); await inspectDataset(); });
+    document.getElementById("inspectDataset").addEventListener("click", inspectDataset);
+    datasetDir.addEventListener("change", () => { datasetReady = false; document.getElementById("datasetState").textContent = "未检查"; startButton.disabled = true; });
+    baseCheckpoint.addEventListener("change", () => { checkpointValues[currentEngine] = baseCheckpoint.value; if (statusData) applyControlState(statusData); });
+    onnxModel.addEventListener("change", updateModelSummary);
+    document.getElementById("quality").addEventListener("change", (event) => {
+      const checkpoint = selectedCheckpoint();
+      if (checkpoint?.quality && checkpoint.quality !== event.target.value) baseCheckpoint.value = "";
+    });
+
+    previewButton.addEventListener("click", async () => {
+      previewButton.disabled = true;
+      document.getElementById("previewState").textContent = "生成中";
+      const data = new FormData();
+      data.set("model_id", onnxModel.value); data.set("text", document.getElementById("previewText").value);
+      data.set("length_scale", document.getElementById("lengthScale").value); data.set("noise_scale", document.getElementById("noiseScale").value);
+      data.set("noise_w_scale", document.getElementById("noiseW").value); data.set("volume", document.getElementById("volume").value);
+      try {
+        const response = await fetch("/api/piper/preview", { method: "POST", body: data });
+        const result = await response.json(); if (!response.ok) throw new Error(result.detail || "试听生成失败");
+        const audio = document.getElementById("previewAudio"); audio.src = `${result.audio_url}?t=${Date.now()}`; audio.load();
+        document.getElementById("previewResult").classList.add("visible");
+        document.getElementById("previewState").textContent = `${Number(result.duration).toFixed(2)} 秒${result.cached ? " · 缓存" : ""}`;
+      } catch (error) { document.getElementById("previewState").textContent = error.message; }
+      previewButton.disabled = !selectedModel() || statusData?.running;
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      saveEngineSettings();
+      const isPiper = currentEngine === "piper";
+      startButton.disabled = true; message.className = "message"; message.textContent = `正在启动 ${isPiper ? "Piper" : "MeloTTS"} 微调`;
+      const data = new FormData(form); data.set("base_checkpoint_id", baseCheckpoint.value); data.set("trim_silence", document.getElementById("trimSilence").checked ? "true" : "false");
+      try {
+        const response = await fetch(isPiper ? "/api/piper/train" : "/api/melo/train", { method: "POST", body: data });
+        const result = await response.json(); if (!response.ok) throw new Error(result.detail || `${isPiper ? "Piper" : "MeloTTS"} 训练启动失败`);
+        message.textContent = `${result.job_name} · ${result.quality} · 已启动`; await refreshStatus(true);
+      } catch (error) { message.className = "message error"; message.textContent = error.message; startButton.disabled = !datasetReady; }
+    });
+
+    stopButton.addEventListener("click", async () => {
+      const activeName = statusData?.active_engine === "sherpa_onnx" ? "MeloTTS" : "Piper";
+      if (!confirm(`停止当前 ${activeName} 训练？已经保存的检查点与输入缓存会保留，当前批次不会保存。`)) return;
+      stopButton.disabled = true;
+      try { const response = await fetch("/api/piper/stop", { method: "POST" }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || "停止失败"); message.textContent = `正在停止 ${activeName} 训练`; }
+      catch (error) { message.className = "message error"; message.textContent = error.message; }
+      await refreshStatus();
+    });
+
+    Promise.all([loadDatasets(), refreshStatus(true)]).then(inspectDataset);
+    setInterval(() => refreshStatus(false), 1500);
+  </script>
+</body>
+</html>

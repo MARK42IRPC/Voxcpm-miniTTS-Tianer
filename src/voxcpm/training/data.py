@@ -202,28 +202,32 @@ class BatchProcessor:
         audio_vae: AudioVAE,
         dataset_cnt: int,
         device: torch.device,
+        audio_device: torch.device | None = None,
     ):
         self.device = device
+        self.audio_device = audio_device or device
         self.dataset_cnt = dataset_cnt
         self.audio_vae = audio_vae
-        self.audio_vae.to(device)
+        self.audio_vae.to(self.audio_device)
         self.packer = AudioFeatureProcessingPacker(
             dataset_cnt=dataset_cnt,
             max_len=config.max_length,
             patch_size=config.patch_size,
             feat_dim=config.feat_dim,
             audio_vae=self.audio_vae,
+            audio_device=self.audio_device,
+            output_device=self.device,
         )
 
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        audio_tokens = batch["audio_tokens"].to(self.device)
+        audio_tokens = batch["audio_tokens"].to(self.audio_device)
         text_tokens = batch["text_tokens"].to(self.device)
         task_ids = batch["task_ids"].to(self.device)
         dataset_ids = batch["dataset_ids"].to(self.device)
 
         ref_audio_tokens = None
         if "ref_audio_tokens" in batch:
-            ref_audio_tokens = batch["ref_audio_tokens"].to(self.device)
+            ref_audio_tokens = batch["ref_audio_tokens"].to(self.audio_device)
 
         packed = self.packer(
             audio_tokens=audio_tokens,

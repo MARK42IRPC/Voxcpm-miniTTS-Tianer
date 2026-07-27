@@ -15,9 +15,17 @@ V1_MODEL_PATH = ROOT / "models" / "openbmb__VoxCPM1.5"
 V2_MODEL_PATH = ROOT / "models" / "VoxCPM2-1B-newaudiovae-6hz-nope-sft"
 
 
+def _voxcpm_modules():
+    return {name: module for name, module in sys.modules.items() if name == "voxcpm" or name.startswith("voxcpm.")}
+
+
+original_voxcpm_modules = _voxcpm_modules()
+for module_name in original_voxcpm_modules:
+    sys.modules.pop(module_name, None)
+
 pkg = types.ModuleType("voxcpm")
 pkg.__path__ = [str(ROOT / "src" / "voxcpm")]
-sys.modules.setdefault("voxcpm", pkg)
+sys.modules["voxcpm"] = pkg
 
 core_stub = types.ModuleType("voxcpm.core")
 
@@ -34,6 +42,24 @@ cli = importlib.util.module_from_spec(spec)
 sys.modules["voxcpm.cli"] = cli
 assert spec.loader is not None
 spec.loader.exec_module(cli)
+
+for module_name in _voxcpm_modules():
+    sys.modules.pop(module_name, None)
+sys.modules.update(original_voxcpm_modules)
+
+
+@pytest.fixture(autouse=True)
+def isolated_cli_modules():
+    previous = _voxcpm_modules()
+    for module_name in previous:
+        sys.modules.pop(module_name, None)
+    sys.modules.update({"voxcpm": pkg, "voxcpm.core": core_stub, "voxcpm.cli": cli})
+    try:
+        yield
+    finally:
+        for module_name in _voxcpm_modules():
+            sys.modules.pop(module_name, None)
+        sys.modules.update(previous)
 
 
 class DummyTTSModel:

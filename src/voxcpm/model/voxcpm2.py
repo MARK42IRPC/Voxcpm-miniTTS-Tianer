@@ -56,6 +56,17 @@ from .utils import (
 )
 
 
+def _continuation_badcase_limit(
+    target_token_length: int,
+    prompt_token_length: int,
+    prompt_audio_length: int,
+    generic_ratio_threshold: float,
+) -> float:
+    generic_limit = target_token_length * generic_ratio_threshold
+    expected_target_length = prompt_audio_length * target_token_length / max(1, prompt_token_length)
+    return min(generic_limit, expected_target_length * 1.4 + 2)
+
+
 # A simple function to trim audio silence using VAD, not used default
 def _trim_audio_silence_vad(
     audio: torch.Tensor, sample_rate: int, max_silence_ms: float = 200.0, top_db: float = 35.0
@@ -170,6 +181,14 @@ class VoxCPM2Model(nn.Module):
         self.patch_size = config.patch_size
         self.device = resolve_runtime_device(device, config.device)
         self.config.device = self.device
+        self.hybrid_device: torch.device | None = None
+        self.hybrid_base_lm = False
+        self.hybrid_cache_length: int | None = None
+        self.hybrid_residual_lm = False
+        self.hybrid_residual_cache_length: int | None = None
+        self.hybrid_feat_encoder = False
+        self.hybrid_vae_decoder = False
+        self.hybrid_decoder_optimized = False
         resolved_dtype = pick_runtime_dtype(self.device, self.config.dtype)
         if resolved_dtype != self.config.dtype:
             print(
@@ -250,6 +269,182 @@ class VoxCPM2Model(nn.Module):
 
         if self.lora_config is not None:
             self._apply_lora()
+
+    def enable_hybrid_inference(
+        self,
+        device: str = "cuda",
+        cache_length: int = 2048,
+        accelerate_base_lm: bool = True,
+        accelerate_residual_lm: bool = False,
+        residual_cache_length: int = 8192,
+        accelerate_feat_encoder: bool = False,
+        accelerate_vae_decoder: bool = False,
+    ) -> "VoxCPM2Model":
+        """Move selected high-cost inference modules to CUDA."""
+        if self.device != "cpu":
+            raise ValueError("Hybrid inference requires the main model to be loaded on CPU")
+        hybrid_device = torch.device(resolve_runtime_device(device, "cuda"))
+        if hybrid_device.type != "cuda":
+            raise ValueError("Hybrid inference requires a CUDA device")
+
+        if os.environ.get("VOXCPM_HYBRID_DETERMINISTIC", "1").strip().lower() not in {"0", "false", "no"}:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True)
+
+        if cache_length < 1:
+            raise ValueError("Hybrid cache length must be positive")
+        if residual_cache_length < 1:
+            raise ValueError("Hybrid residual cache length must be positive")
+
+        self.feat_decoder = self.feat_decoder.to(hybrid_device)
+        self.hybrid_device = hybrid_device
+
+        if accelerate_feat_encoder:
+            encoder = getattr(self, "_feat_encoder_raw", self.feat_encoder)
+            encoder = encoder.to(device=hybrid_device, dtype=torch.float32)
+            if hasattr(self, "_feat_encoder_raw"):
+                self._feat_encoder_raw = encoder
+            else:
+                self.feat_encoder = encoder
+            # Keep CUDA FP32 matmuls out of TF32 so this path stays as close as
+            # possible to the original CPU conditioning calculations.
+            torch.set_float32_matmul_precision("highest")
+            self.hybrid_feat_encoder = True
+
+        if accelerate_residual_lm:
+            self.residual_lm = self.residual_lm.to(hybrid_device)
+            self.residual_lm.setup_cache(
+                1,
+                residual_cache_length,
+                hybrid_device,
+                get_dtype(self.config.dtype),
+            )
+            self.hybrid_residual_lm = True
+            self.hybrid_residual_cache_length = residual_cache_length
+
+        if accelerate_vae_decoder:
+            self.audio_vae.decoder = self.audio_vae.decoder.to(hybrid_device)
+            self.hybrid_vae_decoder = True
+
+        if accelerate_base_lm:
+            # Keep the large token embedding on CPU, but move all compute-heavy
+            # LM layers and their bounded inference caches to CUDA.
+            if self.base_lm.rope_emb is not None:
+                self.base_lm.rope_emb._set_cos_sin_cache(
+                    seq_len=cache_length,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                )
+                self.base_lm.rope_emb = self.base_lm.rope_emb.to(hybrid_device)
+            self.base_lm.layers = self.base_lm.layers.to(hybrid_device)
+            self.base_lm.norm = self.base_lm.norm.to(hybrid_device)
+            self.base_lm.setup_cache(
+                1,
+                cache_length,
+                hybrid_device,
+                get_dtype(self.config.dtype),
+            )
+            self.hybrid_base_lm = True
+            self.hybrid_cache_length = cache_length
+
+        components = ["feat_decoder"]
+        if self.hybrid_feat_encoder:
+            components.append("feat_encoder(fp32)")
+        if self.hybrid_base_lm:
+            components.append("base_lm")
+        if self.hybrid_residual_lm:
+            components.append("residual_lm")
+        if self.hybrid_vae_decoder:
+            components.append("audio_vae.decoder")
+        if torch.are_deterministic_algorithms_enabled():
+            components.append("deterministic")
+        print(f"[voxcpm2] hybrid CUDA: {', '.join(components)}", file=sys.stderr)
+        return self
+
+    def _hybrid_feat_encode(self, feat: torch.Tensor) -> torch.Tensor:
+        encoder = getattr(self, "_feat_encoder_raw", self.feat_encoder)
+        if not self.hybrid_feat_encoder:
+            return encoder(feat)
+        encoded = encoder(feat.to(self.hybrid_device, dtype=torch.float32, non_blocking=True))
+        projection_dtype = next(self.enc_to_lm_proj.parameters()).dtype
+        return encoded.to(self.device, dtype=projection_dtype, non_blocking=True)
+
+    def _hybrid_feat_decode(self, *, mu: torch.Tensor, cond: torch.Tensor, **kwargs) -> torch.Tensor:
+        if self.hybrid_device is None:
+            return self.feat_decoder(mu=mu, cond=cond, **kwargs)
+        result = self.feat_decoder(
+            mu=mu.to(self.hybrid_device, non_blocking=True),
+            cond=cond.to(self.hybrid_device, non_blocking=True),
+            **kwargs,
+        )
+        if self.hybrid_feat_encoder:
+            return result
+        return result.to(self.device, non_blocking=True)
+
+    def optimize_hybrid_decoder(self, disable: bool = False) -> "VoxCPM2Model":
+        """Compile only the CUDA DiT estimator used by hybrid inference."""
+        if disable or self.hybrid_decoder_optimized:
+            return self
+        if self.hybrid_device is None:
+            raise ValueError("Hybrid decoder optimization requires hybrid inference")
+        try:
+            import triton  # noqa: F401
+
+            self.feat_decoder.estimator = torch.compile(
+                self.feat_decoder.estimator,
+                # CUDA Graph capture in reduce-overhead mode changes the
+                # autoregressive branch after warm-up on this low-VRAM path.
+                mode="default",
+                fullgraph=True,
+            )
+            self.hybrid_decoder_optimized = True
+            print("[voxcpm2] hybrid CUDA DiT optimization enabled", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: hybrid DiT torch.compile disabled - {exc}", file=sys.stderr)
+        return self
+
+    def _hybrid_base_prefill(self, inputs_embeds: torch.Tensor):
+        if not self.hybrid_base_lm:
+            return self.base_lm(inputs_embeds=inputs_embeds, is_causal=True)
+        outputs, caches = self.base_lm(
+            inputs_embeds=inputs_embeds.to(self.hybrid_device, non_blocking=True),
+            is_causal=True,
+        )
+        return outputs.to(self.device, non_blocking=True), caches
+
+    def _hybrid_base_step(self, inputs_embeds: torch.Tensor, position_id: torch.Tensor) -> torch.Tensor:
+        if not self.hybrid_base_lm:
+            return self.base_lm.forward_step(inputs_embeds, position_id)
+        output = self.base_lm.forward_step(
+            inputs_embeds.to(self.hybrid_device, non_blocking=True),
+            position_id.to(self.hybrid_device, non_blocking=True),
+        )
+        return output.to(self.device, non_blocking=True)
+
+    def _hybrid_residual_prefill(self, inputs_embeds: torch.Tensor):
+        if not self.hybrid_residual_lm:
+            return self.residual_lm(inputs_embeds=inputs_embeds, is_causal=True)
+        outputs, caches = self.residual_lm(
+            inputs_embeds=inputs_embeds.to(self.hybrid_device, non_blocking=True),
+            is_causal=True,
+        )
+        return outputs.to(self.device, non_blocking=True), caches
+
+    def _hybrid_residual_step(self, inputs_embeds: torch.Tensor, position_id: torch.Tensor) -> torch.Tensor:
+        if not self.hybrid_residual_lm:
+            return self.residual_lm.forward_step(inputs_embeds, position_id)
+        output = self.residual_lm.forward_step(
+            inputs_embeds.to(self.hybrid_device, non_blocking=True),
+            position_id.to(self.hybrid_device, non_blocking=True),
+        )
+        return output.to(self.device, non_blocking=True)
+
+    def _vae_decode_input(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self.hybrid_vae_decoder:
+            return latent.to(torch.float32)
+        decoder_dtype = next(self.audio_vae.decoder.parameters()).dtype
+        return latent.to(self.hybrid_device, dtype=decoder_dtype, non_blocking=True)
 
     def _apply_lora(self):
         """注入 LoRA 到 LM / DiT / 投影层"""
@@ -660,7 +855,7 @@ class VoxCPM2Model(nn.Module):
             if streaming:
                 with self.audio_vae.streaming_decode() as vae_dec:
                     for latent_pred, _, _ctx in inference_result:
-                        decode_audio = vae_dec.decode_chunk(latent_pred.to(torch.float32))
+                        decode_audio = vae_dec.decode_chunk(self._vae_decode_input(latent_pred))
                         decode_audio = decode_audio.squeeze(1).cpu()
                         self.last_successful_seed = last_attempt_seed
                         yield decode_audio
@@ -683,7 +878,7 @@ class VoxCPM2Model(nn.Module):
 
         if not streaming:
             self.last_successful_seed = last_attempt_seed
-            decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
+            decode_audio = self.audio_vae.decode(self._vae_decode_input(latent_pred))
             decode_patch_len = self.patch_size * self._decode_chunk_size
             if context_len > 0:
                 decode_audio = decode_audio[..., decode_patch_len * context_len :].squeeze(1).cpu()
@@ -934,9 +1129,23 @@ class VoxCPM2Model(nn.Module):
 
         # run inference
         target_text_length = len(self.text_tokenizer(target_text))
+        badcase_length_limit = target_text_length * retry_badcase_ratio_threshold
+        if mode in ("continuation", "ref_continuation"):
+            prompt_token_length = len(self.text_tokenizer(prompt_cache.get("prompt_text", "")))
+            prompt_audio_length = prompt_cache["audio_feat"].shape[0]
+            # A continuation that is much longer than the reference speaker's
+            # measured pace commonly contains the prompt transcript. Keep modest
+            # slack for pauses, then fall back instead of spending more full runs.
+            badcase_length_limit = _continuation_badcase_limit(
+                target_text_length,
+                prompt_token_length,
+                prompt_audio_length,
+                retry_badcase_ratio_threshold,
+            )
         retry_badcase_times = 0
         current_seed = materialize_generation_seed(seed)
         last_attempt_seed = current_seed
+        exhausted_continuation = False
         while retry_badcase_times < retry_badcase_max_times:
             last_attempt_seed = current_seed
             apply_generation_seed(last_attempt_seed)
@@ -947,7 +1156,7 @@ class VoxCPM2Model(nn.Module):
                 audio_feat,
                 audio_mask,
                 min_len=min_len,
-                max_len=min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len),
+                max_len=min(int(badcase_length_limit + 10), max_len),
                 inference_timesteps=inference_timesteps,
                 cfg_value=cfg_value,
                 streaming=streaming,
@@ -956,7 +1165,7 @@ class VoxCPM2Model(nn.Module):
             if streaming:
                 with self.audio_vae.streaming_decode() as vae_dec:
                     for latent_pred, pred_audio_feat, _ctx in inference_result:
-                        decode_audio = vae_dec.decode_chunk(latent_pred.to(torch.float32))
+                        decode_audio = vae_dec.decode_chunk(self._vae_decode_input(latent_pred))
                         decode_audio = decode_audio.squeeze(1).cpu()
                         self.last_successful_seed = last_attempt_seed
                         yield (decode_audio, target_text_token, pred_audio_feat)
@@ -964,21 +1173,49 @@ class VoxCPM2Model(nn.Module):
             else:
                 latent_pred, pred_audio_feat, context_len = next_and_close(inference_result)
                 if retry_badcase:
-                    if pred_audio_feat.shape[0] >= target_text_length * retry_badcase_ratio_threshold:
+                    if pred_audio_feat.shape[0] >= badcase_length_limit:
                         print(
                             f"  Badcase detected, audio_text_ratio={pred_audio_feat.shape[0] / target_text_length}, retrying...",
                             file=sys.stderr,
                         )
                         retry_badcase_times += 1
                         current_seed += 1
+                        if retry_badcase_times >= retry_badcase_max_times and mode in (
+                            "continuation",
+                            "ref_continuation",
+                        ):
+                            exhausted_continuation = True
                         continue
                     else:
                         break
                 else:
                     break
+        if not streaming and exhausted_continuation:
+            # Do not return a known bad continuation. Reuse the already encoded
+            # voice as an isolated reference so prompt text cannot enter the LM
+            # token stream. Left/right audio padding differs by at most one patch
+            # and is preferable to leaking the transcript into the result.
+            fallback_ref_feat = prompt_cache.get("ref_audio_feat", prompt_cache["audio_feat"])
+            print("  Continuation retries exhausted; falling back to isolated reference mode.", file=sys.stderr)
+            fallback_result = self._generate_with_prompt_cache(
+                target_text=target_text,
+                prompt_cache={"mode": "reference", "ref_audio_feat": fallback_ref_feat},
+                min_len=min_len,
+                max_len=max_len,
+                inference_timesteps=inference_timesteps,
+                cfg_value=cfg_value,
+                retry_badcase=retry_badcase,
+                retry_badcase_max_times=retry_badcase_max_times,
+                retry_badcase_ratio_threshold=min(retry_badcase_ratio_threshold, 3.0),
+                streaming=False,
+                streaming_prefix_len=streaming_prefix_len,
+                seed=current_seed,
+            )
+            yield next_and_close(fallback_result)
+            return
         if not streaming:
             self.last_successful_seed = last_attempt_seed
-            decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
+            decode_audio = self.audio_vae.decode(self._vae_decode_input(latent_pred))
             decode_patch_len = self.patch_size * self._decode_chunk_size
             if context_len > 0:
                 decode_audio = decode_audio[..., decode_patch_len * context_len :].squeeze(1).cpu()
@@ -1030,9 +1267,17 @@ class VoxCPM2Model(nn.Module):
                 - Predicted audio feature sequence so far as a List if ``streaming=True``, else as a concatenated Tensor
         """
         B, T, P, D = feat.shape
+        cache_limits = [
+            limit
+            for limit in (self.hybrid_cache_length, self.hybrid_residual_cache_length)
+            if limit is not None
+        ]
+        if cache_limits and T + max_len > min(cache_limits):
+            raise ValueError(
+                f"Hybrid input and generation length exceed the {min(cache_limits)}-token cache"
+            )
 
-        prefill_encoder = getattr(self, "_feat_encoder_raw", self.feat_encoder)
-        feat_embed = prefill_encoder(feat)  # [b, t, h_feat]
+        feat_embed = self._hybrid_feat_encode(feat)  # [b, t, h_feat]
         feat_embed = self.enc_to_lm_proj(feat_embed)
 
         if self.config.lm_config.use_mup:
@@ -1057,14 +1302,14 @@ class VoxCPM2Model(nn.Module):
             audio_indices = feat_mask.squeeze(0).nonzero(as_tuple=True)[0]
             context_len = min(streaming_prefix_len - 1, len(audio_indices))
             last_audio_indices = audio_indices[-context_len:]
-            pred_feat_seq = list(feat[:, last_audio_indices, :, :].split(1, dim=1))
+            context_feat = feat[:, last_audio_indices, :, :]
+            if self.hybrid_feat_encoder:
+                context_feat = context_feat.to(self.hybrid_device, non_blocking=True)
+            pred_feat_seq = list(context_feat.split(1, dim=1))
         else:
             pred_feat_seq = []
 
-        enc_outputs, kv_cache_tuple = self.base_lm(
-            inputs_embeds=combined_embed,
-            is_causal=True,
-        )
+        enc_outputs, kv_cache_tuple = self._hybrid_base_prefill(combined_embed)
         self.base_lm.kv_cache.fill_caches(kv_cache_tuple)
 
         enc_outputs = self.fsq_layer(enc_outputs) * feat_mask.unsqueeze(-1) + enc_outputs * text_mask.unsqueeze(-1)
@@ -1073,10 +1318,7 @@ class VoxCPM2Model(nn.Module):
         residual_enc_inputs = self.fusion_concat_proj(
             torch.cat((enc_outputs, feat_mask.unsqueeze(-1) * feat_embed), dim=-1)
         )
-        residual_enc_outputs, residual_kv_cache_tuple = self.residual_lm(
-            inputs_embeds=residual_enc_inputs,
-            is_causal=True,
-        )
+        residual_enc_outputs, residual_kv_cache_tuple = self._hybrid_residual_prefill(residual_enc_inputs)
         self.residual_lm.kv_cache.fill_caches(residual_kv_cache_tuple)
         residual_hidden = residual_enc_outputs[:, -1, :]
 
@@ -1085,7 +1327,7 @@ class VoxCPM2Model(nn.Module):
             dit_hidden_2 = self.res_to_dit_proj(residual_hidden)  # [b, h_dit]
             dit_hidden = torch.cat((dit_hidden_1, dit_hidden_2), dim=-1)
 
-            pred_feat = self.feat_decoder(
+            pred_feat = self._hybrid_feat_decode(
                 mu=dit_hidden,
                 patch_size=self.patch_size,
                 cond=prefix_feat_cond.transpose(1, 2).contiguous(),
@@ -1095,7 +1337,7 @@ class VoxCPM2Model(nn.Module):
                 1, 2
             )  # [b, p, d]
 
-            curr_embed = self.feat_encoder(pred_feat.unsqueeze(1))  # b, 1, c
+            curr_embed = self._hybrid_feat_encode(pred_feat.unsqueeze(1))  # b, 1, c
             curr_embed = self.enc_to_lm_proj(curr_embed)
 
             pred_feat_seq.append(pred_feat.unsqueeze(1))  # b, 1, p, d
@@ -1114,14 +1356,15 @@ class VoxCPM2Model(nn.Module):
             if i > min_len and stop_flag == 1:
                 break
 
-            lm_hidden = self.base_lm.forward_step(
+            lm_hidden = self._hybrid_base_step(
                 curr_embed[:, 0, :], torch.tensor([self.base_lm.kv_cache.step()], device=curr_embed.device)
             ).clone()
 
             lm_hidden = self.fsq_layer(lm_hidden)
             curr_residual_input = self.fusion_concat_proj(torch.cat((lm_hidden, curr_embed[:, 0, :]), dim=-1))
-            residual_hidden = self.residual_lm.forward_step(
-                curr_residual_input, torch.tensor([self.residual_lm.kv_cache.step()], device=curr_embed.device)
+            residual_hidden = self._hybrid_residual_step(
+                curr_residual_input,
+                torch.tensor([self.residual_lm.kv_cache.step()], device=curr_embed.device),
             ).clone()
 
         if not streaming:
@@ -1162,11 +1405,20 @@ class VoxCPM2Model(nn.Module):
             raise FileNotFoundError(
                 f"AudioVAE checkpoint not found. Expected either {audiovae_safetensors_path} or {audiovae_pth_path}"
             )
-        model = cls(config, tokenizer, audio_vae, lora_config, device=device)
         if not training:
-            lm_dtype = get_dtype(model.config.dtype)
-            model = model.to(lm_dtype)
+            # Construct inference weights in their final dtype. Building the 2B
+            # model in FP32 and converting it afterwards can exceed the Windows
+            # commit limit even on machines with enough physical RAM.
+            runtime_device = resolve_runtime_device(device, config.device)
+            lm_dtype = get_dtype(pick_runtime_dtype(runtime_device, config.dtype))
+            previous_dtype = torch.get_default_dtype()
+            try:
+                torch.set_default_dtype(lm_dtype)
+                model = cls(config, tokenizer, audio_vae, lora_config, device=device)
+            finally:
+                torch.set_default_dtype(previous_dtype)
         else:  # training mode
+            model = cls(config, tokenizer, audio_vae, lora_config, device=device)
             for name, param in model.named_parameters():
                 if "audio_vae" in name:  # freeze VAE weights
                     param.requires_grad = False

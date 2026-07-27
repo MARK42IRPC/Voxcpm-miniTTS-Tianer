@@ -11,7 +11,16 @@ class AudioFeatureProcessingPacker:
     audio tokens into the packed multimodal representation required by VoxCPM.
     """
 
-    def __init__(self, dataset_cnt: int, max_len: int, patch_size: int, feat_dim: int, audio_vae: nn.Module):
+    def __init__(
+        self,
+        dataset_cnt: int,
+        max_len: int,
+        patch_size: int,
+        feat_dim: int,
+        audio_vae: nn.Module,
+        audio_device: torch.device | None = None,
+        output_device: torch.device | None = None,
+    ):
         self.audio_start_id = 101
         self.audio_end_id = 102
         self.audio_prompt_start_id = 103
@@ -25,6 +34,8 @@ class AudioFeatureProcessingPacker:
         self.max_len = max_len
 
         self.audio_vae = audio_vae
+        self.audio_device = audio_device or next(audio_vae.parameters()).device
+        self.output_device = output_device or self.audio_device
 
         self.process_functions = {"tts": self.process_tts_data}
         self.task_id_map = {"tts": 1}
@@ -55,7 +66,7 @@ class AudioFeatureProcessingPacker:
         AudioVAE.encode expects shape [B, 1, T'] and returns [B, D, T].
         We then transpose to [B, T, D] to match downstream expectations.
         """
-        wav = wav.unsqueeze(0)  # [1, T]
+        wav = wav.to(self.audio_device).unsqueeze(0)  # [1, T]
         wav = wav.unsqueeze(1)  # [1, 1, T]
         wav_len = wav.size(-1)
         if wav_len % self.patch_len != 0:
@@ -64,7 +75,7 @@ class AudioFeatureProcessingPacker:
 
         with torch.no_grad():
             z = self.audio_vae.encode(wav, self.audio_vae.sample_rate)  # [1, D, T']
-            feat = z.transpose(1, 2)  # [1, T', D]
+            feat = z.transpose(1, 2).to(self.output_device)  # [1, T', D]
         return feat
 
     # ------------------------------------------------------------------ #

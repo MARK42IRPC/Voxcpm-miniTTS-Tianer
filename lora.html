@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoxCPM LoRA 训练</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f4f6f7;
+      --surface: #ffffff;
+      --surface-muted: #eef1f2;
+      --ink: #171a1c;
+      --muted: #657078;
+      --line: #d9dfe2;
+      --green: #147a55;
+      --green-hover: #0f6848;
+      --teal: #147684;
+      --red: #b43b3b;
+      --amber: #9a6814;
+      --shadow: 0 12px 30px rgba(25, 35, 40, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { overflow-x: hidden; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      min-height: 100vh;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button, input, select { min-width: 0; max-width: 100%; font: inherit; letter-spacing: 0; }
+    button, label, select { cursor: pointer; }
+
+    .topbar {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 0 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand img { width: 34px; height: 34px; object-fit: contain; }
+    .brand strong { font-size: 17px; white-space: nowrap; }
+    .top-actions { display: flex; align-items: center; gap: 16px; }
+    .nav { display: flex; align-items: center; gap: 4px; padding: 3px; background: var(--surface-muted); border-radius: 6px; }
+    .nav a { padding: 7px 12px; border-radius: 4px; color: var(--muted); font-size: 13px; text-decoration: none; }
+    .nav a.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20, 28, 32, 0.12); }
+    .device-status { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa3a8; }
+    .status-dot.ready { background: var(--green); }
+    .status-dot.running { background: var(--teal); }
+    .status-dot.error { background: var(--red); }
+    .status-dot.warning { background: var(--amber); }
+
+    main { width: 100%; max-width: 1480px; margin: 0 auto; padding: 24px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; align-items: start; gap: 20px; }
+    .trainer, .monitor { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); overflow: hidden; }
+    .section { padding: 22px 24px; }
+    .section + .section { border-top: 1px solid var(--line); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .section-title { margin: 0; font-size: 14px; }
+    .section-state { color: var(--muted); font-size: 12px; }
+
+    .field { display: grid; gap: 7px; min-width: 0; }
+    .field label { font-size: 12px; font-weight: 650; }
+    .field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .field-grid + .field-grid { margin-top: 14px; }
+
+    .tooltip-trigger {
+      position: relative;
+      display: inline-flex;
+      width: max-content;
+      max-width: 100%;
+      align-items: center;
+      gap: 5px;
+      outline: 0;
+    }
+    .tooltip-trigger::after {
+      content: "?";
+      display: inline-grid;
+      place-items: center;
+      flex: 0 0 16px;
+      width: 16px;
+      height: 16px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .tooltip-trigger:hover::after, .tooltip-trigger:focus-visible::after { border-color: var(--teal); color: var(--teal); }
+    .tooltip-trigger:focus-visible { border-radius: 3px; box-shadow: 0 0 0 2px rgba(20, 118, 132, 0.18); }
+    .property-tooltip {
+      position: fixed;
+      z-index: 1000;
+      width: max-content;
+      max-width: min(320px, calc(100vw - 24px));
+      padding: 8px 10px;
+      border: 1px solid #3e484d;
+      border-radius: 5px;
+      background: #20272a;
+      color: #fff;
+      box-shadow: 0 8px 20px rgba(20, 28, 32, 0.18);
+      font-size: 12px;
+      line-height: 1.55;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(2px);
+      transition: opacity 100ms, transform 100ms;
+    }
+    .property-tooltip.visible { opacity: 1; transform: translateY(0); }
+    input[type="text"], input[type="number"], select {
+      width: 100%;
+      height: 40px;
+      padding: 0 11px;
+      border: 1px solid #c9d0d4;
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 118, 132, 0.12); }
+    input:disabled, select:disabled { cursor: not-allowed; opacity: 0.58; }
+
+    .model-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .model-option { position: relative; }
+    .model-option input { position: absolute; opacity: 0; pointer-events: none; }
+    .model-option label { display: grid; gap: 4px; min-height: 70px; padding: 13px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .model-option .tooltip-trigger { width: auto; max-width: none; }
+    .model-option .tooltip-trigger::after { position: absolute; top: 9px; right: 9px; }
+    .model-option strong { font-size: 13px; }
+    .model-option span { color: var(--muted); font-size: 11px; }
+    .model-option input:checked + label { border-color: var(--teal); background: #eef8f9; }
+    .model-option input:disabled + label { cursor: not-allowed; opacity: 0.5; }
+
+    .dataset-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+    .secondary { height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--teal); font-weight: 700; }
+    .secondary:hover { border-color: var(--teal); }
+    .secondary:disabled { cursor: wait; opacity: 0.55; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .stat { padding: 12px 8px; text-align: center; }
+    .stat + .stat { border-left: 1px solid var(--line); }
+    .stat strong { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .stat span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+
+    .toggles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
+    .toggle-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
+    .switch input { position: absolute; opacity: 0; }
+    .switch span { position: absolute; inset: 0; border-radius: 12px; background: #bdc5c9; transition: background 120ms; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: transform 120ms; }
+    .switch input:checked + span { background: var(--green); }
+    .switch input:checked + span::after { transform: translateX(18px); }
+
+    .actionbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; background: #fafbfb; border-top: 1px solid var(--line); }
+    .message { min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .message.error { color: var(--red); }
+    .actions { display: flex; gap: 8px; }
+    .primary, .pause { min-width: 118px; height: 42px; border: 0; border-radius: 6px; color: #fff; font-weight: 700; }
+    .primary { background: var(--green); }
+    .primary:hover { background: var(--green-hover); }
+    .pause { background: var(--amber); }
+    .pause:hover { background: #80550f; }
+    .primary:disabled, .pause:disabled { cursor: not-allowed; opacity: 0.48; }
+
+    .monitor { position: sticky; top: 20px; max-height: calc(100vh - 40px); display: grid; grid-template-rows: auto minmax(250px, 1fr) auto; }
+    .monitor-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--line); }
+    .run-state { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .run-state strong { font-size: 13px; }
+    .elapsed { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .logs { margin: 0; min-height: 300px; padding: 14px; overflow: auto; background: #171a1c; color: #dce4e6; font: 12px/1.55 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .checkpoint-section { border-top: 1px solid var(--line); }
+    .checkpoint-head { display: flex; align-items: center; justify-content: space-between; padding: 13px 16px; }
+    .checkpoint-head strong { font-size: 12px; }
+    .checkpoint-count { color: var(--muted); font-size: 11px; }
+    .checkpoint-list { max-height: 190px; overflow-y: auto; padding: 0 10px 10px; }
+    .checkpoint { padding: 10px 6px; border-top: 1px solid var(--line); }
+    .checkpoint:first-child { border-top: 0; }
+    .checkpoint strong { display: block; font-size: 12px; }
+    .checkpoint span { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+    .empty { padding: 16px 8px; color: var(--muted); font-size: 12px; text-align: center; }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: minmax(0, 1fr); }
+      .monitor { position: static; max-height: 720px; }
+    }
+    @media (max-width: 720px) {
+      .topbar { height: auto; min-height: 64px; padding: 10px 14px; }
+      .brand strong, .device-status { display: none; }
+      main { padding: 12px; }
+      .section { padding: 18px 16px; }
+      .field-grid, .stats, .toggles { grid-template-columns: 1fr 1fr; }
+      .actionbar { align-items: stretch; flex-direction: column; padding: 16px; }
+      .actions { width: 100%; }
+      .primary, .pause { flex: 1; min-width: 0; }
+    }
+    @media (max-width: 480px) {
+      .field-grid, .model-grid, .toggles { grid-template-columns: minmax(0, 1fr); }
+      .dataset-row { grid-template-columns: minmax(0, 1fr); }
+      .secondary { width: 100%; }
+      .nav a { padding: 7px 9px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/assets/voxcpm_logo.png" alt="VoxCPM">
+      <strong>VoxCPM 本地推理</strong>
+    </div>
+    <div class="top-actions">
+      <nav class="nav" aria-label="页面切换">
+        <a href="/" target="_blank" rel="noopener">推理</a>
+        <a class="active" href="/lora">LoRA 训练</a>
+        <a href="/distill">蒸馏</a>
+      </nav>
+      <div class="device-status" id="deviceStatus"><span class="status-dot"></span><span>正在检查设备</span></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="layout">
+      <form class="trainer" id="trainingForm">
+        <section class="section">
+          <div class="section-head"><h1 class="section-title">基础模型</h1><span class="section-state" id="modelState"></span></div>
+          <div class="model-grid">
+            <div class="model-option">
+              <input id="model05" name="model_key" type="radio" value="voxcpm-0.5b" checked>
+              <label class="tooltip-trigger" for="model05" tabindex="0" data-tooltip="以 VoxCPM 0.5B 为基础模型训练，显存需求较低，适合当前 4 GB 显卡，生成采样率为 16kHz。"><strong>VoxCPM 0.5B</strong><span>16kHz · 本机低显存配置</span></label>
+            </div>
+            <div class="model-option">
+              <input id="model15" name="model_key" type="radio" value="voxcpm1.5">
+              <label class="tooltip-trigger" for="model15" tabindex="0" data-tooltip="以 VoxCPM1.5 0.6B 为基础模型训练，输出 44.1kHz。4 GB 显存仅建议批次 1、Rank 4、开启低显存模式；这是实验性极限配置，仍可能因样本长度或训练目标过多而显存不足。"><strong>VoxCPM1.5 0.6B</strong><span>44.1kHz · 4GB 极限配置</span></label>
+            </div>
+            <div class="model-option">
+              <input id="model2" name="model_key" type="radio" value="voxcpm2">
+              <label class="tooltip-trigger" for="model2" tabindex="0" data-tooltip="以 VoxCPM2 2B 为基础模型训练，能力和输出采样率更高，但 LoRA 训练需要约 8 GB 或更多显存。"><strong>VoxCPM2 2B</strong><span>48kHz · 需要更大显存</span></label>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">训练数据</h2><span class="section-state" id="datasetState">未检查</span></div>
+          <div class="field">
+            <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="包含训练 WAV 和同名 .lab 文本的本地目录。开始训练前会检查文件配对、采样率、声道和音频时长。">训练集目录</label>
+            <div class="dataset-row">
+              <input id="datasetDir" name="dataset_dir" type="text" value="D:\音频素材\爱弥斯语音训练集\train\wavs">
+              <button class="secondary" id="inspectButton" type="button">检查数据集</button>
+            </div>
+          </div>
+          <div class="stats">
+            <div class="stat"><strong id="fileCount">-</strong><span>音频</span></div>
+            <div class="stat"><strong id="totalMinutes">-</strong><span>分钟</span></div>
+            <div class="stat"><strong id="sampleRate">-</strong><span>采样率</span></div>
+            <div class="stat"><strong id="durationRange">-</strong><span>时长范围</span></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">训练参数</h2><span class="section-state" id="scheduleState">等待数据集</span></div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="outputName" tabindex="0" data-tooltip="训练任务和检查点目录的名称。留空时按当前时间自动命名，同名任务会继续写入同一任务目录。">任务名称</label><input id="outputName" name="output_name" type="text" placeholder="自动使用时间命名"></div>
+            <div class="field"><label class="tooltip-trigger" for="numEpochs" tabindex="0" data-tooltip="完整遍历训练集的次数。后端会结合样本数、批次大小和梯度累积自动换算优化步数；默认 20 轮适合先观察 LoRA 收敛情况。">训练轮数</label><input id="numEpochs" name="num_epochs" type="number" min="1" max="1000" value="20"></div>
+            <div class="field"><label class="tooltip-trigger" for="learningRate" tabindex="0" data-tooltip="每次更新 LoRA 权重的幅度。默认 0.0001 是常用 LoRA 起点，输入支持七位小数，也可以直接设置为 0.00009 等数值。">学习率</label><input id="learningRate" name="learning_rate" type="number" min="0.0000001" max="0.1" step="0.0000001" value="0.0001"></div>
+          </div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="batchSize" tabindex="0" data-tooltip="一次前向和反向计算处理的样本数，直接影响显存峰值。4 GB 显存建议保持为 1。">批次大小</label><input id="batchSize" name="batch_size" type="number" min="1" max="32" value="1"></div>
+            <div class="field"><label class="tooltip-trigger" for="gradAccum" tabindex="0" data-tooltip="累积多批梯度后再更新一次参数。有效批次约等于批次大小乘以该值，可用更多耗时换取较低显存和更稳定的梯度。">梯度累积</label><input id="gradAccum" name="grad_accum_steps" type="number" min="1" max="256" value="16"></div>
+            <div class="field"><label class="tooltip-trigger" for="saveEveryEpochs" tabindex="0" data-tooltip="每隔多少个训练轮次保存一个 LoRA 检查点。后端会自动换算为优化步间隔，默认每 5 轮保存一次。">每 N 轮保存</label><input id="saveEveryEpochs" name="save_every_epochs" type="number" min="1" max="20" value="5"></div>
+          </div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="loraRank" tabindex="0" data-tooltip="LoRA 低秩矩阵的容量。更高 Rank 可学习更复杂的变化，但会增加可训练参数、显存占用和检查点大小。">LoRA Rank</label><input id="loraRank" name="lora_rank" type="number" min="1" max="256" value="4"></div>
+            <div class="field"><label class="tooltip-trigger" for="loraAlpha" tabindex="0" data-tooltip="LoRA 更新的缩放强度，实际缩放约为 Alpha 除以 Rank。默认 Alpha 为 Rank 的两倍。">LoRA Alpha</label><input id="loraAlpha" name="lora_alpha" type="number" min="1" max="1024" value="8"></div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">训练目标</h2><span class="section-state">DiT 音色适配</span></div>
+          <div class="toggles">
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="训练扩散声学解码器的注意力层，主要学习音色和声学表现，是当前设备上优先推荐的训练目标。">DiT LoRA</span><label class="switch"><input id="enableDit" name="enable_dit" type="checkbox" checked><span></span></label></div>
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="同时训练基础和残差语言模型的注意力层，可影响韵律与内容建模，但参数量、显存占用和输出漂移风险更高。">Base LM LoRA</span><label class="switch"><input id="enableLm" name="enable_lm" type="checkbox"><span></span></label></div>
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="训练编码器、语言模型和扩散模块之间的投影层，用较少参数调整跨模块条件映射。">投影层 LoRA</span><label class="switch"><input id="enableProj" name="enable_proj" type="checkbox"><span></span></label></div>
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="把音频编码等高占用环节放到 CPU，降低 GPU 显存峰值，代价是数据准备和训练速度变慢。">4GB 低显存模式</span><label class="switch"><input id="lowVram" name="low_vram" type="checkbox" checked><span></span></label></div>
+          </div>
+        </section>
+
+        <div class="actionbar">
+          <div class="message" id="message">就绪</div>
+          <div class="actions">
+            <button class="pause" id="pauseButton" type="button" disabled title="暂停会保存检查点并释放显存">暂停训练</button>
+            <button class="primary" id="startButton" type="submit">开始训练</button>
+          </div>
+        </div>
+      </form>
+
+      <aside class="monitor">
+        <div class="monitor-head">
+          <div class="run-state"><span class="status-dot" id="runDot"></span><strong id="runState">未运行</strong></div>
+          <span class="elapsed" id="elapsed">00:00:00</span>
+        </div>
+        <pre class="logs" id="logs">等待训练任务</pre>
+        <div class="checkpoint-section">
+          <div class="checkpoint-head"><strong>检查点</strong><span class="checkpoint-count" id="checkpointCount">0</span></div>
+          <div class="checkpoint-list" id="checkpointList"><div class="empty">暂无检查点</div></div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const form = document.getElementById("trainingForm");
+    const datasetDir = document.getElementById("datasetDir");
+    const inspectButton = document.getElementById("inspectButton");
+    const startButton = document.getElementById("startButton");
+    const pauseButton = document.getElementById("pauseButton");
+    const message = document.getElementById("message");
+    const logs = document.getElementById("logs");
+    const modelInputs = [...document.querySelectorAll('input[name="model_key"]')];
+    const booleanInputs = ["enableDit", "enableLm", "enableProj", "lowVram"];
+    const numEpochs = document.getElementById("numEpochs");
+    const batchSize = document.getElementById("batchSize");
+    const gradAccum = document.getElementById("gradAccum");
+    const saveEveryEpochs = document.getElementById("saveEveryEpochs");
+    let statusData = null;
+    let datasetReady = false;
+    let datasetFileCount = 0;
+    const propertyTooltip = document.createElement("div");
+    propertyTooltip.className = "property-tooltip";
+    propertyTooltip.id = "propertyTooltip";
+    propertyTooltip.role = "tooltip";
+    propertyTooltip.setAttribute("aria-hidden", "true");
+    document.body.append(propertyTooltip);
+    let activeTooltipTarget = null;
+    let tooltipTimer = null;
+
+    function positionPropertyTooltip(target) {
+      const margin = 12;
+      const gap = 8;
+      const targetRect = target.getBoundingClientRect();
+      const tooltipRect = propertyTooltip.getBoundingClientRect();
+      let left = targetRect.left + (targetRect.width - tooltipRect.width) / 2;
+      left = Math.max(margin, Math.min(left, window.innerWidth - tooltipRect.width - margin));
+      let top = targetRect.top - tooltipRect.height - gap;
+      if (top < margin) top = targetRect.bottom + gap;
+      if (top + tooltipRect.height > window.innerHeight - margin) {
+        top = Math.max(margin, window.innerHeight - tooltipRect.height - margin);
+      }
+      propertyTooltip.style.left = `${Math.round(left)}px`;
+      propertyTooltip.style.top = `${Math.round(top)}px`;
+    }
+
+    function showPropertyTooltip(target, immediate = false) {
+      clearTimeout(tooltipTimer);
+      const reveal = () => {
+        if (!target.isConnected) return;
+        activeTooltipTarget?.removeAttribute("aria-describedby");
+        activeTooltipTarget = target;
+        propertyTooltip.textContent = target.dataset.tooltip;
+        propertyTooltip.setAttribute("aria-hidden", "false");
+        target.setAttribute("aria-describedby", propertyTooltip.id);
+        propertyTooltip.classList.add("visible");
+        positionPropertyTooltip(target);
+      };
+      if (immediate) reveal();
+      else tooltipTimer = setTimeout(reveal, 350);
+    }
+
+    function hidePropertyTooltip() {
+      clearTimeout(tooltipTimer);
+      activeTooltipTarget?.removeAttribute("aria-describedby");
+      activeTooltipTarget = null;
+      propertyTooltip.classList.remove("visible");
+      propertyTooltip.setAttribute("aria-hidden", "true");
+    }
+
+    document.addEventListener("mouseover", (event) => {
+      const target = event.target.closest?.(".tooltip-trigger");
+      if (!target || target === activeTooltipTarget) return;
+      showPropertyTooltip(target);
+    });
+    document.addEventListener("mouseout", (event) => {
+      const target = event.target.closest?.(".tooltip-trigger");
+      if (!target || target.contains(event.relatedTarget)) return;
+      hidePropertyTooltip();
+    });
+    document.addEventListener("focusin", (event) => {
+      const target = event.target.closest?.(".tooltip-trigger");
+      if (target) showPropertyTooltip(target, true);
+    });
+    document.addEventListener("focusout", (event) => {
+      const target = event.target.closest?.(".tooltip-trigger");
+      if (target && !target.contains(event.relatedTarget)) hidePropertyTooltip();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") hidePropertyTooltip();
+    });
+    window.addEventListener("scroll", hidePropertyTooltip, true);
+    window.addEventListener("resize", hidePropertyTooltip);
+
+    function formatElapsed(seconds) {
+      const value = Math.max(0, Math.floor(seconds || 0));
+      const hours = Math.floor(value / 3600);
+      const minutes = Math.floor((value % 3600) / 60);
+      const secs = value % 60;
+      return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+    }
+
+    function selectedModel() {
+      return modelInputs.find((input) => input.checked).value;
+    }
+
+    function modelSupported() {
+      return Boolean(statusData?.models?.[selectedModel()]?.supported_on_current_gpu);
+    }
+
+    function updateSchedulePreview() {
+      const epochs = Math.max(1, Number(numEpochs.value) || 1);
+      const effectiveBatch = Math.max(1, Number(batchSize.value) || 1) * Math.max(1, Number(gradAccum.value) || 1);
+      saveEveryEpochs.max = String(epochs);
+      if (Number(saveEveryEpochs.value) > epochs) saveEveryEpochs.value = String(epochs);
+      document.getElementById("scheduleState").textContent = datasetFileCount
+        ? `${epochs} 轮 · 预计 ${Math.ceil(datasetFileCount * epochs / effectiveBatch)} 步 · 有效批次 ${effectiveBatch}`
+        : "等待数据集";
+    }
+
+    function updateModelState() {
+      if (!statusData) return;
+      const model = statusData.models[selectedModel()];
+      const state = document.getElementById("modelState");
+      state.textContent = !model.installed ? "未安装" : model.supported_on_current_gpu ? "可训练" : "当前显存不足";
+      state.style.color = model.supported_on_current_gpu ? "var(--green)" : "var(--red)";
+      startButton.disabled = statusData.running || !datasetReady || !model.installed || !model.supported_on_current_gpu;
+    }
+
+    async function inspectDataset() {
+      inspectButton.disabled = true;
+      document.getElementById("datasetState").textContent = "检查中";
+      const data = new FormData();
+      data.set("dataset_dir", datasetDir.value.trim());
+      try {
+        const response = await fetch("/api/lora/dataset", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "数据集检查失败");
+        datasetReady = true;
+        datasetFileCount = Number(result.file_count);
+        document.getElementById("datasetState").textContent = "可用";
+        document.getElementById("fileCount").textContent = result.file_count;
+        document.getElementById("totalMinutes").textContent = Number(result.total_minutes).toFixed(2);
+        document.getElementById("sampleRate").textContent = `${Object.keys(result.sample_rates).join("/")} Hz`;
+        document.getElementById("durationRange").textContent = `${Number(result.min_duration).toFixed(1)}-${Number(result.max_duration).toFixed(1)}s`;
+        message.className = "message";
+        message.textContent = `${result.file_count} 条音频 · ${Number(result.total_minutes).toFixed(2)} 分钟 · 文本匹配完整`;
+        updateSchedulePreview();
+      } catch (error) {
+        datasetReady = false;
+        datasetFileCount = 0;
+        document.getElementById("datasetState").textContent = "不可用";
+        message.className = "message error";
+        message.textContent = error.message;
+        updateSchedulePreview();
+      } finally {
+        inspectButton.disabled = false;
+        updateModelState();
+      }
+    }
+
+    function renderCheckpoints(items) {
+      const list = document.getElementById("checkpointList");
+      document.getElementById("checkpointCount").textContent = String(items.length);
+      list.replaceChildren();
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "暂无检查点";
+        list.append(empty);
+        return;
+      }
+      items.slice(0, 20).forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "checkpoint";
+        const title = document.createElement("strong");
+        title.textContent = `${item.job_name} · ${item.name}`;
+        const path = document.createElement("span");
+        path.textContent = item.path;
+        row.append(title, path);
+        list.append(row);
+      });
+    }
+
+    function renderStatus(data) {
+      statusData = data;
+      const stateLabels = { idle: "未运行", running: "训练中", pausing: "正在暂停", paused: "已暂停", completed: "已完成", failed: "训练失败" };
+      const runState = document.getElementById("runState");
+      const runDot = document.getElementById("runDot");
+      runState.textContent = stateLabels[data.status] || data.status;
+      runDot.className = `status-dot ${data.running ? "running" : data.status === "failed" ? "error" : data.status === "completed" ? "ready" : ""}`;
+      document.getElementById("elapsed").textContent = formatElapsed(data.elapsed_seconds);
+      const nearBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 48;
+      logs.textContent = data.logs || "等待训练任务";
+      if (nearBottom) logs.scrollTop = logs.scrollHeight;
+      pauseButton.disabled = !data.running || !data.pause_supported || data.status === "pausing";
+      pauseButton.title = data.pause_supported
+        ? "完成当前批次后保存检查点、退出训练并释放显存"
+        : "当前服务仍在运行旧版本；需在本次训练结束后重启 WebUI 才能使用安全暂停";
+      startButton.textContent = data.status === "paused" ? "继续训练" : "开始训练";
+      form.querySelectorAll("input").forEach((input) => { input.disabled = data.running; });
+      inspectButton.disabled = data.running;
+      document.getElementById("deviceStatus").querySelector(".status-dot").className = `status-dot ${data.cuda_available ? "ready" : "error"}`;
+      document.getElementById("deviceStatus").querySelector("span:last-child").textContent = data.cuda_available
+        ? `${data.gpu_name} · ${data.gpu_memory_gb} GB`
+        : "CUDA 不可用";
+      modelInputs.forEach((input) => { input.disabled = data.running || !data.models[input.value].installed; });
+      renderCheckpoints(data.checkpoints || []);
+      updateModelState();
+    }
+
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/api/lora/status");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "状态获取失败");
+        renderStatus(data);
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      }
+    }
+
+    inspectButton.addEventListener("click", inspectDataset);
+    datasetDir.addEventListener("input", () => {
+      datasetReady = false;
+      datasetFileCount = 0;
+      updateSchedulePreview();
+      updateModelState();
+    });
+    modelInputs.forEach((input) => input.addEventListener("change", updateModelState));
+    [numEpochs, batchSize, gradAccum, saveEveryEpochs].forEach((input) => {
+      input.addEventListener("input", updateSchedulePreview);
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      startButton.disabled = true;
+      message.className = "message";
+      message.textContent = "正在启动训练";
+      const data = new FormData(form);
+      booleanInputs.forEach((id) => {
+        const input = document.getElementById(id);
+        data.set(input.name, input.checked ? "true" : "false");
+      });
+      try {
+        const response = await fetch("/api/lora/train", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "训练启动失败");
+        message.textContent = `${result.job_name} · ${result.schedule.num_epochs} 轮 · ${result.schedule.optimizer_steps} 步 · 已启动`;
+        await refreshStatus();
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+        updateModelState();
+      }
+    });
+
+    pauseButton.addEventListener("click", async () => {
+      pauseButton.disabled = true;
+      try {
+        const response = await fetch("/api/lora/pause", { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "暂停失败");
+        message.className = "message";
+        message.textContent = "暂停请求已发送，将在当前批次完成后保存并释放显存";
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      }
+      await refreshStatus();
+    });
+
+    updateSchedulePreview();
+    refreshStatus().then(inspectDataset);
+    setInterval(refreshStatus, 1000);
+  </script>
+</body>
+</html>

@@ -16,6 +16,7 @@ from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 import signal
 import os
+import time
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -66,6 +67,8 @@ def train(
     lora: dict = None,
     config_path: str = "",
     max_grad_norm: float = 0.0,  # gradient clipping; 0 = disabled (backward compat)
+    low_vram: bool = False,
+    audio_encoder_device: str = "",
     # Distribution options (for LoRA checkpoints)
     hf_model_id: str = "",  # HuggingFace model ID (e.g., "openbmb/VoxCPM1.5")
     distribute: bool = False,  # If True, save hf_model_id as base_model; otherwise save pretrained_path
@@ -79,6 +82,7 @@ def train(
     accelerator = Accelerator(amp=True)
 
     save_dir = Path(save_path)
+    pause_request_path = save_dir / ".pause-request"
     tb_dir = Path(tensorboard) if tensorboard else save_dir / "logs"
 
     # Only create directories on rank 0 to avoid race conditions
@@ -174,11 +178,17 @@ def train(
         else None
     )
 
+    resolved_audio_device = (
+        torch.device(audio_encoder_device)
+        if audio_encoder_device
+        else (torch.device("cpu") if low_vram else accelerator.device)
+    )
     batch_processor = BatchProcessor(
         config=base_model.config,
         audio_vae=base_model.audio_vae,
         dataset_cnt=dataset_cnt,
         device=accelerator.device,
+        audio_device=resolved_audio_device,
     )
     # Save audio_vae and output sample rate for audio generation.
     # Prefer model's actual output rate; fall back to YAML out_sample_rate or encode rate.
@@ -187,14 +197,36 @@ def train(
     if out_sr == 0 and out_sample_rate > 0:
         out_sr = out_sample_rate
     del base_model.audio_vae
+    if low_vram:
+        base_model.base_lm.kv_cache = None
+        base_model.residual_lm.kv_cache = None
+        base_model.to(dtype=torch.bfloat16)
+        for param in base_model.parameters():
+            if param.requires_grad:
+                param.data = param.data.to(torch.float32)
+        if accelerator.rank == 0:
+            print(
+                f"Low-VRAM mode: frozen weights=BF16, trainable LoRA=FP32, AudioVAE={resolved_audio_device}",
+                file=sys.stderr,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     model = accelerator.prepare_model(base_model)
     unwrapped_model = accelerator.unwrap(model)
     unwrapped_model.train()
 
-    # Only print param info on rank 0 to avoid cluttered output
+    # Keep WebUI logs focused on the parameters that are actually optimized.
     if accelerator.rank == 0:
-        for name, param in model.named_parameters():
-            print(name, param.requires_grad, file=sys.stderr)
+        trainable = [(name, param.numel()) for name, param in model.named_parameters() if param.requires_grad]
+        trainable_count = sum(count for _, count in trainable)
+        total_count = sum(param.numel() for param in model.parameters())
+        print(
+            f"Trainable parameters: {trainable_count:,} / {total_count:,} "
+            f"({100 * trainable_count / max(total_count, 1):.4f}%)",
+            file=sys.stderr,
+        )
+        for name, _ in trainable:
+            print(f"  {name}", file=sys.stderr)
 
     optimizer = AdamW(
         (p for p in model.parameters() if p.requires_grad),
@@ -281,6 +313,7 @@ def train(
             # Gradient accumulation: accumulate gradients over micro-batches before optimizer step
             loss_dict = {}
             for micro_step in range(grad_accum_steps):
+                batch_started = time.perf_counter()
                 batch = get_next_batch()
                 processed = batch_processor(batch)
 
@@ -314,6 +347,43 @@ def train(
                     # Accumulate gradients (normalized by grad_accum_steps)
                     accelerator.backward(total_loss)
 
+                completed_batch = step * grad_accum_steps + micro_step + 1
+                total_batches = num_iters * grad_accum_steps
+                estimated_epoch = (
+                    completed_batch * batch_size * accelerator.world_size / max(1, num_train_samples)
+                )
+                tracker.print(
+                    f"[batch] {completed_batch}/{total_batches}, "
+                    f"optimizer step {step + 1}/{num_iters}, "
+                    f"accumulation {micro_step + 1}/{grad_accum_steps}, "
+                    f"epoch {estimated_epoch:.3f}, "
+                    f"elapsed {time.perf_counter() - batch_started:.2f}s"
+                )
+
+                if pause_request_path.is_file():
+                    tracker.print(
+                        f"[pause] request acknowledged after batch {completed_batch}; "
+                        f"saving resume step {step}"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    if accelerator.rank == 0:
+                        save_checkpoint(
+                            model,
+                            optimizer,
+                            scheduler,
+                            save_dir,
+                            step,
+                            pretrained_path,
+                            hf_model_id,
+                            distribute,
+                        )
+                        pause_request_path.unlink(missing_ok=True)
+                        tracker.print("[pause] checkpoint saved; training process is exiting")
+                    accelerator.barrier()
+                    if writer:
+                        writer.close()
+                    return
+
             # After all micro-batches, do unscale / grad_norm / step
             scaler = getattr(accelerator, "scaler", None)
             if scaler is not None:
@@ -324,6 +394,7 @@ def train(
             accelerator.step(optimizer)
             accelerator.update()
             scheduler.step()
+            resume["step"] = step + 1
 
             if step % log_interval == 0 or step == num_iters - 1:
                 loss_values = {k: v.item() if isinstance(v, torch.Tensor) else float(v) for k, v in loss_dict.items()}
@@ -332,6 +403,9 @@ def train(
                 epoch = (step * grad_accum_steps * batch_size * accelerator.world_size) / max(1, num_train_samples)
                 loss_values["epoch"] = float(epoch)
                 loss_values["grad_norm"] = float(grad_norm)
+                if torch.cuda.is_available():
+                    loss_values["cuda_allocated_gb"] = torch.cuda.max_memory_allocated() / 1024**3
+                    loss_values["cuda_reserved_gb"] = torch.cuda.max_memory_reserved() / 1024**3
                 tracker.log_metrics(loss_values, split="train")
 
             if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
@@ -353,8 +427,18 @@ def train(
                     valid_interval=valid_interval,
                 )
 
-            if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
-                save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
+            completed_step = step + 1
+            if (completed_step % save_interval == 0 or completed_step == num_iters) and accelerator.rank == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    save_dir,
+                    completed_step,
+                    pretrained_path,
+                    hf_model_id,
+                    distribute,
+                )
 
     if accelerator.rank == 0:
         save_checkpoint(model, optimizer, scheduler, save_dir, num_iters, pretrained_path, hf_model_id, distribute)
