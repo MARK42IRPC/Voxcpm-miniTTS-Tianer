@@ -175,7 +175,7 @@
           <div class="section-head"><h2 class="section-title">训练集设置</h2><span class="section-state" id="datasetState">未检查</span></div>
           <div class="field">
             <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="使用包含 WAV 和同名 .lab 的训练集。Piper 会自动重采样并生成音素缓存。">训练集</label>
-            <div class="dataset-row"><select id="datasetDir" name="dataset_dir"><option value="">正在读取训练集</option></select><button class="secondary" id="refreshDatasets" type="button">刷新</button><button class="secondary" id="inspectDataset" type="button">检查训练集</button></div>
+            <div class="dataset-row"><input id="datasetDir" name="dataset_dir" type="text" readonly placeholder="请选择包含 WAV 和同名 LAB 的文件夹"><button class="secondary" id="browseDataset" type="button">选择文件夹</button><button class="secondary" id="inspectDataset" type="button">检查训练集</button></div>
           </div>
           <div class="stats"><div class="stat"><strong id="fileCount">-</strong><span>训练对</span></div><div class="stat"><strong id="totalMinutes">-</strong><span>分钟</span></div><div class="stat"><strong id="sampleRates">-</strong><span>原采样率</span></div><div class="stat"><strong id="durationRange">-</strong><span>时长范围</span></div></div>
         </section>
@@ -300,6 +300,7 @@
       const trainable = data.student_engines.some((engine) => engine.id === currentEngine && engine.trainable);
       trainingSection.querySelectorAll("input, select").forEach((input) => { input.disabled = data.running || !trainable; });
       studentFamily.querySelectorAll("button").forEach((button) => { button.disabled = data.running; });
+      document.getElementById("browseDataset").disabled = data.running;
       stopButton.disabled = !data.running;
       const meloStartReady = currentEngine !== "sherpa_onnx" || baseCheckpoint.value !== "official-melotts-chinese" || data.melo_base?.installed;
       startButton.disabled = data.running || !trainable || !datasetReady || !data.cuda_available || !meloStartReady;
@@ -541,20 +542,52 @@
       } finally { refreshing = false; }
     }
 
-    async function loadDatasets() {
-      const current = datasetDir.value;
+    async function loadDatasets(selectedPath = "") {
+      const current = selectedPath || datasetDir.value;
       try {
         const response = await fetch("/api/training-datasets", { cache: "no-store" });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "训练集读取失败");
-        datasetDir.replaceChildren();
-        data.datasets.forEach((item) => datasetDir.add(new Option(`${item.name} · ${item.file_count} 条`, item.path)));
-        datasetDir.value = [...datasetDir.options].some((option) => option.value === current) ? current : data.default || "";
-        if (!datasetDir.options.length) datasetDir.add(new Option("没有可用训练集", ""));
-      } catch (error) { datasetDir.replaceChildren(new Option("训练集列表不可用", "")); }
+        datasetDir.value = current || data.default || "";
+        datasetDir.title = datasetDir.value;
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      }
+    }
+
+    async function browseDatasetDirectory() {
+      const button = document.getElementById("browseDataset");
+      button.disabled = true;
+      document.getElementById("datasetState").textContent = "选择中";
+      const data = new FormData(); data.set("initial_path", datasetDir.value);
+      try {
+        const response = await fetch("/api/training-datasets/browse", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "文件夹选择器启动失败");
+        if (result.cancelled) {
+          document.getElementById("datasetState").textContent = datasetReady ? "可用" : "未检查";
+          return;
+        }
+        await loadDatasets(result.path);
+        datasetReady = false;
+        await inspectDataset();
+      } catch (error) {
+        document.getElementById("datasetState").textContent = "选择失败";
+        message.className = "message error"; message.textContent = error.message;
+      } finally {
+        button.disabled = Boolean(statusData?.running);
+      }
     }
 
     async function inspectDataset() {
+      if (!datasetDir.value) {
+        datasetReady = false;
+        document.getElementById("datasetState").textContent = "未选择";
+        message.className = "message error"; message.textContent = "请先选择训练集文件夹";
+        if (statusData) applyControlState(statusData);
+        return;
+      }
       datasetReady = false;
       document.getElementById("datasetState").textContent = "检查中";
       const data = new FormData(); data.set("dataset_dir", datasetDir.value);
@@ -597,9 +630,8 @@
         updateTrainingMode();
       }
     });
-    document.getElementById("refreshDatasets").addEventListener("click", async () => { await loadDatasets(); await inspectDataset(); });
+    document.getElementById("browseDataset").addEventListener("click", browseDatasetDirectory);
     document.getElementById("inspectDataset").addEventListener("click", inspectDataset);
-    datasetDir.addEventListener("change", () => { datasetReady = false; document.getElementById("datasetState").textContent = "未检查"; startButton.disabled = true; });
     baseCheckpoint.addEventListener("change", () => { checkpointValues[currentEngine] = baseCheckpoint.value; if (statusData) applyControlState(statusData); });
     onnxModel.addEventListener("change", updateModelSummary);
     document.getElementById("quality").addEventListener("change", (event) => {
@@ -646,7 +678,7 @@
       await refreshStatus();
     });
 
-    Promise.all([loadDatasets(), refreshStatus(true)]).then(inspectDataset);
+    Promise.all([loadDatasets(), refreshStatus(true)]).then(() => { if (datasetDir.value) inspectDataset(); });
     setInterval(() => refreshStatus(false), 1500);
   </script>
 </body>

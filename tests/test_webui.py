@@ -432,6 +432,46 @@ def test_create_training_dataset_endpoint_creates_lists_and_rejects_duplicate(mo
     assert duplicate.json()["detail"] == "同名训练集已经存在"
 
 
+def test_register_training_dataset_resolves_standard_layout(monkeypatch, tmp_path):
+    dataset_root = tmp_path / "character"
+    wav_dir = dataset_root / "train" / "wavs"
+    wav_dir.mkdir(parents=True)
+    sf.write(wav_dir / "sample.wav", np.zeros(1600, dtype=np.float32), 16000)
+    registry = tmp_path / "cache" / "training-datasets.json"
+    monkeypatch.setattr(webui, "TRAINING_DATASET_REGISTRY", registry)
+    monkeypatch.setattr(webui, "DEFAULT_TRAINING_DATASET", tmp_path / "missing")
+
+    result = webui.register_training_dataset(dataset_root)
+    listed = webui.list_training_datasets()
+
+    assert Path(result["path"]) == wav_dir.resolve()
+    assert result["file_count"] == 1
+    assert json.loads(registry.read_text(encoding="utf-8")) == [str(wav_dir.resolve())]
+    assert any(item["path"] == str(wav_dir.resolve()) for item in listed)
+
+
+def test_browse_training_dataset_endpoint_registers_selection(monkeypatch, tmp_path):
+    wav_dir = tmp_path / "selected" / "train" / "wavs"
+    wav_dir.mkdir(parents=True)
+    monkeypatch.setattr(webui, "TRAINING_DATASET_REGISTRY", tmp_path / "registry.json")
+    monkeypatch.setattr(webui, "DEFAULT_TRAINING_DATASET", tmp_path / "missing")
+    monkeypatch.setattr(webui, "choose_training_dataset_directory", lambda initial: str(tmp_path / "selected"))
+    client = TestClient(webui.app)
+
+    response = client.post("/api/training-datasets/browse", data={"initial_path": ""})
+
+    assert response.status_code == 200
+    assert response.json()["cancelled"] is False
+    assert Path(response.json()["path"]) == wav_dir.resolve()
+
+
+def test_browse_training_dataset_endpoint_handles_cancel(monkeypatch):
+    monkeypatch.setattr(webui, "choose_training_dataset_directory", lambda initial: None)
+    response = TestClient(webui.app).post("/api/training-datasets/browse", data={"initial_path": ""})
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": True}
+
+
 @pytest.mark.parametrize("name", ["", "..", "角色/语音", "角色:语音", "CON", "LPT1.txt", "尾部."])
 def test_create_training_dataset_rejects_invalid_windows_names(monkeypatch, tmp_path, name):
     monkeypatch.setattr(webui, "TRAINING_DATASET_ROOT", tmp_path)

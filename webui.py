@@ -86,6 +86,8 @@ MODEL_PATHS = {
 DENOISER_PATH = ROOT / "pretrained_models" / "ZipEnhancer"
 TRAINING_DATASET_ROOT = Path(r"D:\音频素材")
 DEFAULT_TRAINING_DATASET = TRAINING_DATASET_ROOT / "爱弥斯语音训练集" / "train" / "wavs"
+TRAINING_DATASET_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "training-datasets.json"
+TRAINING_DATASET_REGISTRY_LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
@@ -796,6 +798,18 @@ async def create_training_dataset_endpoint(name: str = Form(...)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/training-datasets/browse")
+async def browse_training_dataset(initial_path: str = Form("")) -> dict:
+    try:
+        selected = await asyncio.to_thread(choose_training_dataset_directory, initial_path)
+        if selected is None:
+            return {"cancelled": True}
+        dataset = await asyncio.to_thread(register_training_dataset, selected)
+        return {"cancelled": False, "path": dataset["path"], "dataset": dataset}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/audio/postprocess")
 async def postprocess_generated_audio(
     filename: str = Form(...),
@@ -981,8 +995,105 @@ def create_training_dataset(name: str) -> dict:
     }
 
 
+def resolve_training_dataset_directory(directory: str | Path) -> Path:
+    selected = Path(directory).expanduser().resolve()
+    if not selected.is_dir():
+        raise ValueError(f"训练集目录不存在: {selected}")
+    if any(selected.glob("*.wav")):
+        return selected
+    for relative_path in (Path("train") / "wavs", Path("wavs")):
+        candidate = selected / relative_path
+        if candidate.is_dir():
+            return candidate.resolve()
+    return selected
+
+
+def _read_registered_training_datasets() -> list[Path]:
+    with TRAINING_DATASET_REGISTRY_LOCK:
+        if not TRAINING_DATASET_REGISTRY.is_file():
+            return []
+        try:
+            values = json.loads(TRAINING_DATASET_REGISTRY.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+    if not isinstance(values, list):
+        return []
+    paths = []
+    for value in values:
+        try:
+            path = Path(str(value)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if path.is_dir():
+            paths.append(path)
+    return paths
+
+
+def register_training_dataset(directory: str | Path) -> dict:
+    dataset_dir = resolve_training_dataset_directory(directory)
+    with TRAINING_DATASET_REGISTRY_LOCK:
+        registered = _read_registered_training_datasets()
+        unique_paths = {str(path).lower(): path for path in registered}
+        unique_paths[str(dataset_dir).lower()] = dataset_dir
+        TRAINING_DATASET_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = TRAINING_DATASET_REGISTRY.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps([str(path) for path in unique_paths.values()], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(TRAINING_DATASET_REGISTRY)
+    dataset_name = dataset_dir.parents[1].name if dataset_dir.name.lower() == "wavs" and len(dataset_dir.parents) > 1 else dataset_dir.name
+    return {
+        "name": dataset_name,
+        "path": str(dataset_dir),
+        "file_count": sum(1 for _ in dataset_dir.glob("*.wav")),
+        "default": dataset_dir == DEFAULT_TRAINING_DATASET.resolve(),
+    }
+
+
+def choose_training_dataset_directory(initial_path: str = "") -> str | None:
+    if os.name != "nt":
+        raise RuntimeError("文件夹选择器当前仅支持 Windows；请在 Windows 本地 WebUI 中使用")
+    initial = Path(initial_path).expanduser() if initial_path.strip() else DEFAULT_TRAINING_DATASET
+    if not initial.is_dir():
+        initial = TRAINING_DATASET_ROOT if TRAINING_DATASET_ROOT.is_dir() else ROOT
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择包含 WAV 和同名 LAB 的训练集文件夹'
+$dialog.ShowNewFolderButton = $true
+if ($env:VOXCPM_INITIAL_DATASET_DIR) { $dialog.SelectedPath = $env:VOXCPM_INITIAL_DATASET_DIR }
+try {
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        [Console]::Write($dialog.SelectedPath)
+    }
+}
+finally { $dialog.Dispose() }
+"""
+    env = os.environ.copy()
+    env["VOXCPM_INITIAL_DATASET_DIR"] = str(initial.resolve())
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "Windows 文件夹选择器启动失败"
+        raise RuntimeError(detail)
+    selected = completed.stdout.strip()
+    return selected or None
+
+
 def list_training_datasets() -> list[dict]:
     candidates = {DEFAULT_TRAINING_DATASET.resolve()}
+    candidates.update(_read_registered_training_datasets())
     audio_root = TRAINING_DATASET_ROOT
     if audio_root.is_dir():
         candidates.update(path.resolve() for path in audio_root.glob("*/train/wavs") if path.is_dir())

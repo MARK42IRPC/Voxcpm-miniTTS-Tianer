@@ -143,7 +143,7 @@
     .model-option input:checked + label { border-color: var(--teal); background: #eef8f9; }
     .model-option input:disabled + label { cursor: not-allowed; opacity: 0.5; }
 
-    .dataset-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+    .dataset-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; }
     .secondary { height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--teal); font-weight: 700; }
     .secondary:hover { border-color: var(--teal); }
     .secondary:disabled { cursor: wait; opacity: 0.55; }
@@ -254,7 +254,8 @@
           <div class="field">
             <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="包含训练 WAV 和同名 .lab 文本的本地目录。开始训练前会检查文件配对、采样率、声道和音频时长。">训练集目录</label>
             <div class="dataset-row">
-              <input id="datasetDir" name="dataset_dir" type="text" value="D:\音频素材\爱弥斯语音训练集\train\wavs">
+              <input id="datasetDir" name="dataset_dir" type="text" readonly placeholder="请选择包含 WAV 和同名 LAB 的文件夹">
+              <button class="secondary" id="browseDataset" type="button">选择文件夹</button>
               <button class="secondary" id="inspectButton" type="button">检查数据集</button>
             </div>
           </div>
@@ -320,6 +321,7 @@
   <script>
     const form = document.getElementById("trainingForm");
     const datasetDir = document.getElementById("datasetDir");
+    const browseDataset = document.getElementById("browseDataset");
     const inspectButton = document.getElementById("inspectButton");
     const startButton = document.getElementById("startButton");
     const pauseButton = document.getElementById("pauseButton");
@@ -443,6 +445,16 @@
     }
 
     async function inspectDataset() {
+      if (!datasetDir.value.trim()) {
+        datasetReady = false;
+        datasetFileCount = 0;
+        document.getElementById("datasetState").textContent = "未选择";
+        message.className = "message error";
+        message.textContent = "请先选择训练集文件夹";
+        updateSchedulePreview();
+        updateModelState();
+        return;
+      }
       inspectButton.disabled = true;
       document.getElementById("datasetState").textContent = "检查中";
       const data = new FormData();
@@ -474,6 +486,34 @@
       }
     }
 
+    async function browseDatasetDirectory() {
+      browseDataset.disabled = true;
+      document.getElementById("datasetState").textContent = "选择中";
+      const data = new FormData();
+      data.set("initial_path", datasetDir.value.trim());
+      try {
+        const response = await fetch("/api/training-datasets/browse", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "文件夹选择器启动失败");
+        if (result.cancelled) {
+          document.getElementById("datasetState").textContent = datasetReady ? "可用" : "未检查";
+          return;
+        }
+        datasetDir.value = result.path;
+        datasetDir.title = result.path;
+        datasetReady = false;
+        datasetFileCount = 0;
+        updateSchedulePreview();
+        await inspectDataset();
+      } catch (error) {
+        document.getElementById("datasetState").textContent = "选择失败";
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        browseDataset.disabled = Boolean(statusData?.running);
+      }
+    }
+
     function renderCheckpoints(items) {
       const list = document.getElementById("checkpointList");
       document.getElementById("checkpointCount").textContent = String(items.length);
@@ -499,6 +539,10 @@
 
     function renderStatus(data) {
       statusData = data;
+      if (!datasetDir.value && data.default_dataset) {
+        datasetDir.value = data.default_dataset;
+        datasetDir.title = data.default_dataset;
+      }
       const stateLabels = { idle: "未运行", running: "训练中", pausing: "正在暂停", paused: "已暂停", completed: "已完成", failed: "训练失败" };
       const runState = document.getElementById("runState");
       const runDot = document.getElementById("runDot");
@@ -514,6 +558,7 @@
         : "当前服务仍在运行旧版本；需在本次训练结束后重启 WebUI 才能使用安全暂停";
       startButton.textContent = data.status === "paused" ? "继续训练" : "开始训练";
       form.querySelectorAll("input").forEach((input) => { input.disabled = data.running; });
+      browseDataset.disabled = data.running;
       inspectButton.disabled = data.running;
       document.getElementById("deviceStatus").querySelector(".status-dot").className = `status-dot ${data.cuda_available ? "ready" : "error"}`;
       document.getElementById("deviceStatus").querySelector("span:last-child").textContent = data.cuda_available
@@ -536,6 +581,7 @@
       }
     }
 
+    browseDataset.addEventListener("click", browseDatasetDirectory);
     inspectButton.addEventListener("click", inspectDataset);
     datasetDir.addEventListener("input", () => {
       datasetReady = false;
@@ -587,7 +633,7 @@
     });
 
     updateSchedulePreview();
-    refreshStatus().then(inspectDataset);
+    refreshStatus().then(() => { if (datasetDir.value) inspectDataset(); });
     setInterval(refreshStatus, 1000);
   </script>
 </body>

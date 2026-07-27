@@ -382,11 +382,12 @@
     .clear-button:disabled { color: #a4adb2; cursor: default; }
     .dataset-target { display: grid; gap: 7px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
     .dataset-target label { font-size: 11px; font-weight: 650; }
-    .dataset-target select { min-width: 0; height: 36px; font-size: 11px; }
+    .dataset-target input { min-width: 0; height: 36px; font-size: 11px; }
     .dataset-target-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .dataset-target-status { min-width: 0; color: var(--green); font-size: 10px; text-align: right; overflow-wrap: anywhere; }
     .dataset-target-status.error { color: var(--red); }
-    .dataset-select-row { display: grid; grid-template-columns: minmax(0, 1fr) 36px; gap: 6px; }
+    .dataset-select-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 36px; gap: 6px; }
+    .dataset-browse { height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--teal); font-size: 11px; font-weight: 700; white-space: nowrap; }
     .dataset-add-toggle { width: 36px; height: 36px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--teal); font-size: 22px; line-height: 1; }
     .dataset-add-toggle.tooltip-trigger::after { display: none; }
     .dataset-add-toggle:hover { border-color: var(--teal); background: var(--surface-muted); }
@@ -627,7 +628,7 @@
         </div>
         <div class="dataset-target">
           <div class="dataset-target-head"><label class="tooltip-trigger" for="trainingDataset" tabindex="0" data-tooltip="选择右侧音频移动到的训练集目录。移动时会从 WAV 元数据读取实际文本并生成同名 .lab；完全相同的音频不会重复加入。">目标训练集</label><span class="dataset-target-status" id="datasetTargetStatus" aria-live="polite"></span></div>
-          <div class="dataset-select-row"><select id="trainingDataset"><option value="">正在读取训练集</option></select><button class="dataset-add-toggle tooltip-trigger" id="datasetAddToggle" type="button" aria-label="新增训练集" data-tooltip="快速创建一个新的训练集目录并立即选中。">+</button></div>
+          <div class="dataset-select-row"><input id="trainingDataset" type="text" readonly placeholder="选择目标训练集文件夹"><button class="dataset-browse" id="datasetBrowse" type="button">选择</button><button class="dataset-add-toggle tooltip-trigger" id="datasetAddToggle" type="button" aria-label="新增训练集" data-tooltip="快速创建一个新的训练集目录并立即选中。">+</button></div>
           <div class="dataset-create-row hidden" id="datasetCreateRow"><input id="datasetName" type="text" maxlength="80" autocomplete="off" placeholder="训练集名称" aria-label="新训练集名称"><button class="dataset-create-confirm" id="datasetCreateConfirm" type="button">创建</button><button class="dataset-create-cancel" id="datasetCreateCancel" type="button" aria-label="取消新增" title="取消">×</button></div>
         </div>
         <div class="session-list" id="sessionList"></div>
@@ -698,6 +699,7 @@
     const sessionCount = document.getElementById("sessionCount");
     const clearSession = document.getElementById("clearSession");
     const trainingDataset = document.getElementById("trainingDataset");
+    const datasetBrowse = document.getElementById("datasetBrowse");
     const datasetTargetStatus = document.getElementById("datasetTargetStatus");
     const datasetAddToggle = document.getElementById("datasetAddToggle");
     const datasetCreateRow = document.getElementById("datasetCreateRow");
@@ -865,20 +867,34 @@
         const response = await fetch("/api/training-datasets", { cache: "no-store" });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "训练集列表读取失败");
-        trainingDataset.replaceChildren();
-        (result.datasets || []).forEach((item) => {
-          const option = new Option(`${item.name} · ${item.file_count} 条`, item.path);
-          option.title = item.path;
-          trainingDataset.add(option);
-        });
-        if (previousPath && [...trainingDataset.options].some((option) => option.value === previousPath)) {
-          trainingDataset.value = previousPath;
-        } else if (result.default) {
-          trainingDataset.value = result.default;
-        }
-        if (!trainingDataset.options.length) trainingDataset.add(new Option("没有可用训练集", ""));
+        trainingDataset.value = previousPath || result.default || "";
+        trainingDataset.title = trainingDataset.value;
       } catch (error) {
-        trainingDataset.replaceChildren(new Option("训练集列表不可用", ""));
+        datasetTargetStatus.classList.add("error");
+        datasetTargetStatus.textContent = "训练集读取失败";
+      }
+    }
+
+    async function browseTrainingDataset() {
+      datasetBrowse.disabled = true;
+      datasetTargetStatus.classList.remove("error");
+      datasetTargetStatus.textContent = "选择中";
+      const data = new FormData(); data.set("initial_path", trainingDataset.value);
+      try {
+        const response = await fetch("/api/training-datasets/browse", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "文件夹选择器启动失败");
+        if (result.cancelled) {
+          datasetTargetStatus.textContent = "";
+          return;
+        }
+        await loadTrainingDatasets(result.path);
+        datasetTargetStatus.textContent = `已选择 · ${result.dataset.file_count} 条`;
+      } catch (error) {
+        datasetTargetStatus.classList.add("error");
+        datasetTargetStatus.textContent = error.message;
+      } finally {
+        datasetBrowse.disabled = false;
       }
     }
 
@@ -1187,6 +1203,7 @@
       saveSessionOutputs();
       renderSessionOutputs();
     });
+    datasetBrowse.addEventListener("click", browseTrainingDataset);
     datasetAddToggle.addEventListener("click", () => setDatasetCreatorVisible(datasetCreateRow.classList.contains("hidden")));
     datasetCreateCancel.addEventListener("click", () => setDatasetCreatorVisible(false));
     datasetCreateConfirm.addEventListener("click", createTrainingDataset);
