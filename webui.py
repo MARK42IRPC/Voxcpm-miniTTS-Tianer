@@ -93,7 +93,8 @@ ALLOWED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
 HYBRID_MAX_GENERATION_LENGTH = 1024
 HYBRID_DEVICES = {"hybrid", "hybrid-max"}
-MAX_LONG_TEXT_SEGMENTS = 100
+MAX_INFERENCE_SEGMENTS = 100
+MAX_BATCH_TASKS = 100
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -1320,9 +1321,83 @@ def timestamped_output_path(created_at: datetime) -> Path:
     return candidate
 
 
-def split_long_text(text: str) -> list[str]:
+def split_sentence_text(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    sentence_endings = set("。！？!?；;…")
+    closing_marks = set("”’\"')）】》」』]}〉")
+    parts = []
+    start = 0
+    index = 0
+    while index < len(normalized):
+        character = normalized[index]
+        boundary = character in sentence_endings
+        if character == ".":
+            previous_is_digit = index > 0 and normalized[index - 1].isdigit()
+            next_is_digit = index + 1 < len(normalized) and normalized[index + 1].isdigit()
+            lookahead = index + 1
+            while lookahead < len(normalized) and normalized[lookahead] in closing_marks:
+                lookahead += 1
+            next_character = normalized[lookahead] if lookahead < len(normalized) else ""
+            boundary = not (previous_is_digit and next_is_digit) and (
+                not next_character or next_character.isspace() or not next_character.isascii()
+            )
+        if not boundary:
+            index += 1
+            continue
+
+        end = index + 1
+        while end < len(normalized) and normalized[end] in sentence_endings:
+            end += 1
+        while end < len(normalized) and normalized[end] in closing_marks:
+            end += 1
+        part = normalized[start:end].strip()
+        if part:
+            parts.append(part)
+        start = end
+        index = end
+
+    remainder = normalized[start:].strip()
+    if remainder:
+        parts.append(remainder)
+    return parts
+
+
+def build_text_tasks(text: str, batch_mode: str) -> list[dict]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    return [part.strip() for part in re.split(r"(?<=。)|\n", normalized) if part.strip()]
+    task_sources = [normalized] if batch_mode == "ordinary" else normalized.split("\n")
+    tasks = []
+    for source in task_sources:
+        task_text = re.sub(r"\s+", " ", source).strip()
+        segments = split_sentence_text(source)
+        if segments:
+            tasks.append({"text": task_text, "segments": segments})
+    return tasks
+
+
+def merge_text_task_results(tasks: list[dict], generation_results: list[tuple]) -> list[dict]:
+    expected_count = sum(len(task["segments"]) for task in tasks)
+    if len(generation_results) != expected_count:
+        raise ValueError(f"Expected {expected_count} generation results, received {len(generation_results)}")
+
+    merged_results = []
+    result_index = 0
+    for task in tasks:
+        task_results = generation_results[result_index : result_index + len(task["segments"])]
+        result_index += len(task_results)
+        waveforms = [np.asarray(result[0]).reshape(-1) for result in task_results]
+        merged_results.append(
+            {
+                "text": task["text"],
+                "segments": task["segments"],
+                "wav": waveforms[0] if len(waveforms) == 1 else np.concatenate(waveforms, axis=0),
+                "successful_seeds": [result[1] for result in task_results],
+                "segment_processing_seconds": [round(float(result[2]), 3) for result in task_results],
+                "processing_seconds": round(sum(float(result[2]) for result in task_results), 3),
+            }
+        )
+    return merged_results
 
 
 def build_prompt_kwargs(mode: str, reference_path: Path | None, prompt_text: str, denoise: bool) -> dict | None:
@@ -1364,7 +1439,7 @@ def validate_request(
         raise HTTPException(status_code=400, detail="Unknown model")
     if mode not in {"design", "reference", "ultimate"}:
         raise HTTPException(status_code=400, detail="Unknown generation mode")
-    if batch_mode not in {"single", "long"}:
+    if batch_mode not in {"ordinary", "batch"}:
         raise HTTPException(status_code=400, detail="Unknown text processing mode")
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
@@ -1395,7 +1470,7 @@ async def generate(
     mode: str = Form("design"),
     control: str = Form(""),
     prompt_text: str = Form(""),
-    batch_mode: str = Form("single"),
+    batch_mode: str = Form("ordinary"),
     device: str = Form("cuda"),
     cfg_value: float = Form(2.0),
     inference_timesteps: int = Form(10),
@@ -1450,11 +1525,17 @@ async def generate(
         raise HTTPException(status_code=400, detail="Reference audio is required")
 
     source_text = text.strip()
-    segments = split_long_text(source_text) if batch_mode == "long" else [source_text]
-    if len(segments) > MAX_LONG_TEXT_SEGMENTS:
+    text_tasks = build_text_tasks(source_text, batch_mode)
+    if len(text_tasks) > MAX_BATCH_TASKS:
         raise HTTPException(
             status_code=400,
-            detail=f"Long text contains more than {MAX_LONG_TEXT_SEGMENTS} segments",
+            detail=f"Batch text contains more than {MAX_BATCH_TASKS} non-empty lines",
+        )
+    segments = [segment for task in text_tasks for segment in task["segments"]]
+    if len(segments) > MAX_INFERENCE_SEGMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Text contains more than {MAX_INFERENCE_SEGMENTS} inference segments",
         )
     final_texts = [f"({control.strip()}){segment}" if control.strip() else segment for segment in segments]
     # reduce-overhead compilation produces near-silent output with LoRALinear.
@@ -1514,27 +1595,35 @@ async def generate(
 
     request_inference_seconds = round(time.perf_counter() - request_started, 3)
     input_cache_created = device == "hybrid" and reference_path is not None and not input_cache_hit
+    task_results = merge_text_task_results(text_tasks, generation_results)
     outputs = []
+    task_count = len(task_results)
     segment_count = len(generation_results)
-    for index, ((wav, successful_seed, segment_seconds), segment, final_text) in enumerate(
-        zip(generation_results, segments, final_texts),
-        start=1,
-    ):
-        segment_created_at = datetime.now().astimezone() if index > 1 else created_at
-        output_path = timestamped_output_path(segment_created_at)
+    final_text_index = 0
+    for task_index, task_result in enumerate(task_results, start=1):
+        task_created_at = datetime.now().astimezone() if task_index > 1 else created_at
+        output_path = timestamped_output_path(task_created_at)
         filename = output_path.name
+        wav = task_result["wav"]
         sf.write(output_path, wav, sample_rate)
         duration = round(len(wav) / sample_rate, 3)
+        task_final_texts = final_texts[final_text_index : final_text_index + len(task_result["segments"])]
+        final_text_index += len(task_final_texts)
+        successful_seeds = task_result["successful_seeds"]
         metadata = {
             "schema": "voxcpm-generation-v1",
-            "created_at": segment_created_at.isoformat(timespec="seconds"),
+            "created_at": task_created_at.isoformat(timespec="seconds"),
             "filename": filename,
-            "text": segment,
+            "text": task_result["text"],
             "source_text": source_text,
-            "final_text": final_text,
+            "final_text": " ".join(task_final_texts),
             "batch_mode": batch_mode,
-            "segment_index": index,
-            "segment_count": segment_count,
+            "task_index": task_index,
+            "task_count": task_count,
+            "segments": task_result["segments"],
+            "segment_processing_seconds": task_result["segment_processing_seconds"],
+            "segment_count": len(task_result["segments"]),
+            "total_segment_count": segment_count,
             "model_key": model_key,
             "lora_id": lora_checkpoint["id"] if lora_checkpoint else None,
             "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
@@ -1549,7 +1638,8 @@ async def generate(
             "min_len": min_len,
             "max_len": max_len,
             "requested_seed": seed,
-            "successful_seed": successful_seed,
+            "successful_seed": successful_seeds[0] if len(set(successful_seeds)) == 1 else None,
+            "successful_seeds": successful_seeds,
             "normalize": normalize,
             "denoise": denoise and reference_filename is not None,
             "optimize_requested": optimize,
@@ -1561,7 +1651,7 @@ async def generate(
             "sample_rate": sample_rate,
             "duration_seconds": duration,
             "processing_seconds": request_inference_seconds,
-            "segment_processing_seconds": round(segment_seconds, 3),
+            "task_processing_seconds": task_result["processing_seconds"],
             "torch_version": torch.__version__,
         }
         write_wav_metadata(output_path, metadata)
@@ -1569,11 +1659,14 @@ async def generate(
             {
                 "audio_url": f"/api/audio/{filename}",
                 "filename": filename,
-                "text": segment,
-                "segment_index": index,
+                "text": task_result["text"],
+                "task_index": task_index,
+                "task_count": task_count,
+                "sentence_count": len(task_result["segments"]),
                 "duration": duration,
-                "processing_seconds": round(segment_seconds, 3),
-                "successful_seed": successful_seed,
+                "processing_seconds": task_result["processing_seconds"],
+                "successful_seed": metadata["successful_seed"],
+                "successful_seeds": successful_seeds,
             }
         )
 
@@ -1588,6 +1681,7 @@ async def generate(
         "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
         "device": device,
         "batch_mode": batch_mode,
+        "task_count": task_count,
         "segment_count": segment_count,
         "processing_seconds": processing_seconds,
         "input_cache_hit": input_cache_hit,

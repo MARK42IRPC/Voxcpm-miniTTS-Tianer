@@ -486,12 +486,12 @@
 
           <div class="field">
             <div class="field-row text-heading">
-              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。长文本模式会按中文句号和换行符拆分，单段模式会作为一个任务整体生成。">合成文本</label>
+              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。普通模式按句末标点分段推理并合成一个音频；批量模式让每个非空行分别生成一个音频。">合成文本</label>
               <div class="text-mode-tabs" role="radiogroup" aria-label="文本处理模式">
-                <input id="batchSingle" type="radio" name="batch_mode" value="single" checked>
-                <label class="tooltip-trigger" for="batchSingle" tabindex="0" data-tooltip="把全部合成文本作为一次推理任务，生成一个音频文件。">单段</label>
-                <input id="batchLong" type="radio" name="batch_mode" value="long">
-                <label class="tooltip-trigger" for="batchLong" tabindex="0" data-tooltip="按中文句号和换行符拆分为多个任务，复用同一参考音频，并输出音频列表。">长文本</label>
+                <input id="batchOrdinary" type="radio" name="batch_mode" value="ordinary" checked>
+                <label class="tooltip-trigger" for="batchOrdinary" tabindex="0" data-tooltip="按句号、问号、感叹号、分号和省略号等句末符号切分推理片段，完成后合成为一个 WAV。">普通</label>
+                <input id="batchMultiple" type="radio" name="batch_mode" value="batch">
+                <label class="tooltip-trigger" for="batchMultiple" tabindex="0" data-tooltip="按换行符拆成多个普通任务。每个非空行内部仍按句末标点分段推理，并各自合成为一个 WAV。">批量</label>
               </div>
             </div>
             <textarea id="text" name="text" required>你好，欢迎使用 VoxCPM 本地语音推理。</textarea>
@@ -800,20 +800,60 @@
       return batchInputs.find((input) => input.checked).value;
     }
 
-    function splitLongText(value) {
-      return value
-        .replace(/\r\n?/g, "\n")
-        .replace(/。/g, "。\n")
-        .split("\n")
-        .map((part) => part.trim())
-        .filter(Boolean);
+    function splitSentenceText(value) {
+      const normalized = value.replace(/\s+/g, " ").trim();
+      if (!normalized) return [];
+      const sentenceEndings = new Set([..."。！？!?；;…"]);
+      const closingMarks = new Set([..."”’\"')）】》」』]}〉"]);
+      const parts = [];
+      let start = 0;
+      let index = 0;
+      while (index < normalized.length) {
+        const character = normalized[index];
+        let boundary = sentenceEndings.has(character);
+        if (character === ".") {
+          const previousIsDigit = index > 0 && /\d/.test(normalized[index - 1]);
+          const nextIsDigit = index + 1 < normalized.length && /\d/.test(normalized[index + 1]);
+          let lookahead = index + 1;
+          while (lookahead < normalized.length && closingMarks.has(normalized[lookahead])) lookahead += 1;
+          const nextCharacter = normalized[lookahead] || "";
+          boundary = !(previousIsDigit && nextIsDigit)
+            && (!nextCharacter || /\s/.test(nextCharacter) || nextCharacter.charCodeAt(0) > 127);
+        }
+        if (!boundary) {
+          index += 1;
+          continue;
+        }
+        let end = index + 1;
+        while (end < normalized.length && sentenceEndings.has(normalized[end])) end += 1;
+        while (end < normalized.length && closingMarks.has(normalized[end])) end += 1;
+        const part = normalized.slice(start, end).trim();
+        if (part) parts.push(part);
+        start = end;
+        index = end;
+      }
+      const remainder = normalized.slice(start).trim();
+      if (remainder) parts.push(remainder);
+      return parts;
+    }
+
+    function planTextTasks(value, mode = currentBatchMode()) {
+      const normalized = value.replace(/\r\n?/g, "\n");
+      const sources = mode === "batch" ? normalized.split("\n") : [normalized];
+      return sources
+        .map((source) => splitSentenceText(source))
+        .filter((sentences) => sentences.length);
     }
 
     function updateSegmentCount() {
-      const isLong = currentBatchMode() === "long";
-      const count = isLong ? splitLongText(textInput.value).length : 1;
-      segmentCount.textContent = isLong ? `${count} 段` : "";
-      button.textContent = isLong && count > 1 ? `生成 ${count} 段` : "开始生成";
+      const mode = currentBatchMode();
+      const tasks = planTextTasks(textInput.value, mode);
+      const taskCount = tasks.length;
+      const sentenceCount = tasks.reduce((total, sentences) => total + sentences.length, 0);
+      segmentCount.textContent = taskCount
+        ? `${taskCount} 条音频 · ${sentenceCount} 个推理片段`
+        : "未检测到有效文本";
+      button.textContent = mode === "batch" && taskCount > 1 ? `生成 ${taskCount} 条` : "开始生成";
     }
 
     function loadSessionOutputs() {
@@ -1265,14 +1305,14 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       button.disabled = true;
-      const requestedSegments = currentBatchMode() === "long" ? splitLongText(textInput.value).length : 1;
-      button.textContent = requestedSegments > 1 ? `生成中 0/${requestedSegments}` : "生成中";
+      const requestedTasks = planTextTasks(textInput.value);
+      const requestedTaskCount = requestedTasks.length;
+      const requestedSegmentCount = requestedTasks.reduce((total, sentences) => total + sentences.length, 0);
+      button.textContent = requestedTaskCount > 1 ? `生成中 · ${requestedTaskCount} 条` : "生成中";
       message.className = "message";
       const startedAt = performance.now();
       const updateTimer = () => {
-        message.textContent = requestedSegments > 1
-          ? `正在生成 ${requestedSegments} 段 · ${formatElapsed(performance.now() - startedAt)}`
-          : `正在生成 · ${formatElapsed(performance.now() - startedAt)}`;
+        message.textContent = `正在生成 ${requestedTaskCount} 条音频 · ${requestedSegmentCount} 个推理片段 · ${formatElapsed(performance.now() - startedAt)}`;
       };
       updateTimer();
       const timerId = setInterval(updateTimer, 100);
@@ -1308,7 +1348,7 @@
           ? " · 输入缓存命中"
           : result.input_cache_created ? " · 输入已缓存" : "";
         const outputLabel = outputs.length > 1
-          ? `${outputs.length} 段音频`
+          ? `${outputs.length} 条音频`
           : `音频 ${Number(firstOutput.duration).toFixed(2)} 秒`;
         const loraLabel = result.lora_name ? ` · ${result.lora_name}` : "";
         message.textContent = `${result.model}${loraLabel} · ${result.device.toUpperCase()} · ${outputLabel}${cacheLabel} · 用时 ${formatElapsed(performance.now() - startedAt)}`;

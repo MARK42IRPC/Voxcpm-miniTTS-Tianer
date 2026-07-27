@@ -14,13 +14,15 @@ from webui import (
     LoRATrainingRuntime,
     ModelConfig,
     ModelRuntime,
+    build_text_tasks,
     build_prompt_kwargs,
     calculate_lora_training_schedule,
     inspect_lora_dataset,
     list_lora_checkpoints,
+    merge_text_task_results,
     resolve_lora_checkpoint,
     safe_lora_job_name,
-    split_long_text,
+    split_sentence_text,
     infer_lora_model_key,
 )
 
@@ -78,13 +80,91 @@ def test_cpu_thread_override(monkeypatch):
     assert calls == {"intra": 6, "inter": 1}
 
 
-def test_split_long_text_on_chinese_periods_and_newlines():
-    assert split_long_text("第一句。第二句。\n第三段\r\n\n第四段") == [
+def test_split_sentence_text_on_chinese_and_english_boundaries():
+    assert split_sentence_text("第一句。“真的吗？！”继续；Yes! Version 1.5 works. 最后一段") == [
         "第一句。",
-        "第二句。",
-        "第三段",
-        "第四段",
+        "“真的吗？！”",
+        "继续；",
+        "Yes!",
+        "Version 1.5 works.",
+        "最后一段",
     ]
+
+
+def test_ordinary_text_builds_one_task_from_all_sentences_and_lines():
+    assert build_text_tasks("第一句。第二句！\n第三句？", "ordinary") == [
+        {
+            "text": "第一句。第二句！ 第三句？",
+            "segments": ["第一句。", "第二句！", "第三句？"],
+        }
+    ]
+
+
+def test_batch_text_builds_one_ordinary_task_per_non_empty_line():
+    assert build_text_tasks("第一句。第二句！\n\n第三句？\r\n第四行", "batch") == [
+        {"text": "第一句。第二句！", "segments": ["第一句。", "第二句！"]},
+        {"text": "第三句？", "segments": ["第三句？"]},
+        {"text": "第四行", "segments": ["第四行"]},
+    ]
+
+
+def test_merge_text_task_results_preserves_waveform_dtype_and_task_boundaries():
+    tasks = build_text_tasks("第一句。第二句！\n第三句？", "batch")
+    results = [
+        (np.array([0.1, 0.2], dtype=np.float32), 42, 1.25),
+        (np.array([0.3], dtype=np.float32), 43, 0.5),
+        (np.array([0.4, 0.5], dtype=np.float32), 42, 0.75),
+    ]
+
+    merged = merge_text_task_results(tasks, results)
+
+    assert len(merged) == 2
+    assert merged[0]["wav"].dtype == np.float32
+    assert merged[0]["wav"].tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert merged[0]["successful_seeds"] == [42, 43]
+    assert merged[0]["processing_seconds"] == 1.75
+    assert merged[1]["wav"].tolist() == pytest.approx([0.4, 0.5])
+
+
+def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tmp_path):
+    generated_texts = []
+
+    def fake_generate_many(config, texts, prompt_cache_key, prompt_build_kwargs, lora_checkpoint, **kwargs):
+        generated_texts.extend(texts)
+        results = [
+            (np.full(2, 0.1, dtype=np.float32), 42, 0.1),
+            (np.full(3, 0.2, dtype=np.float32), 42, 0.2),
+            (np.full(4, 0.3, dtype=np.float32), 42, 0.3),
+        ]
+        return results, 16000, False
+
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(webui.runtime, "generate_many", fake_generate_many)
+    response = TestClient(webui.app).post(
+        "/api/generate",
+        data={
+            "text": "第一句。第二句！\n第三句？",
+            "model_key": "voxcpm-0.5b",
+            "mode": "design",
+            "batch_mode": "batch",
+            "device": "cpu",
+            "denoise": "false",
+            "optimize": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert generated_texts == ["第一句。", "第二句！", "第三句？"]
+    assert result["task_count"] == 2
+    assert result["segment_count"] == 3
+    assert len(result["outputs"]) == 2
+    first_path = tmp_path / result["outputs"][0]["filename"]
+    second_path = tmp_path / result["outputs"][1]["filename"]
+    assert sf.info(first_path).frames == 5
+    assert sf.info(second_path).frames == 4
+    assert webui.read_wav_metadata(first_path)["segments"] == ["第一句。", "第二句！"]
+    assert webui.read_wav_metadata(second_path)["text"] == "第三句？"
 
 
 def test_ultimate_prompt_uses_audio_once_as_continuation():
