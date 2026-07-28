@@ -790,6 +790,7 @@
     const datasetCreateConfirm = document.getElementById("datasetCreateConfirm");
     const datasetCreateCancel = document.getElementById("datasetCreateCancel");
     const SESSION_STORAGE_KEY = "voxcpm-session-audio-v1";
+    const SESSION_AUDIO_LIMIT = 50;
     let voxcpm2GpuSupported = true;
     let loraCheckpoints = [];
     let referencePreviewUrl = null;
@@ -798,6 +799,11 @@
     let currentProcessedOutput = null;
     let inferencePollTimer = null;
     let localInferenceRequest = false;
+    let observedInferenceJobId = null;
+    let observedInferenceOutputs = new Set();
+    let syncedInferenceJobId = null;
+    let pendingInferenceSync = null;
+    let runtimeOptionsReady = false;
     const postprocessPresets = {
       clean: { highpass_enabled: true, highpass_hz: 70, mud_enabled: true, mud_gain_db: -1.5, presence_enabled: true, presence_gain_db: 1, air_enabled: true, air_gain_db: 0.5, compressor_enabled: true, compressor_threshold_db: -18, compressor_ratio: 2, loudness_enabled: true, target_lufs: -16, limiter_enabled: true, limiter_db: -1, pitch_enabled: false, pitch_semitones: 0, reverb_enabled: false, reverb_wet: 0 },
       soft: { highpass_enabled: true, highpass_hz: 60, mud_enabled: false, mud_gain_db: 0, presence_enabled: true, presence_gain_db: -0.5, air_enabled: true, air_gain_db: -0.5, compressor_enabled: true, compressor_threshold_db: -16, compressor_ratio: 1.5, loudness_enabled: true, target_lufs: -18, limiter_enabled: true, limiter_db: -1, pitch_enabled: false, pitch_semitones: 0, reverb_enabled: false, reverb_wet: 0 },
@@ -1066,10 +1072,32 @@
     function loadSessionOutputs() {
       try {
         const stored = JSON.parse(sessionStorage.getItem(SESSION_STORAGE_KEY) || "[]");
-        return Array.isArray(stored) ? stored : [];
+        return Array.isArray(stored) ? stored.slice(0, SESSION_AUDIO_LIMIT) : [];
       } catch (error) {
         return [];
       }
+    }
+
+    function trimSessionOutputs() {
+      if (sessionOutputs.length <= SESSION_AUDIO_LIMIT) return false;
+      const original = sessionOutputs;
+      const limited = original.slice(0, SESSION_AUDIO_LIMIT);
+      const playingRow = [...sessionList.querySelectorAll(".audio-item")].find((row) => {
+        const player = row.querySelector("audio");
+        return player && !player.paused && !player.ended;
+      });
+      const playingItem = playingRow
+        ? original.find((item) => item.id === playingRow.dataset.outputId)
+        : null;
+      if (playingItem && !limited.some((item) => item.id === playingItem.id)) limited.push(playingItem);
+      sessionOutputs = limited;
+      return sessionOutputs.length !== original.length;
+    }
+
+    function settleSessionOutputLimit() {
+      if (!trimSessionOutputs()) return;
+      saveSessionOutputs();
+      renderSessionOutputs();
     }
 
     function saveSessionOutputs() {
@@ -1292,6 +1320,8 @@
       player.preload = "none";
       player.src = item.audio_url;
       player.addEventListener("play", () => pauseOtherPlayers(player));
+      player.addEventListener("pause", () => setTimeout(settleSessionOutputLimit, 0));
+      player.addEventListener("ended", () => setTimeout(settleSessionOutputLimit, 0));
 
       const actions = document.createElement("div");
       actions.className = "audio-item-actions";
@@ -1359,9 +1389,123 @@
         if (existing) Object.assign(existing, values);
         else newItems.push({ ...values, id: `${createdAt}-${index}-${output.filename}`, created_at: createdAt });
       });
+      newItems.reverse();
       sessionOutputs = [...newItems, ...sessionOutputs];
+      trimSessionOutputs();
       saveSessionOutputs();
       renderSessionOutputs();
+    }
+
+    function ingestInferenceOutputs(outputs, result) {
+      const jobId = result.job_id || observedInferenceJobId || "legacy";
+      let candidates;
+      if (jobId !== observedInferenceJobId) {
+        observedInferenceJobId = jobId;
+        observedInferenceOutputs = new Set(outputs.map((output) => output.filename));
+        candidates = outputs.slice(-SESSION_AUDIO_LIMIT);
+      } else {
+        candidates = outputs.filter((output) => !observedInferenceOutputs.has(output.filename));
+        candidates.forEach((output) => observedInferenceOutputs.add(output.filename));
+      }
+      if (candidates.length) addSessionOutputs(candidates, result);
+    }
+
+    function legacyInferenceParams(status) {
+      const outputs = status.outputs || [];
+      const firstOutput = outputs[0] || {};
+      const exportedPath = outputs.find((output) => output.exported_path)?.exported_path || "";
+      const matchingLora = loraCheckpoints.find((item) => item.display_name === status.lora_name);
+      return {
+        model_key: status.model,
+        lora_id: matchingLora?.id,
+        batch_mode: status.batch_mode,
+        device: status.device,
+        batch_output_dir: exportedPath.replace(/[\\/][^\\/]+$/, ""),
+        create_training_pairs: outputs.some((output) => Boolean(output.lab_path)),
+        rotate_seed: firstOutput.seed_strategy === "sequential",
+        seed: firstOutput.effective_seeds?.[0] ?? firstOutput.successful_seed,
+      };
+    }
+
+    function syncInferenceParams(status) {
+      if (!status.running || !runtimeOptionsReady || syncedInferenceJobId === status.job_id) return;
+      const completeSnapshot = Boolean(status.request_params);
+      const params = status.request_params || legacyInferenceParams(status);
+      const has = (key) => params[key] !== undefined && params[key] !== null;
+      const checkValue = (inputs, value) => {
+        const target = inputs.find((input) => input.value === value);
+        if (target) target.checked = true;
+      };
+      if (has("model_key") && [...modelKey.options].some((option) => option.value === params.model_key)) {
+        modelKey.value = params.model_key;
+      }
+      if (has("mode")) checkValue(modeInputs, params.mode);
+      if (has("batch_mode")) checkValue(batchInputs, params.batch_mode);
+      if (has("split_mode")) {
+        checkValue(splitModeInputs, params.split_mode);
+        previousSplitMode = params.split_mode;
+        splitModeValues[params.split_mode] = Number(params.split_value) || 1;
+      }
+      if (has("device")) checkValue(deviceInputs, params.device);
+      renderLoraOptions();
+      if (has("lora_id") && [...loraSelect.options].some((option) => option.value === params.lora_id)) {
+        loraSelect.value = params.lora_id;
+      }
+      updateDevice();
+      if (has("lora_id") && [...loraSelect.options].some((option) => option.value === params.lora_id)) {
+        loraSelect.value = params.lora_id;
+      }
+      if (has("text")) textInput.value = params.text;
+      if (has("control")) control.value = params.control;
+      if (has("prompt_text")) document.getElementById("promptText").value = params.prompt_text;
+      if (has("split_value")) {
+        splitModeValues[params.split_mode] = Number(params.split_value) || 1;
+        splitValue.value = splitModeValues[params.split_mode];
+      }
+      if (has("batch_output_dir")) {
+        batchOutputDir.value = params.batch_output_dir;
+        batchOutputDir.title = params.batch_output_dir;
+        batchExportStatus.textContent = params.batch_output_dir ? "已同步当前任务保存路径" : "";
+      }
+      if (has("create_training_pairs")) createTrainingPairs.checked = Boolean(params.create_training_pairs);
+      if (has("rotate_seed")) rotateSeed.checked = Boolean(params.rotate_seed);
+      if (has("lora_strength")) loraStrength.value = params.lora_strength;
+      const valueFields = {
+        cfg_value: "cfgValue",
+        inference_timesteps: "timesteps",
+        min_len: "minLen",
+        max_len: "maxLen",
+        seed: "seed",
+      };
+      Object.entries(valueFields).forEach(([key, id]) => {
+        if (has(key)) document.getElementById(id).value = params[key];
+      });
+      ["normalize", "denoise", "optimize"].forEach((key) => {
+        if (has(key)) document.getElementById(key).checked = Boolean(params[key]);
+      });
+      if (params.has_reference_audio && params.reference_filename) {
+        fileName.textContent = `当前任务参考音频：${params.reference_filename}（重新提交前需重新选择）`;
+      }
+      updateMode();
+      updateDevice();
+      updateSplitControls();
+      updateBatchExportState();
+      document.getElementById("cfgOutput").textContent = Number(document.getElementById("cfgValue").value).toFixed(1);
+      document.getElementById("timestepsOutput").textContent = document.getElementById("timesteps").value;
+      document.getElementById("loraStrengthOutput").textContent = `${Number(loraStrength.value).toFixed(2)}x`;
+      updateSegmentCount();
+      syncedInferenceJobId = status.job_id;
+      pendingInferenceSync = null;
+      message.className = "message";
+      message.textContent = completeSnapshot
+        ? "已热接管当前推理任务 · 完整参数已同步"
+        : "已热接管当前推理任务 · 已同步后端可用参数";
+    }
+
+    function queueInferenceSync(status) {
+      if (!status.running || syncedInferenceJobId === status.job_id) return;
+      pendingInferenceSync = status;
+      syncInferenceParams(status);
     }
 
     function renderInferenceProgress(status, reveal = true) {
@@ -1375,10 +1519,7 @@
       inferenceProgressText.textContent = `已导出 ${completedTasks}/${totalTasks} · 片段 ${completedSegments}/${totalSegments}`;
       cancelInferenceButton.disabled = !status.running || Boolean(status.cancel_requested);
       cancelInferenceButton.textContent = status.cancel_requested ? "中止中" : "中止";
-      const newOutputs = (status.outputs || []).filter(
-        (output) => !sessionOutputs.some((item) => item.filename === output.filename),
-      );
-      if (newOutputs.length) addSessionOutputs(newOutputs, status);
+      ingestInferenceOutputs(status.outputs || [], status);
     }
 
     async function pollInferenceProgress(revealIdle = false) {
@@ -1386,9 +1527,11 @@
         const response = await fetch("/api/inference/status", { cache: "no-store" });
         const status = await response.json();
         if (!response.ok) throw new Error(status.detail || "无法读取推理进度");
+        queueInferenceSync(status);
         if (status.running || revealIdle) renderInferenceProgress(status, true);
         if (status.running) {
           button.disabled = true;
+          button.textContent = Number(status.total_tasks) > 1 ? `生成中 · ${status.total_tasks} 条` : "生成中";
           cancelInferenceButton.disabled = Boolean(status.cancel_requested);
         } else if (!localInferenceRequest && inferencePollTimer !== null) {
           stopInferencePolling();
@@ -1595,6 +1738,9 @@
       } catch (error) {
         statusElement.querySelector(".status-dot").className = "status-dot error";
         statusElement.querySelector("span:last-child").textContent = "服务状态不可用";
+      } finally {
+        runtimeOptionsReady = true;
+        if (pendingInferenceSync) syncInferenceParams(pendingInferenceSync);
       }
     }
 
@@ -1776,7 +1922,7 @@
         const outputs = result.outputs || (result.filename ? [result] : []);
         const firstOutput = outputs[0];
         if (outputs.length) {
-          addSessionOutputs(outputs, result);
+          ingestInferenceOutputs(outputs, result);
           currentOriginalOutput = {
             ...firstOutput,
             model: result.model,

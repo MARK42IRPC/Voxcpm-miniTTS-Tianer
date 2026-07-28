@@ -272,6 +272,13 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         "第一句。第二句！",
         "第三句？",
     ]
+    request_params = webui.inference_job.snapshot()["request_params"]
+    assert request_params["text"] == "第一句。第二句！\n第三句？"
+    assert request_params["batch_mode"] == "batch"
+    assert request_params["batch_output_dir"] == str(export_root.resolve())
+    assert request_params["create_training_pairs"] is True
+    assert request_params["rotate_seed"] is True
+    assert request_params["reference_filename"] is None
 
 
 def test_generate_applies_character_split_and_records_configuration(monkeypatch, tmp_path):
@@ -374,6 +381,7 @@ def test_generate_keeps_optimization_enabled_with_lora(monkeypatch, tmp_path):
 
 def test_inference_job_tracks_progress_outputs_and_soft_cancel():
     job = InferenceJobRuntime()
+    request_params = {"model_key": "voxcpm1.5", "seed": 42}
     cancel_event = job.start(
         batch_mode="batch",
         model="voxcpm1.5",
@@ -381,7 +389,9 @@ def test_inference_job_tracks_progress_outputs_and_soft_cancel():
         device="cuda",
         total_tasks=2,
         total_segments=3,
+        request_params=request_params,
     )
+    request_params["seed"] = 99
 
     job.record_segment()
     job.record_output({"filename": "first.wav"})
@@ -396,6 +406,9 @@ def test_inference_job_tracks_progress_outputs_and_soft_cancel():
     assert status["completed_segments"] == 1
     assert status["progress"] == pytest.approx(1 / 3)
     assert status["outputs"] == [{"filename": "first.wav"}]
+    assert status["request_params"] == {"model_key": "voxcpm1.5", "seed": 42}
+    status["request_params"]["seed"] = 7
+    assert job.snapshot()["request_params"]["seed"] == 42
 
 
 def test_generate_tasks_stops_before_next_segment_after_cancel():
@@ -1400,6 +1413,11 @@ def test_web_session_output_updates_reuse_existing_audio_nodes():
     assert 'if (existing) Object.assign(existing, values)' in merge
     assert "newFilenames" not in merge
     assert ".slice(0, 500)" not in merge
+    assert "const SESSION_AUDIO_LIMIT = 50" in source
+    assert "outputs.slice(-SESSION_AUDIO_LIMIT)" in source
+    assert "playingItem && !limited.some" in source
+    assert "function syncInferenceParams(status)" in source
+    assert "syncedInferenceJobId === status.job_id" in source
 
 
 def test_wav_metadata_reader_uses_latest_appended_metadata(tmp_path):

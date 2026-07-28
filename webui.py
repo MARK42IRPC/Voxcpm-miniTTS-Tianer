@@ -161,6 +161,7 @@ class InferenceJobRuntime:
             "total_segments": 0,
             "completed_segments": 0,
             "outputs": [],
+            "request_params": None,
             "started_at": 0.0,
             "finished_at": 0.0,
             "error": None,
@@ -175,6 +176,7 @@ class InferenceJobRuntime:
         device: str,
         total_tasks: int,
         total_segments: int,
+        request_params: dict | None = None,
     ) -> threading.Event:
         with self._lock:
             if self._state["running"]:
@@ -191,6 +193,7 @@ class InferenceJobRuntime:
                 "device": device,
                 "total_tasks": total_tasks,
                 "total_segments": total_segments,
+                "request_params": dict(request_params) if request_params else None,
                 "started_at": time.time(),
             }
             return self._cancel_event
@@ -236,7 +239,15 @@ class InferenceJobRuntime:
 
     def snapshot(self) -> dict:
         with self._lock:
-            state = {**self._state, "outputs": [dict(output) for output in self._state["outputs"]]}
+            state = {
+                **self._state,
+                "outputs": [dict(output) for output in self._state["outputs"]],
+                "request_params": (
+                    dict(self._state["request_params"])
+                    if self._state["request_params"] is not None
+                    else None
+                ),
+            }
             now = time.time()
             finished_at = state["finished_at"] or now
             state["elapsed_seconds"] = (
@@ -2983,6 +2994,32 @@ async def generate(
     reference_hash = None
     task_count = len(text_tasks)
     segment_count = len(segments)
+    request_params = {
+        "text": source_text,
+        "model_key": model_key,
+        "lora_id": lora_checkpoint["id"] if lora_checkpoint else "",
+        "lora_strength": lora_strength,
+        "mode": mode,
+        "control": control,
+        "prompt_text": prompt_text,
+        "batch_mode": batch_mode,
+        "split_mode": split_mode,
+        "split_value": split_value if split_mode != "none" else 1,
+        "batch_output_dir": str(batch_output_directory) if batch_output_directory else "",
+        "create_training_pairs": create_training_pairs,
+        "rotate_seed": rotate_seed,
+        "device": device,
+        "cfg_value": cfg_value,
+        "inference_timesteps": inference_timesteps,
+        "min_len": min_len,
+        "max_len": max_len,
+        "seed": seed,
+        "normalize": normalize,
+        "denoise": denoise,
+        "optimize": optimize,
+        "reference_filename": reference_filename,
+        "has_reference_audio": reference_audio is not None,
+    }
     cancel_event = inference_job.start(
         batch_mode=batch_mode,
         model=model_key,
@@ -2990,6 +3027,7 @@ async def generate(
         device=device,
         total_tasks=task_count,
         total_segments=segment_count,
+        request_params=request_params,
     )
     outputs = []
     sample_rate = 0
