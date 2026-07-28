@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoxCPM 训练集审核</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f4f6f7; --surface: #fff; --surface-muted: #eef1f2;
+      --ink: #171a1c; --muted: #657078; --line: #d9dfe2;
+      --green: #147a55; --green-hover: #0f6848; --teal: #147684;
+      --red: #b43b3b; --red-hover: #963030; --shadow: 0 12px 30px rgba(25,35,40,.08);
+    }
+    * { box-sizing: border-box; }
+    html { overflow-x: hidden; }
+    body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--canvas); color: var(--ink); font-family: Inter,"Segoe UI","Microsoft YaHei",sans-serif; letter-spacing: 0; }
+    button, select { min-width: 0; max-width: 100%; font: inherit; letter-spacing: 0; }
+    button, label, select { cursor: pointer; }
+    .topbar { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 10px 24px; background: var(--surface); border-bottom: 1px solid var(--line); }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand img { width: 34px; height: 34px; object-fit: contain; }
+    .brand strong { font-size: 17px; white-space: nowrap; }
+    .nav { display: flex; align-items: center; gap: 4px; padding: 3px; background: var(--surface-muted); border-radius: 6px; }
+    .nav a { padding: 7px 12px; border-radius: 4px; color: var(--muted); font-size: 13px; text-decoration: none; white-space: nowrap; }
+    .nav a.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20,28,32,.12); }
+    main { width: 100%; min-width: 0; max-width: 1180px; margin: 0 auto; padding: 24px; }
+    .workspace { width: 100%; min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); overflow: hidden; }
+    .section { min-width: 0; padding: 22px 24px; }
+    .section + .section { border-top: 1px solid var(--line); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    h1, h2 { margin: 0; font-size: 14px; }
+    .section-state, .queue-note { min-width: 0; max-width: 65%; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+    .dataset-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 10px; }
+    select { width: 100%; height: 40px; padding: 0 11px; border: 1px solid #c9d0d4; border-radius: 6px; background: var(--surface); color: var(--ink); outline: none; }
+    select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20,118,132,.12); }
+    button { height: 40px; padding: 0 14px; border-radius: 6px; font-weight: 700; }
+    button:disabled { cursor: wait; opacity: .5; }
+    .secondary { border: 1px solid var(--line); background: var(--surface); color: var(--teal); }
+    .secondary:hover { border-color: var(--teal); }
+    .status { min-height: 18px; margin-top: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .status.error { color: var(--red); }
+    .review-controls { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 18px; }
+    .toggle-row { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 12px; }
+    .switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
+    .switch input { position: absolute; opacity: 0; }
+    .switch span { position: absolute; inset: 0; border-radius: 12px; background: #bdc5c9; transition: background 120ms; }
+    .switch span::after { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #fff; transition: transform 120ms; }
+    .switch input:checked + span { background: var(--green); }
+    .switch input:checked + span::after { transform: translateX(18px); }
+    .stats { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); margin-top: 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .stat { padding: 14px 8px; text-align: center; }
+    .stat + .stat { border-left: 1px solid var(--line); }
+    .stat strong { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+    .stat span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .queue { display: grid; gap: 10px; }
+    .review-item { display: grid; grid-template-columns: minmax(230px,320px) minmax(0,1fr) auto; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: #fafbfb; }
+    .audio-column { min-width: 0; }
+    .filename { display: block; margin-bottom: 8px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    audio { display: block; width: 100%; min-width: 0; max-width: 100%; height: 36px; }
+    .transcript { min-width: 0; color: var(--ink); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+    .transcript.missing { color: var(--red); }
+    .item-actions { display: flex; gap: 8px; }
+    .keep { min-width: 72px; border: 0; background: var(--green); color: #fff; }
+    .keep:hover { background: var(--green-hover); }
+    .delete { min-width: 72px; border: 0; background: var(--red); color: #fff; }
+    .delete:hover { background: var(--red-hover); }
+    .empty { padding: 48px 16px; color: var(--muted); font-size: 13px; text-align: center; border: 1px dashed var(--line); border-radius: 7px; }
+    .tooltip-trigger { position: relative; display: inline-flex; width: max-content; max-width: 100%; align-items: center; gap: 5px; outline: 0; }
+    .tooltip-trigger::after { content: "?"; display: inline-grid; place-items: center; flex: 0 0 16px; width: 16px; height: 16px; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font-size: 10px; font-weight: 700; line-height: 1; }
+    .tooltip-trigger:hover::after, .tooltip-trigger:focus-visible::after { border-color: var(--teal); color: var(--teal); }
+    .property-tooltip { position: fixed; z-index: 1000; width: max-content; max-width: min(320px,calc(100vw - 24px)); padding: 8px 10px; border: 1px solid #3e484d; border-radius: 5px; background: #20272a; color: #fff; box-shadow: 0 8px 20px rgba(20,28,32,.18); font-size: 12px; line-height: 1.55; pointer-events: none; opacity: 0; transform: translateY(2px); transition: opacity 100ms,transform 100ms; }
+    .property-tooltip.visible { opacity: 1; transform: translateY(0); }
+    @media (max-width: 800px) {
+      .topbar { align-items: stretch; flex-direction: column; gap: 8px; padding: 10px 14px; }
+      .brand { display: none; }
+      .nav { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); width: 100%; }
+      .nav a { min-width: 0; padding: 7px 2px; overflow: hidden; font-size: 12px; text-align: center; text-overflow: ellipsis; }
+      main { padding: 12px; }
+      .section { padding: 18px 16px; }
+      .review-item { width: 100%; min-width: 0; grid-template-columns: minmax(0,1fr); gap: 12px; }
+      .item-actions { min-width: 0; }
+      .item-actions button { flex: 1; }
+    }
+    @media (max-width: 560px) {
+      .dataset-row { grid-template-columns: minmax(0,1fr) 1fr; }
+      .dataset-row select { grid-column: 1 / -1; }
+      .review-controls { align-items: stretch; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 本地推理</strong></div>
+    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a class="active" href="/datasets">训练集</a><a href="/distill">蒸馏</a></nav>
+  </header>
+  <main>
+    <div class="workspace">
+      <section class="section">
+        <div class="section-head"><h1>训练集选择</h1><span class="section-state" id="directoryState">尚未加载</span></div>
+        <div class="dataset-row">
+          <select id="datasetSelect" aria-label="训练集"></select>
+          <button class="secondary tooltip-trigger" id="browseButton" type="button" data-tooltip="打开系统文件夹选择器。可选择训练集根目录、train 目录或直接选择包含音频的 wavs 目录。">选择文件夹</button>
+          <button class="secondary tooltip-trigger" id="refreshButton" type="button" data-tooltip="重新扫描磁盘中的音频和 LAB，并刷新审核队列与实时统计。">刷新列表</button>
+        </div>
+        <div class="status" id="status" aria-live="polite"></div>
+        <div class="review-controls">
+          <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="每次队列更新后自动播放当前最顶部的音频一次。浏览器阻止自动播放时，可先手动播放任意一条。">自动轮播</span><label class="switch"><input id="autoPlay" type="checkbox"><span></span></label></div>
+          <button class="secondary tooltip-trigger" id="resetButton" type="button" data-tooltip="清除当前训练集的已保留记录，让所有仍在磁盘上的音频重新进入待审核队列；不会删除任何文件。">重新审核全部</button>
+        </div>
+        <div class="stats" aria-label="审核统计">
+          <div class="stat"><strong id="confirmedCount">0</strong><span>已确认保留</span></div>
+          <div class="stat"><strong id="pendingCount">0</strong><span>未确认</span></div>
+          <div class="stat"><strong id="totalCount">0</strong><span>当前音频总数</span></div>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>待审核音频</h2><span class="queue-note" id="queueNote"></span></div>
+        <div class="queue" id="queue"><div class="empty">请选择训练集</div></div>
+      </section>
+    </div>
+  </main>
+  <div class="property-tooltip" id="propertyTooltip" role="tooltip"></div>
+  <script>
+    const datasetSelect = document.getElementById("datasetSelect");
+    const browseButton = document.getElementById("browseButton");
+    const refreshButton = document.getElementById("refreshButton");
+    const resetButton = document.getElementById("resetButton");
+    const autoPlay = document.getElementById("autoPlay");
+    const status = document.getElementById("status");
+    const directoryState = document.getElementById("directoryState");
+    const queue = document.getElementById("queue");
+    const queueNote = document.getElementById("queueNote");
+    const confirmedCount = document.getElementById("confirmedCount");
+    const pendingCount = document.getElementById("pendingCount");
+    const totalCount = document.getElementById("totalCount");
+    const controls = [datasetSelect, browseButton, refreshButton, resetButton];
+    let currentSnapshot = null;
+
+    function setBusy(busy) { controls.forEach((control) => { control.disabled = busy; }); }
+    function setStatus(message, error = false) { status.textContent = message; status.classList.toggle("error", error); }
+    function selectedDirectory() { return datasetSelect.value || ""; }
+    function formatSize(bytes) { return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`; }
+
+    async function readJson(response, fallback) {
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || fallback);
+      return result;
+    }
+
+    async function loadDatasets(preferred = "") {
+      const result = await readJson(await fetch("/api/training-datasets", { cache: "no-store" }), "训练集列表读取失败");
+      const prior = preferred || localStorage.getItem("voxcpm-review-dataset") || result.default || "";
+      datasetSelect.replaceChildren();
+      for (const item of result.datasets) {
+        const option = document.createElement("option");
+        option.value = item.path;
+        option.textContent = `${item.name} · ${item.file_count} WAV`;
+        option.title = item.path;
+        datasetSelect.append(option);
+      }
+      if ([...datasetSelect.options].some((option) => option.value === prior)) datasetSelect.value = prior;
+      return selectedDirectory();
+    }
+
+    function playTopAudio() {
+      if (!autoPlay.checked) return;
+      const audio = queue.querySelector("audio");
+      if (!audio) return;
+      queue.querySelectorAll("audio").forEach((item) => { if (item !== audio) { item.pause(); item.currentTime = 0; } });
+      audio.currentTime = 0;
+      audio.play().catch(() => setStatus("浏览器暂未允许自动播放，请先手动播放任意一条音频"));
+    }
+
+    function makeActionButton(label, className, item, action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = className;
+      button.textContent = label;
+      button.title = action === "delete" ? "删除真实音频及同名 LAB，不可撤销" : "确认保留并移出待审核队列";
+      button.addEventListener("click", () => reviewAction(action, item.filename));
+      return button;
+    }
+
+    function renderSnapshot(snapshot, shouldPlay = true) {
+      currentSnapshot = snapshot;
+      confirmedCount.textContent = snapshot.confirmed_count;
+      pendingCount.textContent = snapshot.pending_count;
+      totalCount.textContent = snapshot.total_count;
+      directoryState.textContent = snapshot.directory;
+      queueNote.textContent = snapshot.pending_count > snapshot.items.length ? `显示队首 ${snapshot.items.length} / ${snapshot.pending_count} 条` : `${snapshot.items.length} 条待审核`;
+      queue.replaceChildren();
+      if (!snapshot.items.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = snapshot.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
+        queue.append(empty);
+        return;
+      }
+      for (const item of snapshot.items) {
+        const row = document.createElement("article");
+        row.className = "review-item";
+        const audioColumn = document.createElement("div");
+        audioColumn.className = "audio-column";
+        const name = document.createElement("strong");
+        name.className = "filename";
+        name.textContent = `${item.filename} · ${formatSize(item.size_bytes)}`;
+        name.title = item.filename;
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "metadata";
+        const params = new URLSearchParams({ dataset_dir: snapshot.directory, filename: item.filename });
+        audio.src = `/api/dataset-review/audio?${params}`;
+        audioColumn.append(name, audio);
+        const transcript = document.createElement("div");
+        transcript.className = `transcript${item.has_lab ? "" : " missing"}`;
+        transcript.textContent = item.has_lab ? (item.text || "[LAB 内容为空]") : "缺少同名 LAB 文本";
+        const actions = document.createElement("div");
+        actions.className = "item-actions";
+        actions.append(makeActionButton("保留", "keep", item, "keep"), makeActionButton("删除", "delete", item, "delete"));
+        row.append(audioColumn, transcript, actions);
+        queue.append(row);
+      }
+      if (shouldPlay) setTimeout(playTopAudio, 0);
+    }
+
+    async function refreshReview(shouldPlay = true) {
+      const directory = selectedDirectory();
+      if (!directory) return;
+      setBusy(true);
+      setStatus("正在扫描训练集");
+      try {
+        const params = new URLSearchParams({ dataset_dir: directory });
+        const snapshot = await readJson(await fetch(`/api/dataset-review?${params}`, { cache: "no-store" }), "训练集扫描失败");
+        localStorage.setItem("voxcpm-review-dataset", snapshot.directory);
+        renderSnapshot(snapshot, shouldPlay);
+        setStatus("列表与统计已更新");
+      } catch (error) { setStatus(error.message, true); }
+      finally { setBusy(false); }
+    }
+
+    async function reviewAction(action, filename) {
+      setBusy(true);
+      queue.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+      setStatus(action === "delete" ? `正在删除 ${filename}` : `正在保留 ${filename}`);
+      const data = new FormData();
+      data.set("dataset_dir", selectedDirectory());
+      data.set("filename", filename);
+      try {
+        const snapshot = await readJson(await fetch(`/api/dataset-review/${action}`, { method: "POST", body: data }), "审核操作失败");
+        renderSnapshot(snapshot, true);
+        await loadDatasets(snapshot.directory);
+        setStatus(action === "delete" ? "音频及同名 LAB 已从磁盘删除" : "已确认保留");
+      } catch (error) { setStatus(error.message, true); await refreshReview(false); }
+      finally { setBusy(false); }
+    }
+
+    async function browseDataset() {
+      setBusy(true); setStatus("正在打开文件夹选择器");
+      const data = new FormData(); data.set("initial_path", selectedDirectory());
+      try {
+        const result = await readJson(await fetch("/api/training-datasets/browse", { method: "POST", body: data }), "文件夹选择器启动失败");
+        if (result.cancelled) { setStatus("已取消选择"); return; }
+        await loadDatasets(result.path);
+        await refreshReview(true);
+      } catch (error) { setStatus(error.message, true); }
+      finally { setBusy(false); }
+    }
+
+    async function resetReview() {
+      if (!selectedDirectory() || !confirm("重新审核当前训练集的全部音频？此操作不会删除文件。")) return;
+      setBusy(true); setStatus("正在清除审核记录");
+      const data = new FormData(); data.set("dataset_dir", selectedDirectory());
+      try {
+        const snapshot = await readJson(await fetch("/api/dataset-review/reset", { method: "POST", body: data }), "重新审核失败");
+        renderSnapshot(snapshot, true); setStatus("全部音频已重新进入待审核队列");
+      } catch (error) { setStatus(error.message, true); }
+      finally { setBusy(false); }
+    }
+
+    const tooltip = document.getElementById("propertyTooltip");
+    let tooltipTarget = null;
+    function showTooltip(target) {
+      const message = target.dataset.tooltip; if (!message) return;
+      tooltipTarget = target; tooltip.textContent = message; tooltip.classList.add("visible");
+      const rect = target.getBoundingClientRect(); const tip = tooltip.getBoundingClientRect();
+      let left = Math.min(rect.left, innerWidth - tip.width - 12); left = Math.max(12, left);
+      let top = rect.bottom + 8; if (top + tip.height > innerHeight - 12) top = rect.top - tip.height - 8;
+      tooltip.style.left = `${left}px`; tooltip.style.top = `${Math.max(12, top)}px`;
+    }
+    function hideTooltip(target) { if (tooltipTarget !== target) return; tooltipTarget = null; tooltip.classList.remove("visible"); }
+    document.querySelectorAll(".tooltip-trigger").forEach((target) => {
+      target.addEventListener("mouseenter", () => showTooltip(target)); target.addEventListener("mouseleave", () => hideTooltip(target));
+      target.addEventListener("focus", () => showTooltip(target)); target.addEventListener("blur", () => hideTooltip(target));
+    });
+
+    datasetSelect.addEventListener("change", () => refreshReview(true));
+    browseButton.addEventListener("click", browseDataset);
+    refreshButton.addEventListener("click", () => refreshReview(true));
+    resetButton.addEventListener("click", resetReview);
+    autoPlay.checked = localStorage.getItem("voxcpm-review-autoplay") === "true";
+    autoPlay.addEventListener("change", () => { localStorage.setItem("voxcpm-review-autoplay", autoPlay.checked); if (autoPlay.checked) playTopAudio(); });
+    loadDatasets().then((directory) => directory && refreshReview(false)).catch((error) => setStatus(error.message, true));
+  </script>
+</body>
+</html>

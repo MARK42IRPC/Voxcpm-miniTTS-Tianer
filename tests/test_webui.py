@@ -129,27 +129,13 @@ def test_batch_seed_rotation_is_sequential_and_reproducible():
     assert build_generation_seed_tasks(tasks, 2**32 - 1, True) == [[2**32 - 1, 0], [1]]
 
 
-def test_batch_text_limit_allows_500_tasks_and_1000_segments():
-    tasks = build_text_tasks("\n".join(["第一句。第二句！"] * 500), "batch")
+def test_batch_text_has_no_task_or_segment_limit():
+    tasks = build_text_tasks("\n".join(["第一句。第二句！"] * 1200), "batch")
 
     segments = validate_text_task_limits(tasks, "batch")
 
-    assert len(tasks) == 500
-    assert len(segments) == 1000
-
-
-def test_batch_text_limit_rejects_more_than_500_tasks():
-    tasks = build_text_tasks("\n".join(["一句。"] * 501), "batch")
-
-    with pytest.raises(HTTPException, match="500 个非空行"):
-        validate_text_task_limits(tasks, "batch")
-
-
-def test_batch_text_limit_rejects_more_than_1000_segments():
-    tasks = build_text_tasks("\n".join(["第一句。第二句！"] * 500) + "第三句？", "batch")
-
-    with pytest.raises(HTTPException, match="1000 个推理分段"):
-        validate_text_task_limits(tasks, "batch")
+    assert len(tasks) == 1200
+    assert len(segments) == 2400
 
 
 def test_ordinary_text_limit_remains_100_segments():
@@ -984,6 +970,95 @@ def test_browse_training_dataset_endpoint_handles_cancel(monkeypatch):
     response = TestClient(webui.app).post("/api/training-datasets/browse", data={"initial_path": ""})
     assert response.status_code == 200
     assert response.json() == {"cancelled": True}
+
+
+def configure_dataset_review_test(monkeypatch, tmp_path):
+    dataset_dir = tmp_path / "character" / "train" / "wavs"
+    dataset_dir.mkdir(parents=True)
+    monkeypatch.setattr(webui, "TRAINING_DATASET_REGISTRY", tmp_path / "training-datasets.json")
+    monkeypatch.setattr(webui, "DATASET_REVIEW_STATE", tmp_path / "dataset-review-state.json")
+    monkeypatch.setattr(webui, "DEFAULT_TRAINING_DATASET", tmp_path / "missing")
+    monkeypatch.setattr(webui, "TRAINING_DATASET_ROOT", tmp_path / "audio-root")
+    webui.register_training_dataset(dataset_dir)
+    return dataset_dir
+
+
+def test_dataset_review_keep_persists_and_updates_statistics(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    for name, text in (("first.wav", "第一条。"), ("second.wav", "第二条。")):
+        sf.write(dataset_dir / name, np.zeros(800, dtype=np.float32), 16000)
+        (dataset_dir / Path(name).with_suffix(".lab")).write_text(text, encoding="utf-8")
+    client = TestClient(webui.app)
+
+    initial = client.get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
+    kept = client.post(
+        "/api/dataset-review/keep",
+        data={"dataset_dir": str(dataset_dir), "filename": "first.wav"},
+    )
+    refreshed = client.get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
+
+    assert initial.status_code == 200
+    assert initial.json()["total_count"] == 2
+    assert [item["filename"] for item in initial.json()["items"]] == ["first.wav", "second.wav"]
+    assert kept.json()["confirmed_count"] == 1
+    assert kept.json()["pending_count"] == 1
+    assert [item["filename"] for item in refreshed.json()["items"]] == ["second.wav"]
+    assert json.loads(webui.DATASET_REVIEW_STATE.read_text(encoding="utf-8"))[str(dataset_dir.resolve())] == [
+        "first.wav"
+    ]
+
+
+def test_dataset_review_delete_removes_audio_and_matching_lab(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    audio_path = dataset_dir / "remove.wav"
+    lab_path = dataset_dir / "remove.lab"
+    sf.write(audio_path, np.zeros(800, dtype=np.float32), 16000)
+    lab_path.write_text("需要删除。", encoding="utf-8")
+
+    response = TestClient(webui.app).post(
+        "/api/dataset-review/delete",
+        data={"dataset_dir": str(dataset_dir), "filename": audio_path.name},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total_count"] == 0
+    assert not audio_path.exists()
+    assert not lab_path.exists()
+
+
+def test_dataset_review_rejects_unregistered_directory_and_path_traversal(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    sf.write(dataset_dir / "sample.wav", np.zeros(800, dtype=np.float32), 16000)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sf.write(outside / "secret.wav", np.zeros(800, dtype=np.float32), 16000)
+    client = TestClient(webui.app)
+
+    unregistered = client.get("/api/dataset-review", params={"dataset_dir": str(outside)})
+    traversal = client.get(
+        "/api/dataset-review/audio",
+        params={"dataset_dir": str(dataset_dir), "filename": "../secret.wav"},
+    )
+
+    assert unregistered.status_code == 400
+    assert traversal.status_code == 404
+
+
+def test_dataset_review_reset_returns_kept_audio_to_queue(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    sf.write(dataset_dir / "sample.wav", np.zeros(800, dtype=np.float32), 16000)
+    client = TestClient(webui.app)
+    client.post(
+        "/api/dataset-review/keep",
+        data={"dataset_dir": str(dataset_dir), "filename": "sample.wav"},
+    )
+
+    response = client.post("/api/dataset-review/reset", data={"dataset_dir": str(dataset_dir)})
+
+    assert response.status_code == 200
+    assert response.json()["confirmed_count"] == 0
+    assert response.json()["pending_count"] == 1
+    assert response.json()["items"][0]["filename"] == "sample.wav"
 
 
 def test_batch_output_directory_registry_persists_last_selection(monkeypatch, tmp_path):

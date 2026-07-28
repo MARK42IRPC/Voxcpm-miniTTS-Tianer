@@ -125,7 +125,7 @@
       .topbar { display: block; width: 100%; padding: 10px 12px; }
       .brand, .device-status { display: none; }
       .top-actions, .nav { width: 100%; min-width: 0; }
-      .nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .nav a { min-width: 0; padding: 7px 4px; text-align: center; white-space: nowrap; }
       main, .layout, .workbench, .side-panel { width: 100%; max-width: calc(100vw - 24px); min-width: 0; }
       .section { max-width: 100%; overflow: hidden; }
@@ -142,7 +142,7 @@
   <header class="topbar">
     <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 本地推理</strong></div>
     <div class="top-actions">
-      <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a class="active" href="/distill">蒸馏</a></nav>
+      <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a class="active" href="/distill">蒸馏</a></nav>
       <div class="device-status" id="deviceStatus"><span class="status-dot"></span><span>正在检查学生运行时</span></div>
     </div>
   </header>

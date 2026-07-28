@@ -476,6 +476,7 @@
       <nav class="nav" aria-label="页面切换">
         <a class="active" href="/">推理</a>
         <a href="/lora">LoRA 训练</a>
+        <a href="/datasets">训练集</a>
         <a href="/distill">蒸馏</a>
       </nav>
       <div class="status" id="deviceStatus">
@@ -502,12 +503,12 @@
 
           <div class="field">
             <div class="field-row text-heading">
-              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。普通模式按句末标点分段推理并合成一个音频，最多 100 段；批量模式让每个非空行分别生成一个音频，最多 500 条、合计 1000 个推理片段。">合成文本</label>
+              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。普通模式按句末标点分段推理并合成一个音频，最多 100 段；批量模式让每个非空行分别生成一个音频，不限制任务数量，可随时中止。">合成文本</label>
               <div class="text-mode-tabs" role="radiogroup" aria-label="文本处理模式">
                 <input id="batchOrdinary" type="radio" name="batch_mode" value="ordinary" checked>
                 <label class="tooltip-trigger" for="batchOrdinary" tabindex="0" data-tooltip="按句号、问号、感叹号、分号和省略号等句末符号切分推理片段，完成后合成为一个 WAV。">普通</label>
                 <input id="batchMultiple" type="radio" name="batch_mode" value="batch">
-                <label class="tooltip-trigger" for="batchMultiple" tabindex="0" data-tooltip="按换行符拆成多个普通任务。每个非空行内部仍按句末标点分段推理，并各自合成为一个 WAV；最多 500 条、合计 1000 个推理片段。">批量</label>
+                <label class="tooltip-trigger" for="batchMultiple" tabindex="0" data-tooltip="按换行符拆成多个普通任务。每个非空行内部仍按句末标点分段推理，并各自合成为一个 WAV；任务数量不设上限，可随时中止。">批量</label>
               </div>
             </div>
             <textarea id="text" name="text" required>你好，欢迎使用 VoxCPM 本地语音推理。</textarea>

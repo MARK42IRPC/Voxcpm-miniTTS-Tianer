@@ -78,6 +78,7 @@ TORCH_CPU_THREADS = configure_torch_cpu_threads()
 ROOT = Path(__file__).resolve().parent
 WEB_PAGE = ROOT / "web.html"
 LORA_PAGE = ROOT / "lora.html"
+DATASETS_PAGE = ROOT / "datasets.html"
 OUTPUT_ROOT = ROOT / "outputs" / "web"
 LORA_ROOT = ROOT / "lora"
 MODEL_PATHS = {
@@ -90,6 +91,8 @@ TRAINING_DATASET_ROOT = Path(r"D:\音频素材")
 DEFAULT_TRAINING_DATASET = TRAINING_DATASET_ROOT / "爱弥斯语音训练集" / "train" / "wavs"
 TRAINING_DATASET_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "training-datasets.json"
 TRAINING_DATASET_REGISTRY_LOCK = threading.RLock()
+DATASET_REVIEW_STATE = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "dataset-review-state.json"
+DATASET_REVIEW_STATE_LOCK = threading.RLock()
 BATCH_OUTPUT_DIRECTORY_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "batch-output-directories.json"
 BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -100,8 +103,7 @@ VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
 HYBRID_MAX_GENERATION_LENGTH = 1024
 HYBRID_DEVICES = {"hybrid", "hybrid-max"}
 MAX_ORDINARY_INFERENCE_SEGMENTS = 100
-MAX_BATCH_INFERENCE_SEGMENTS = 1000
-MAX_BATCH_TASKS = 500
+DATASET_REVIEW_PAGE_SIZE = 200
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -704,6 +706,11 @@ def lora_index() -> FileResponse:
     return FileResponse(LORA_PAGE)
 
 
+@app.get("/datasets")
+def datasets_index() -> FileResponse:
+    return FileResponse(DATASETS_PAGE)
+
+
 @app.get("/api/status")
 def status() -> dict:
     loaded = runtime.config
@@ -1243,6 +1250,57 @@ async def browse_training_dataset(initial_path: str = Form("")) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/dataset-review")
+def dataset_review(dataset_dir: str) -> dict:
+    try:
+        return build_dataset_review_snapshot(dataset_dir)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/dataset-review/audio")
+def dataset_review_audio(dataset_dir: str, filename: str) -> FileResponse:
+    try:
+        path = resolve_dataset_review_audio(dataset_dir, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    media_types = {
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+    }
+    return FileResponse(path, media_type=media_types.get(path.suffix.lower(), "application/octet-stream"))
+
+
+@app.post("/api/dataset-review/keep")
+def keep_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+    try:
+        mark_dataset_review_audio_kept(dataset_dir, filename)
+        return build_dataset_review_snapshot(dataset_dir)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-review/delete")
+def delete_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+    try:
+        delete_dataset_review_pair(dataset_dir, filename)
+        return build_dataset_review_snapshot(dataset_dir)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-review/reset")
+def reset_dataset_review(dataset_dir: str = Form(...)) -> dict:
+    try:
+        clear_dataset_review_state(dataset_dir)
+        return build_dataset_review_snapshot(dataset_dir)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/batch-output-directories")
 def batch_output_directories() -> dict:
     directories = [str(path) for path in _read_registered_batch_output_directories()]
@@ -1633,6 +1691,159 @@ def list_training_datasets() -> list[dict]:
     return datasets
 
 
+def resolve_registered_training_dataset(directory: str | Path) -> Path:
+    requested = Path(directory).expanduser().resolve()
+    registered = {item["path"].lower(): Path(item["path"]) for item in list_training_datasets()}
+    try:
+        return registered[str(requested).lower()]
+    except KeyError as exc:
+        raise ValueError("训练集目录未通过文件夹选择器登记") from exc
+
+
+def _read_dataset_review_state() -> dict[str, list[str]]:
+    with DATASET_REVIEW_STATE_LOCK:
+        if not DATASET_REVIEW_STATE.is_file():
+            return {}
+        try:
+            value = json.loads(DATASET_REVIEW_STATE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(directory): [str(filename) for filename in filenames if isinstance(filename, str)]
+        for directory, filenames in value.items()
+        if isinstance(filenames, list)
+    }
+
+
+def _write_dataset_review_state(state: dict[str, list[str]]) -> None:
+    with DATASET_REVIEW_STATE_LOCK:
+        DATASET_REVIEW_STATE.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = DATASET_REVIEW_STATE.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_path.replace(DATASET_REVIEW_STATE)
+
+
+def _dataset_audio_files(dataset_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in dataset_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in ALLOWED_AUDIO_SUFFIXES
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def _prune_dataset_review_state(dataset_dir: Path, audio_files: list[Path]) -> set[str]:
+    directory_key = str(dataset_dir)
+    existing = {path.name.lower(): path.name for path in audio_files}
+    with DATASET_REVIEW_STATE_LOCK:
+        state = _read_dataset_review_state()
+        kept = {existing[name.lower()] for name in state.get(directory_key, []) if name.lower() in existing}
+        normalized = sorted(kept, key=str.lower)
+        if state.get(directory_key, []) != normalized:
+            if normalized:
+                state[directory_key] = normalized
+            else:
+                state.pop(directory_key, None)
+            _write_dataset_review_state(state)
+    return {name.lower() for name in kept}
+
+
+def resolve_dataset_review_audio(dataset_dir: str | Path, filename: str) -> Path:
+    directory = resolve_registered_training_dataset(dataset_dir)
+    safe_name = Path(filename).name
+    if safe_name != filename or Path(safe_name).suffix.lower() not in ALLOWED_AUDIO_SUFFIXES:
+        raise ValueError("音频文件名无效")
+    path = (directory / safe_name).resolve()
+    if path.parent != directory or not path.is_file():
+        raise ValueError("训练集音频不存在")
+    return path
+
+
+def _dataset_review_item(path: Path, lab_path: Path | None) -> dict:
+    text = ""
+    if lab_path is not None:
+        try:
+            text = lab_path.read_text(encoding="utf-8-sig").strip()
+        except UnicodeDecodeError:
+            text = "[LAB 文本编码无法读取]"
+    return {
+        "filename": path.name,
+        "text": text,
+        "has_lab": lab_path is not None,
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def build_dataset_review_snapshot(dataset_dir: str | Path) -> dict:
+    directory = resolve_registered_training_dataset(dataset_dir)
+    audio_files = _dataset_audio_files(directory)
+    lab_files = {
+        path.stem.lower(): path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() == ".lab"
+    }
+    kept = _prune_dataset_review_state(directory, audio_files)
+    pending = [path for path in audio_files if path.name.lower() not in kept]
+    return {
+        "directory": str(directory),
+        "items": [
+            _dataset_review_item(path, lab_files.get(path.stem.lower()))
+            for path in pending[:DATASET_REVIEW_PAGE_SIZE]
+        ],
+        "confirmed_count": len(audio_files) - len(pending),
+        "pending_count": len(pending),
+        "total_count": len(audio_files),
+        "window_size": DATASET_REVIEW_PAGE_SIZE,
+    }
+
+
+def mark_dataset_review_audio_kept(dataset_dir: str | Path, filename: str) -> None:
+    path = resolve_dataset_review_audio(dataset_dir, filename)
+    directory_key = str(path.parent)
+    with DATASET_REVIEW_STATE_LOCK:
+        state = _read_dataset_review_state()
+        kept = {name.lower(): name for name in state.get(directory_key, [])}
+        kept[path.name.lower()] = path.name
+        state[directory_key] = sorted(kept.values(), key=str.lower)
+        _write_dataset_review_state(state)
+
+
+def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> None:
+    path = resolve_dataset_review_audio(dataset_dir, filename)
+    directory = path.parent
+    lab_files = [
+        candidate
+        for candidate in directory.iterdir()
+        if candidate.is_file()
+        and candidate.suffix.lower() == ".lab"
+        and candidate.stem.lower() == path.stem.lower()
+    ]
+    path.unlink()
+    for lab_path in lab_files:
+        lab_path.unlink()
+    directory_key = str(directory)
+    with DATASET_REVIEW_STATE_LOCK:
+        state = _read_dataset_review_state()
+        remaining = [name for name in state.get(directory_key, []) if name.lower() != path.name.lower()]
+        if remaining:
+            state[directory_key] = remaining
+        else:
+            state.pop(directory_key, None)
+        _write_dataset_review_state(state)
+
+
+def clear_dataset_review_state(dataset_dir: str | Path) -> None:
+    directory = resolve_registered_training_dataset(dataset_dir)
+    with DATASET_REVIEW_STATE_LOCK:
+        state = _read_dataset_review_state()
+        state.pop(str(directory), None)
+        _write_dataset_review_state(state)
+
+
 def _validated_output_audio(filename: str) -> Path:
     safe_name = Path(filename).name
     path = OUTPUT_ROOT / safe_name
@@ -1942,20 +2153,11 @@ def build_generation_seed_tasks(text_tasks: list[dict], base_seed: int, rotate: 
 
 
 def validate_text_task_limits(text_tasks: list[dict], batch_mode: str) -> list[str]:
-    if batch_mode == "batch" and len(text_tasks) > MAX_BATCH_TASKS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"批量文本不能超过 {MAX_BATCH_TASKS} 个非空行",
-        )
     segments = [segment for task in text_tasks for segment in task["segments"]]
-    segment_limit = (
-        MAX_BATCH_INFERENCE_SEGMENTS if batch_mode == "batch" else MAX_ORDINARY_INFERENCE_SEGMENTS
-    )
-    if len(segments) > segment_limit:
-        mode_label = "批量文本" if batch_mode == "batch" else "普通文本"
+    if batch_mode != "batch" and len(segments) > MAX_ORDINARY_INFERENCE_SEGMENTS:
         raise HTTPException(
             status_code=400,
-            detail=f"{mode_label}不能超过 {segment_limit} 个推理分段",
+            detail=f"普通文本不能超过 {MAX_ORDINARY_INFERENCE_SEGMENTS} 个推理分段",
         )
     return segments
 
