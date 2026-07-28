@@ -275,15 +275,17 @@ class ModelRuntime:
             requested_signature = lora_checkpoint["signature"] if lora_checkpoint else None
             if lora_checkpoint is None and self._lora_signature is not None:
                 if self._lora_id is not None:
-                    self._model.set_lora_enabled(False)
-                    self._lora_id = None
-                    self._lora_strength = 1.0
-                    self._clear_prompt_cache()
+                    if config.optimize:
+                        self._release()
+                    else:
+                        self._model.set_lora_enabled(False)
+                        self._lora_id = None
+                        self._lora_strength = 1.0
+                        self._clear_prompt_cache()
             elif lora_checkpoint is not None and self._lora_signature == requested_signature:
                 if self._lora_id != requested_lora_id:
                     if config.optimize:
-                        # reduce-overhead compilation captures the initial LoRA state.
-                        # Rebuild so the requested weights are loaded before warm-up.
+                        # Each compiled model is bound to one adapter identity.
                         self._release()
                     else:
                         try:
@@ -385,6 +387,7 @@ class ModelRuntime:
         lora_checkpoint: dict | None = None,
         lora_strength: float = 1.0,
         cancel_event: threading.Event | None = None,
+        task_seeds: list[list[int]] | None = None,
         on_segment_complete=None,
         on_task_complete=None,
         collect_results: bool = False,
@@ -392,6 +395,11 @@ class ModelRuntime:
     ):
         with self._lock:
             try:
+                if task_seeds is not None and (
+                    len(task_seeds) != len(text_tasks)
+                    or any(len(seeds) != len(texts) for seeds, texts in zip(task_seeds, text_tasks))
+                ):
+                    raise ValueError("Seed plan does not match inference text tasks")
                 model = self.get(config, lora_checkpoint, lora_strength)
                 prompt_cache = None
                 cache_hit = False
@@ -418,13 +426,20 @@ class ModelRuntime:
                         cancelled = True
                         break
                     results = []
-                    for text in texts:
+                    for segment_index, text in enumerate(texts):
                         if cancel_event is not None and cancel_event.is_set():
                             cancelled = True
                             break
                         segment_started = time.perf_counter()
-                        wav = model.generate(text=text, prompt_cache=prompt_cache, **kwargs)
-                        successful_seed = getattr(model.tts_model, "last_successful_seed", kwargs.get("seed"))
+                        generation_kwargs = kwargs
+                        if task_seeds is not None:
+                            generation_kwargs = {**kwargs, "seed": task_seeds[task_index][segment_index]}
+                        wav = model.generate(text=text, prompt_cache=prompt_cache, **generation_kwargs)
+                        successful_seed = getattr(
+                            model.tts_model,
+                            "last_successful_seed",
+                            generation_kwargs.get("seed"),
+                        )
                         result = (wav, successful_seed, time.perf_counter() - segment_started)
                         results.append(result)
                         if on_segment_complete is not None:
@@ -446,6 +461,13 @@ class ModelRuntime:
     def release(self) -> None:
         with self._lock:
             self._release()
+
+    def release_optimized(self) -> bool:
+        with self._lock:
+            if self._config is None or not self._config.optimize:
+                return False
+            self._release()
+            return True
 
 
 runtime = ModelRuntime()
@@ -1907,6 +1929,18 @@ def build_text_tasks(text: str, batch_mode: str) -> list[dict]:
     return tasks
 
 
+def build_generation_seed_tasks(text_tasks: list[dict], base_seed: int, rotate: bool) -> list[list[int]]:
+    seed_tasks = []
+    global_segment_index = 0
+    for task in text_tasks:
+        task_seeds = []
+        for _ in task["segments"]:
+            task_seeds.append((int(base_seed) + global_segment_index) % (2**32) if rotate else int(base_seed))
+            global_segment_index += 1
+        seed_tasks.append(task_seeds)
+    return seed_tasks
+
+
 def validate_text_task_limits(text_tasks: list[dict], batch_mode: str) -> list[str]:
     if batch_mode == "batch" and len(text_tasks) > MAX_BATCH_TASKS:
         raise HTTPException(
@@ -2017,6 +2051,8 @@ def persist_generation_task(
         "processing_seconds": task_result["processing_seconds"],
         "successful_seed": metadata["successful_seed"],
         "successful_seeds": successful_seeds,
+        "seed_strategy": metadata.get("seed_strategy", "fixed"),
+        "effective_seeds": metadata.get("effective_seeds", []),
         **export_result,
     }
 
@@ -2093,6 +2129,13 @@ def cancel_inference() -> dict:
     return inference_job.request_cancel()
 
 
+@app.post("/api/model/release-optimized")
+def release_optimized_model() -> dict:
+    if inference_job.snapshot()["running"]:
+        raise HTTPException(status_code=409, detail="推理运行时不能切换模型或 LoRA")
+    return {"released": runtime.release_optimized()}
+
+
 @app.post("/api/generate")
 async def generate(
     text: str = Form(...),
@@ -2105,6 +2148,7 @@ async def generate(
     batch_mode: str = Form("ordinary"),
     batch_output_dir: str = Form(""),
     create_training_pairs: bool = Form(False),
+    rotate_seed: bool = Form(True),
     device: str = Form("cuda"),
     cfg_value: float = Form(2.0),
     inference_timesteps: int = Form(10),
@@ -2177,6 +2221,8 @@ async def generate(
     source_text = text.strip()
     text_tasks = build_text_tasks(source_text, batch_mode)
     segments = validate_text_task_limits(text_tasks, batch_mode)
+    rotate_seed_effective = batch_mode == "batch" and rotate_seed
+    seed_tasks = build_generation_seed_tasks(text_tasks, seed, rotate_seed_effective)
     final_texts = [f"({control.strip()}){segment}" if control.strip() else segment for segment in segments]
     final_text_tasks = []
     final_text_index = 0
@@ -2184,11 +2230,10 @@ async def generate(
         task_segment_count = len(task["segments"])
         final_text_tasks.append(final_texts[final_text_index : final_text_index + task_segment_count])
         final_text_index += task_segment_count
-    # reduce-overhead compilation produces near-silent output with LoRALinear.
     config = ModelConfig(
         model_key,
         device,
-        optimize and device in {"cuda", "hybrid"} and lora_checkpoint is None,
+        optimize and device in {"cuda", "hybrid"},
         denoise and reference_audio is not None,
     )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2268,6 +2313,8 @@ async def generate(
                     "min_len": min_len,
                     "max_len": max_len,
                     "requested_seed": seed,
+                    "seed_strategy": "sequential" if rotate_seed_effective else "fixed",
+                    "effective_seeds": seed_tasks[task_index],
                     "normalize": normalize,
                     "denoise": denoise and reference_filename is not None,
                     "optimize_requested": optimize,
@@ -2304,6 +2351,7 @@ async def generate(
                 lora_checkpoint,
                 lora_strength=lora_strength,
                 cancel_event=cancel_event,
+                task_seeds=seed_tasks,
                 on_segment_complete=inference_job.record_segment,
                 on_task_complete=on_task_complete,
                 **kwargs,
@@ -2341,6 +2389,8 @@ async def generate(
         "processing_seconds": processing_seconds,
         "input_cache_hit": input_cache_hit,
         "input_cache_created": input_cache_created,
+        "seed_strategy": "sequential" if rotate_seed_effective else "fixed",
+        "rotate_seed": rotate_seed_effective,
         "cancelled": cancelled,
     }
     if outputs:

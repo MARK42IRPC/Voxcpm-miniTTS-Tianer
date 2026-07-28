@@ -6,6 +6,7 @@ from torch import nn
 
 import voxcpm.core as core
 from voxcpm.model.voxcpm2 import VoxCPM2Model, _continuation_badcase_limit
+from voxcpm.model.utils import select_compile_mode
 
 
 class RecordingEncoder(nn.Module):
@@ -17,6 +18,11 @@ class RecordingEncoder(nn.Module):
     def forward(self, feat):
         self.input_dtype = feat.dtype
         return feat.mean(dim=2)
+
+
+def test_lora_uses_compatible_compile_mode_without_cuda_graphs():
+    assert select_compile_mode(None) == "reduce-overhead"
+    assert select_compile_mode(SimpleNamespace(r=8)) == "default"
 
 
 def test_hybrid_fp32_feature_encoder_restores_cpu_projection_dtype():

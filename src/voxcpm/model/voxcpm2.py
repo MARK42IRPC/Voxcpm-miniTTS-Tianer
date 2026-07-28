@@ -53,6 +53,7 @@ from .utils import (
     next_and_close,
     pick_runtime_dtype,
     resolve_runtime_device,
+    select_compile_mode,
 )
 
 
@@ -481,14 +482,15 @@ class VoxCPM2Model(nn.Module):
                 import triton  # noqa: F401
             except ImportError:
                 raise ValueError("triton is not installed")
-            self.base_lm.forward_step = torch.compile(self.base_lm.forward_step, mode="reduce-overhead", fullgraph=True)
+            compile_mode = select_compile_mode(self.lora_config)
+            self.base_lm.forward_step = torch.compile(self.base_lm.forward_step, mode=compile_mode, fullgraph=True)
             self.residual_lm.forward_step = torch.compile(
-                self.residual_lm.forward_step, mode="reduce-overhead", fullgraph=True
+                self.residual_lm.forward_step, mode=compile_mode, fullgraph=True
             )
             self._feat_encoder_raw = self.feat_encoder
-            self.feat_encoder = torch.compile(self.feat_encoder, mode="reduce-overhead", fullgraph=True)
+            self.feat_encoder = torch.compile(self.feat_encoder, mode=compile_mode, fullgraph=True)
             self.feat_decoder.estimator = torch.compile(
-                self.feat_decoder.estimator, mode="reduce-overhead", fullgraph=True
+                self.feat_decoder.estimator, mode=compile_mode, fullgraph=True
             )
         except Exception as e:
             print(f"Warning: torch.compile disabled - {e}", file=sys.stderr)

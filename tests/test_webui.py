@@ -20,6 +20,7 @@ from webui import (
     ModelConfig,
     ModelRuntime,
     build_text_tasks,
+    build_generation_seed_tasks,
     build_prompt_kwargs,
     calculate_lora_training_schedule,
     inspect_lora_dataset,
@@ -42,6 +43,7 @@ class FakeModel:
     def __init__(self):
         self.build_count = 0
         self.generate_count = 0
+        self.generated_seeds = []
         self.loaded_loras = []
         self.lora_enabled = None
         self.lora_scale = None
@@ -56,6 +58,7 @@ class FakeModel:
 
     def generate(self, text, prompt_cache, **kwargs):
         self.generate_count += 1
+        self.generated_seeds.append(kwargs["seed"])
         self.tts_model.last_successful_seed = kwargs["seed"]
         assert prompt_cache is not None
         return np.zeros(8, dtype=np.float32)
@@ -116,6 +119,14 @@ def test_batch_text_builds_one_ordinary_task_per_non_empty_line():
         {"text": "第三句？", "segments": ["第三句？"]},
         {"text": "第四行", "segments": ["第四行"]},
     ]
+
+
+def test_batch_seed_rotation_is_sequential_and_reproducible():
+    tasks = build_text_tasks("第一句。第二句！\n第三句？", "batch")
+
+    assert build_generation_seed_tasks(tasks, 42, True) == [[42, 43], [44]]
+    assert build_generation_seed_tasks(tasks, 42, False) == [[42, 42], [42]]
+    assert build_generation_seed_tasks(tasks, 2**32 - 1, True) == [[2**32 - 1, 0], [1]]
 
 
 def test_batch_text_limit_allows_500_tasks_and_1000_segments():
@@ -181,8 +192,10 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         lora_checkpoint,
         on_segment_complete=None,
         on_task_complete=None,
+        task_seeds=None,
         **kwargs,
     ):
+        assert task_seeds == [[42, 43], [44]]
         task_results = [
             [
                 (np.full(2, 0.1, dtype=np.float32), 42, 0.1),
@@ -233,6 +246,8 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
     assert sf.info(first_path).frames == 5
     assert sf.info(second_path).frames == 4
     assert webui.read_wav_metadata(first_path)["segments"] == ["第一句。", "第二句！"]
+    assert webui.read_wav_metadata(first_path)["seed_strategy"] == "sequential"
+    assert webui.read_wav_metadata(first_path)["effective_seeds"] == [42, 43]
     assert webui.read_wav_metadata(second_path)["text"] == "第三句？"
     exported_paths = [Path(output["exported_path"]) for output in result["outputs"]]
     assert all(path.parent == export_root.resolve() and path.is_file() for path in exported_paths)
@@ -240,6 +255,50 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         "第一句。第二句！",
         "第三句？",
     ]
+
+
+def test_generate_keeps_optimization_enabled_with_lora(monkeypatch, tmp_path):
+    captured = {}
+    output_root = tmp_path / "web-cache"
+    output_root.mkdir()
+    checkpoint = {
+        "id": "speaker/checkpoints/step_1",
+        "display_name": "speaker · step_1",
+        "path": str(tmp_path / "checkpoint"),
+        "signature": "same-config",
+        "lora_config": {"enable_lm": False, "enable_dit": True, "enable_proj": False, "r": 4, "alpha": 8},
+    }
+
+    def fake_generate_tasks(config, text_tasks, *args, on_segment_complete=None, on_task_complete=None, **kwargs):
+        captured["config"] = config
+        result = [(np.full(4, 0.1, dtype=np.float32), 42, 0.1)]
+        on_segment_complete()
+        on_task_complete(0, result, 16000, False)
+        return [], 16000, False, False, 1
+
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui, "resolve_lora_checkpoint", lambda lora_id, model_key: checkpoint)
+    monkeypatch.setattr(webui.runtime, "generate_tasks", fake_generate_tasks)
+    monkeypatch.setattr(webui.torch.cuda, "is_available", lambda: True)
+
+    response = TestClient(webui.app).post(
+        "/api/generate",
+        data={
+            "text": "LoRA 优化测试。",
+            "model_key": "voxcpm-0.5b",
+            "lora_id": checkpoint["id"],
+            "mode": "design",
+            "batch_mode": "ordinary",
+            "device": "cuda",
+            "optimize": "true",
+            "denoise": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["config"].optimize is True
+    assert response.json()["lora_id"] == checkpoint["id"]
+    assert webui.read_wav_metadata(output_root / response.json()["filename"])["optimize_effective"] is True
 
 
 def test_inference_job_tracks_progress_outputs_and_soft_cancel():
@@ -315,6 +374,22 @@ def test_generate_tasks_exports_completed_task_before_cancel_stops_next_task():
     assert task_count == 1
     assert completed_tasks == [0]
     assert model.generate_count == 1
+
+
+def test_generate_tasks_applies_seed_plan_per_segment():
+    config = ModelConfig("voxcpm2", "hybrid", False, True)
+    runtime, model = make_runtime_with_model(config)
+
+    runtime.generate_tasks(
+        config,
+        [["第一句。", "第二句。"], ["第三句。"]],
+        ("cache",),
+        {"reference_wav_path": "reference.wav", "denoise": True},
+        task_seeds=[[42, 43], [44]],
+        seed=999,
+    )
+
+    assert model.generated_seeds == [42, 43, 44]
 
 
 def test_inference_status_and_cancel_endpoints(monkeypatch):
@@ -713,6 +788,37 @@ def test_optimized_lora_switch_rebuilds_before_warmup(monkeypatch):
         runtime.get(config, checkpoint)
 
     assert model.loaded_loras == []
+
+
+def test_optimized_lora_disable_rebuilds_instead_of_hot_disabling(monkeypatch):
+    config = ModelConfig("voxcpm-0.5b", "cuda", True, False)
+    runtime, model = make_runtime_with_model(config)
+    runtime._lora_id = "current"
+    runtime._lora_signature = "same-config"
+
+    class RebuildRequested(Exception):
+        pass
+
+    monkeypatch.setattr(runtime, "_release", lambda: (_ for _ in ()).throw(RebuildRequested()))
+
+    with pytest.raises(RebuildRequested):
+        runtime.get(config, None)
+
+    assert model.lora_enabled is None
+
+
+def test_release_optimized_model_endpoint_only_releases_compiled_runtime(monkeypatch):
+    optimized_runtime, _ = make_runtime_with_model(ModelConfig("voxcpm1.5", "cuda", True, False))
+    monkeypatch.setattr(webui, "runtime", optimized_runtime)
+    monkeypatch.setattr(webui, "inference_job", InferenceJobRuntime())
+    client = TestClient(webui.app)
+
+    first = client.post("/api/model/release-optimized")
+    second = client.post("/api/model/release-optimized")
+
+    assert first.status_code == 200
+    assert first.json() == {"released": True}
+    assert second.json() == {"released": False}
 
 
 def test_postprocess_audio_keeps_original_and_reuses_hashed_cache(monkeypatch, tmp_path):

@@ -37,6 +37,11 @@ def apply_generation_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def select_compile_mode(lora_config) -> str:
+    """Avoid CUDA Graph capture for models containing runtime LoRA layers."""
+    return "default" if lora_config is not None else "reduce-overhead"
+
+
 def mask_multichar_chinese_tokens(tokenizer: PreTrainedTokenizer):
     """Create a tokenizer wrapper that converts multi-character Chinese tokens to single characters.
 
