@@ -1249,6 +1249,7 @@ async def start_melo_training(
     num_workers: int = Form(1),
     segment_size: int = Form(8192),
     keep_checkpoints: int = Form(5),
+    precision: str = Form("fp32"),
 ) -> dict:
     if melo_training.running:
         raise HTTPException(status_code=409, detail="MeloTTS 训练任务已经在运行")
@@ -1262,6 +1263,8 @@ async def start_melo_training(
         raise HTTPException(status_code=500, detail="MeloTTS 训练核心未安装")
     if language not in ("ZH", "ZH_MIX_EN"):
         raise HTTPException(status_code=400, detail="MeloTTS 文本前端无效")
+    if precision not in ("fp32", "bf16", "fp16"):
+        raise HTTPException(status_code=400, detail="MeloTTS 训练精度无效")
     if not 1 <= num_epochs <= 1000 or not 1 <= save_every_epochs <= num_epochs:
         raise HTTPException(status_code=400, detail="训练轮数或保存间隔无效")
     if not 1 <= batch_size <= 4 or not 0 <= num_workers <= 4:
@@ -1307,6 +1310,7 @@ async def start_melo_training(
         "num_workers": num_workers,
         "segment_size": segment_size,
         "keep_checkpoints": keep_checkpoints,
+        "precision": precision,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     job_config_path.write_text(json.dumps(job_config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1321,7 +1325,7 @@ async def start_melo_training(
     return {
         "status": "running",
         "job_name": job_name,
-        "quality": "MeloTTS 44.1kHz",
+        "quality": f"MeloTTS 44.1kHz · {precision.upper()}",
         "dataset": {key: value for key, value in dataset.items() if key != "records"},
     }
 

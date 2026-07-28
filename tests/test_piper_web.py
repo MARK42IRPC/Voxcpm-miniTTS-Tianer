@@ -1,10 +1,13 @@
 import json
+import importlib.util
+import sys
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -201,3 +204,77 @@ def test_melo_base_status_requires_checkpoint_and_config(monkeypatch, tmp_path):
     assert status["installed"] is True
     assert status["checkpoint"] == str(checkpoint)
     assert status["language"] == "中文 + English"
+
+
+def test_melo_training_persists_precision_and_rejects_unknown_value(monkeypatch, tmp_path):
+    dataset = tmp_path / "dataset"
+    runs = tmp_path / "runs"
+    source = tmp_path / "MeloTTS" / "melo"
+    base = tmp_path / "base" / "checkpoint.pth"
+    for directory in (dataset, runs, source, base.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    base.write_bytes(b"checkpoint")
+    for index in range(2):
+        sf.write(dataset / f"sample-{index}.wav", np.zeros(1600, dtype=np.float32), 16000)
+        (dataset / f"sample-{index}.lab").write_text(f"测试文本 {index}", encoding="utf-8")
+
+    started = {}
+    monkeypatch.setattr(piper_web, "PIPER_RUNS_ROOT", runs)
+    monkeypatch.setattr(piper_web, "MELO_SOURCE_ROOT", source)
+    monkeypatch.setattr(piper_web, "MELO_BASE_CHECKPOINT", base)
+    monkeypatch.setattr(piper_web, "melo_base_status", lambda: {"installed": True})
+    monkeypatch.setattr(piper_web.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(piper_web, "_release_inference", lambda: None)
+    monkeypatch.setattr(piper_web.piper_voice_runtime, "release", lambda: None)
+    monkeypatch.setattr(piper_web.sherpa_voice_runtime, "release", lambda: None)
+    monkeypatch.setattr(
+        piper_web.melo_training,
+        "start",
+        lambda config, name, directory: started.update(config=config, name=name, directory=directory),
+    )
+    app = FastAPI()
+    app.include_router(piper_web.router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/melo/train",
+        data={
+            "dataset_dir": str(dataset),
+            "output_name": "precision-test",
+            "num_epochs": 1,
+            "save_every_epochs": 1,
+            "precision": "fp32",
+        },
+    )
+    invalid = client.post(
+        "/api/melo/train",
+        data={"dataset_dir": str(dataset), "precision": "tf32"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quality"].endswith("FP32")
+    assert json.loads(Path(started["config"]).read_text(encoding="utf-8"))["precision"] == "fp32"
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "MeloTTS 训练精度无效"
+
+
+def test_melo_non_finite_guard_stops_nan_and_inf():
+    melo_dir = Path(__file__).parents[1] / "third_party" / "MeloTTS" / "melo"
+    import_paths = [str(melo_dir.parent), str(melo_dir)]
+    sys.path[:0] = import_paths
+    try:
+        spec = importlib.util.spec_from_file_location("voxcpm_melo_train_test", melo_dir / "train.py")
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    finally:
+        for path in import_paths:
+            sys.path.remove(path)
+
+    module.assert_finite_training_values(3, loss=torch.tensor(1.0))
+    with pytest.raises(FloatingPointError, match="step 4: generator_loss, grad_norm"):
+        module.assert_finite_training_values(
+            4,
+            generator_loss=torch.tensor(float("nan")),
+            grad_norm=torch.tensor(float("inf")),
+        )

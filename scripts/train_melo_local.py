@@ -130,6 +130,9 @@ def preprocess(job_path: Path) -> None:
     template["model"].update(base_config["model"])
     template["data"].update(base_config["data"])
     steps_per_epoch = max(1, math.ceil(len(training_records) / job["batch_size"]))
+    precision = job.get("precision", "fp32")
+    if precision not in ("fp32", "bf16", "fp16"):
+        raise ValueError(f"Unsupported MeloTTS training precision: {precision}")
     template["train"].update(
         {
             "log_interval": 1,
@@ -137,7 +140,8 @@ def preprocess(job_path: Path) -> None:
             "epochs": job["num_epochs"],
             "learning_rate": job["learning_rate"],
             "batch_size": job["batch_size"],
-            "fp16_run": True,
+            "fp16_run": precision != "fp32",
+            "precision": precision,
             "segment_size": job["segment_size"],
             "num_workers": job["num_workers"],
             "keep_ckpts": job.get("keep_checkpoints", 5),
@@ -166,6 +170,7 @@ def preprocess(job_path: Path) -> None:
         f"{len(validation_records)} validation, {cache_hits} cached",
         flush=True,
     )
+    print(f"[Melo] training precision: {precision.upper()}", flush=True)
     del cleaned_records
     gc.collect()
     if torch.cuda.is_available():

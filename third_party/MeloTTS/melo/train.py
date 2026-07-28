@@ -45,6 +45,34 @@ torch.backends.cuda.enable_math_sdp(True)
 global_step = 0
 
 
+def training_precision(hps):
+    fallback = "fp16" if getattr(hps.train, "fp16_run", False) else "fp32"
+    precision = str(getattr(hps.train, "precision", fallback)).lower()
+    if precision not in ("fp32", "bf16", "fp16"):
+        raise ValueError(f"Unsupported training precision: {precision}")
+    return precision
+
+
+def training_autocast(hps):
+    precision = training_precision(hps)
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    return autocast(enabled=precision != "fp32", dtype=dtype)
+
+
+def assert_finite_training_values(step, **values):
+    invalid = []
+    for name, value in values.items():
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+        if not bool(torch.isfinite(tensor.detach()).all()):
+            invalid.append(name)
+    if invalid:
+        names = ", ".join(invalid)
+        raise FloatingPointError(
+            f"Non-finite training value at step {step}: {names}. "
+            "Training stopped before saving an invalid checkpoint."
+        )
+
+
 def run():
     hps = utils.get_hparams()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -255,7 +283,10 @@ def run():
         )
     else:
         scheduler_dur_disc = None
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    precision = training_precision(hps)
+    if rank == 0:
+        logger.info(f"Training precision: {precision.upper()}")
+    scaler = GradScaler(enabled=precision == "fp16")
 
     for epoch in range(epoch_str, hps.train.epochs + 1):
         try:
@@ -349,7 +380,7 @@ def train_and_evaluate(
         bert = bert.cuda(rank, non_blocking=True)
         ja_bert = ja_bert.cuda(rank, non_blocking=True)
 
-        with autocast(enabled=hps.train.fp16_run):
+        with training_autocast(hps):
             (
                 y_hat,
                 l_length,
@@ -396,6 +427,19 @@ def train_and_evaluate(
                 y, ids_slice * hps.data.hop_length, hps.train.segment_size
             )  # slice
 
+            with autocast(enabled=False):
+                loss_dur = torch.sum(l_length.float())
+                loss_mel = F.l1_loss(y_mel.float(), y_hat_mel.float()) * hps.train.c_mel
+                loss_kl = kl_loss(
+                    z_p.float(), logs_q.float(), m_p.float(), logs_p.float(), z_mask.float()
+                ) * hps.train.c_kl
+            assert_finite_training_values(
+                global_step,
+                duration_loss=loss_dur,
+                mel_loss=loss_mel,
+                kl_loss=loss_kl,
+            )
+
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
             with autocast(enabled=False):
@@ -403,6 +447,7 @@ def train_and_evaluate(
                     y_d_hat_r, y_d_hat_g
                 )
                 loss_disc_all = loss_disc
+            assert_finite_training_values(global_step, discriminator_loss=loss_disc_all)
             if net_dur_disc is not None:
                 y_dur_hat_r, y_dur_hat_g = net_dur_disc(
                     hidden_x.detach(), x_mask.detach(), logw.detach(), logw_.detach()
@@ -415,38 +460,50 @@ def train_and_evaluate(
                         losses_dur_disc_g,
                     ) = discriminator_loss(y_dur_hat_r, y_dur_hat_g)
                     loss_dur_disc_all = loss_dur_disc
+                assert_finite_training_values(
+                    global_step,
+                    duration_discriminator_loss=loss_dur_disc_all,
+                )
                 optim_dur_disc.zero_grad()
                 scaler.scale(loss_dur_disc_all).backward()
                 scaler.unscale_(optim_dur_disc)
-                commons.clip_grad_value_(net_dur_disc.parameters(), None)
+                grad_norm_dur = commons.clip_grad_value_(net_dur_disc.parameters(), None)
+                assert_finite_training_values(
+                    global_step,
+                    duration_discriminator_grad_norm=grad_norm_dur,
+                )
                 scaler.step(optim_dur_disc)
 
         optim_d.zero_grad()
         scaler.scale(loss_disc_all).backward()
         scaler.unscale_(optim_d)
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        assert_finite_training_values(global_step, discriminator_grad_norm=grad_norm_d)
         scaler.step(optim_d)
 
-        with autocast(enabled=hps.train.fp16_run):
+        with training_autocast(hps):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             if net_dur_disc is not None:
                 y_dur_hat_r, y_dur_hat_g = net_dur_disc(hidden_x, x_mask, logw, logw_)
             with autocast(enabled=False):
-                loss_dur = torch.sum(l_length.float())
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
                 if net_dur_disc is not None:
                     loss_dur_gen, losses_dur_gen = generator_loss(y_dur_hat_g)
                     loss_gen_all += loss_dur_gen
+        assert_finite_training_values(
+            global_step,
+            generator_loss=loss_gen_all,
+            adversarial_loss=loss_gen,
+            feature_loss=loss_fm,
+        )
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
         grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        assert_finite_training_values(global_step, generator_grad_norm=grad_norm_g)
         scaler.step(optim_g)
         scaler.update()
 

@@ -200,6 +200,7 @@
           </div>
           <div class="field-grid engine-hidden" id="meloOptions" style="margin-top:14px">
             <div class="field"><label class="tooltip-trigger" for="meloLanguage" tabindex="0" data-tooltip="中英混合前端可保留训练文本中的英文；纯中文前端对全中文数据更简单。">文本前端</label><select id="meloLanguage" name="language"><option value="ZH_MIX_EN" selected>中文 + English</option><option value="ZH">仅中文</option></select></div>
+            <div class="field"><label class="tooltip-trigger" for="meloPrecision" tabindex="0" data-tooltip="FP32 最稳定且为默认值；BF16 显存接近 FP16但数值范围更大；FP16 最省显存但容易出现 NaN，检测到后会立即停止。">训练精度</label><select id="meloPrecision" name="precision"><option value="fp32" selected>FP32 · 稳定推荐</option><option value="bf16">BF16 混合 · 省显存</option><option value="fp16">FP16 混合 · 实验</option></select></div>
             <div class="field"><label class="tooltip-trigger" for="segmentSize" tabindex="0" data-tooltip="每次送入判别器的音频采样点。8192 适合 4GB 显存；更长可能略利于连贯性但显著增加显存。">训练片段</label><select id="segmentSize" name="segment_size"><option value="4096">4096 · 最省显存</option><option value="8192" selected>8192 · 4GB 推荐</option><option value="16384">16384 · 官方长度</option></select></div>
             <div class="field"><label class="tooltip-trigger" for="keepCheckpoints" tabindex="0" data-tooltip="同时保留多少组 G/D/DUR 检查点。每组体积较大，默认只保留最近 5 组。">保留检查点</label><input id="keepCheckpoints" name="keep_checkpoints" type="number" min="1" max="20" value="5"></div>
           </div>
@@ -315,7 +316,7 @@
       document.getElementById("meloOptions").classList.toggle("engine-hidden", isPiper);
       document.getElementById("meloBasePanel").classList.toggle("engine-hidden", isPiper);
       document.getElementById("trainingTitle").textContent = isPiper ? "Piper 微调设置" : "MeloTTS 微调设置";
-      document.getElementById("trainingHint").textContent = isPiper ? "4GB 默认配置" : "44.1kHz · FP16 · 4GB 极限配置";
+      document.getElementById("trainingHint").textContent = isPiper ? "4GB 默认配置" : `44.1kHz · ${document.getElementById("meloPrecision").value.toUpperCase()} · 非有限值自动停止`;
       startButton.textContent = isPiper ? "开始 Piper 微调" : "开始 MeloTTS 微调";
       const baseLabel = document.getElementById("baseCheckpointLabel");
       baseLabel.dataset.tooltip = isPiper ? "选择 CKPT 作为权重热启动；规格必须与 Piper 模型一致。" : "默认从官方 MeloTTS-Chinese 生成器开始，也可选择已有 G_*.pth 继续微调。";
@@ -638,6 +639,7 @@
       const checkpoint = selectedCheckpoint();
       if (checkpoint?.quality && checkpoint.quality !== event.target.value) baseCheckpoint.value = "";
     });
+    document.getElementById("meloPrecision").addEventListener("change", updateTrainingMode);
 
     previewButton.addEventListener("click", async () => {
       previewButton.disabled = true;
