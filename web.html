@@ -317,8 +317,13 @@
       border-radius: 8px;
     }
 
+    .action-feedback { min-width: 0; flex: 1 1 auto; display: grid; gap: 8px; }
     .message { min-width: 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
     .message.error { color: var(--red); }
+    .inference-progress { display: grid; grid-template-columns: minmax(120px, 1fr) auto; align-items: center; gap: 10px; }
+    .inference-progress progress { width: 100%; height: 8px; border: 0; border-radius: 4px; accent-color: var(--green); overflow: hidden; }
+    .inference-progress span { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .action-buttons { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 
     .primary {
       min-width: 142px;
@@ -331,6 +336,9 @@
     }
     .primary:hover { background: var(--green-hover); }
     .primary:disabled { cursor: wait; opacity: 0.62; }
+    .stop-button { min-width: 88px; height: 42px; border: 1px solid #d8a6a6; border-radius: 6px; background: var(--surface); color: var(--red); font-weight: 700; }
+    .stop-button:hover:not(:disabled) { border-color: var(--red); background: #fff4f4; }
+    .stop-button:disabled { cursor: default; opacity: 0.42; }
 
     .output {
       display: none;
@@ -433,7 +441,9 @@
       .composer, .settings { max-width: 100%; overflow: hidden; padding: 18px; }
       .parameter-grid { grid-template-columns: 1fr; }
       .actionbar { align-items: stretch; flex-direction: column; }
-      .primary { width: 100%; }
+      .action-buttons, .primary { width: 100%; }
+      .action-buttons .stop-button { flex: 0 0 88px; }
+      .action-buttons .primary { flex: 1 1 auto; }
       .audio-comparison { grid-template-columns: minmax(0, 1fr); }
       .postprocess-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .postprocess-head { align-items: stretch; flex-direction: column; }
@@ -600,8 +610,11 @@
       </div>
 
       <div class="actionbar">
-        <div class="message" id="message">就绪</div>
-        <button class="primary" id="generateButton" type="submit">开始生成</button>
+        <div class="action-feedback">
+          <div class="message" id="message">就绪</div>
+          <div class="inference-progress hidden" id="inferenceProgress" aria-live="polite"><progress id="inferenceProgressBar" max="1" value="0"></progress><span id="inferenceProgressText">等待开始</span></div>
+        </div>
+        <div class="action-buttons"><button class="stop-button" id="cancelInferenceButton" type="button" title="当前推理片段完成后停止后续任务" disabled>中止</button><button class="primary" id="generateButton" type="submit">开始生成</button></div>
       </div>
       </form>
 
@@ -667,6 +680,10 @@
     const dropzone = document.getElementById("dropzone");
     const message = document.getElementById("message");
     const button = document.getElementById("generateButton");
+    const cancelInferenceButton = document.getElementById("cancelInferenceButton");
+    const inferenceProgress = document.getElementById("inferenceProgress");
+    const inferenceProgressBar = document.getElementById("inferenceProgressBar");
+    const inferenceProgressText = document.getElementById("inferenceProgressText");
     const outputPanel = document.getElementById("outputPanel");
     const audioPlayer = document.getElementById("audioPlayer");
     const downloadLink = document.getElementById("downloadLink");
@@ -742,6 +759,8 @@
     let sessionOutputs = loadSessionOutputs();
     let currentOriginalOutput = null;
     let currentProcessedOutput = null;
+    let inferencePollTimer = null;
+    let localInferenceRequest = false;
     const postprocessPresets = {
       clean: { highpass_enabled: true, highpass_hz: 70, mud_enabled: true, mud_gain_db: -1.5, presence_enabled: true, presence_gain_db: 1, air_enabled: true, air_gain_db: 0.5, compressor_enabled: true, compressor_threshold_db: -18, compressor_ratio: 2, loudness_enabled: true, target_lufs: -16, limiter_enabled: true, limiter_db: -1, pitch_enabled: false, pitch_semitones: 0, reverb_enabled: false, reverb_wet: 0 },
       soft: { highpass_enabled: true, highpass_hz: 60, mud_enabled: false, mud_gain_db: 0, presence_enabled: true, presence_gain_db: -0.5, air_enabled: true, air_gain_db: -0.5, compressor_enabled: true, compressor_threshold_db: -16, compressor_ratio: 1.5, loudness_enabled: true, target_lufs: -18, limiter_enabled: true, limiter_db: -1, pitch_enabled: false, pitch_semitones: 0, reverb_enabled: false, reverb_wet: 0 },
@@ -1172,9 +1191,59 @@
         created_at: createdAt,
       }));
       const newFilenames = new Set(newItems.map((item) => item.filename));
-      sessionOutputs = [...newItems, ...sessionOutputs.filter((item) => !newFilenames.has(item.filename))].slice(0, 100);
+      sessionOutputs = [...newItems, ...sessionOutputs.filter((item) => !newFilenames.has(item.filename))].slice(0, 500);
       saveSessionOutputs();
       renderSessionOutputs();
+    }
+
+    function renderInferenceProgress(status, reveal = true) {
+      if (reveal) inferenceProgress.classList.remove("hidden");
+      const totalSegments = Number(status.total_segments || status.segment_count || 0);
+      const completedSegments = Number(status.completed_segments ?? status.completed_segment_count ?? 0);
+      const totalTasks = Number(status.total_tasks || status.task_count || 0);
+      const completedTasks = Number(status.completed_tasks ?? status.completed_task_count ?? 0);
+      inferenceProgressBar.max = Math.max(1, totalSegments);
+      inferenceProgressBar.value = Math.min(completedSegments, Math.max(1, totalSegments));
+      inferenceProgressText.textContent = `已导出 ${completedTasks}/${totalTasks} · 片段 ${completedSegments}/${totalSegments}`;
+      cancelInferenceButton.disabled = !status.running || Boolean(status.cancel_requested);
+      cancelInferenceButton.textContent = status.cancel_requested ? "中止中" : "中止";
+      const newOutputs = (status.outputs || []).filter(
+        (output) => !sessionOutputs.some((item) => item.filename === output.filename),
+      );
+      if (newOutputs.length) addSessionOutputs(newOutputs, status);
+    }
+
+    async function pollInferenceProgress(revealIdle = false) {
+      try {
+        const response = await fetch("/api/inference/status", { cache: "no-store" });
+        const status = await response.json();
+        if (!response.ok) throw new Error(status.detail || "无法读取推理进度");
+        if (status.running || revealIdle) renderInferenceProgress(status, true);
+        if (status.running) {
+          button.disabled = true;
+          cancelInferenceButton.disabled = Boolean(status.cancel_requested);
+        } else if (!localInferenceRequest && inferencePollTimer !== null) {
+          stopInferencePolling();
+          cancelInferenceButton.disabled = true;
+          button.disabled = false;
+          updateSegmentCount();
+        }
+        return status;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function startInferencePolling() {
+      if (inferencePollTimer !== null) return;
+      pollInferenceProgress(true);
+      inferencePollTimer = setInterval(() => pollInferenceProgress(true), 500);
+    }
+
+    function stopInferencePolling() {
+      if (inferencePollTimer === null) return;
+      clearInterval(inferencePollTimer);
+      inferencePollTimer = null;
     }
 
     function updateMode() {
@@ -1448,20 +1517,52 @@
       }
     });
 
+    cancelInferenceButton.addEventListener("click", async () => {
+      cancelInferenceButton.disabled = true;
+      cancelInferenceButton.textContent = "中止中";
+      try {
+        const response = await fetch("/api/inference/cancel", { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "中止请求失败");
+        if (result.accepted) {
+          message.className = "message";
+          message.textContent = "已请求中止，当前推理片段完成后停止";
+          renderInferenceProgress(result, true);
+        } else {
+          message.textContent = "当前没有正在运行的推理任务";
+        }
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+        cancelInferenceButton.disabled = false;
+        cancelInferenceButton.textContent = "中止";
+      }
+    });
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      localInferenceRequest = true;
       button.disabled = true;
+      cancelInferenceButton.disabled = false;
+      cancelInferenceButton.textContent = "中止";
       const requestedTasks = planTextTasks(textInput.value);
       const requestedTaskCount = requestedTasks.length;
       const requestedSegmentCount = requestedTasks.reduce((total, sentences) => total + sentences.length, 0);
       button.textContent = requestedTaskCount > 1 ? `生成中 · ${requestedTaskCount} 条` : "生成中";
       message.className = "message";
+      inferenceProgress.classList.remove("hidden");
+      inferenceProgressBar.max = Math.max(1, requestedSegmentCount);
+      inferenceProgressBar.value = 0;
+      inferenceProgressText.textContent = `已导出 0/${requestedTaskCount} · 片段 0/${requestedSegmentCount}`;
       const startedAt = performance.now();
       const updateTimer = () => {
-        message.textContent = `正在生成 ${requestedTaskCount} 条音频 · ${requestedSegmentCount} 个推理片段 · ${formatElapsed(performance.now() - startedAt)}`;
+        message.textContent = cancelInferenceButton.textContent === "中止中"
+          ? `正在完成当前推理片段，随后中止 · ${formatElapsed(performance.now() - startedAt)}`
+          : `正在生成 ${requestedTaskCount} 条音频 · ${requestedSegmentCount} 个推理片段 · ${formatElapsed(performance.now() - startedAt)}`;
       };
       updateTimer();
       const timerId = setInterval(updateTimer, 100);
+      startInferencePolling();
       outputPanel.classList.remove("visible");
 
       const data = new FormData(form);
@@ -1473,40 +1574,50 @@
         const response = await fetch("/api/generate", { method: "POST", body: data });
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || "推理失败");
-        const outputs = result.outputs || [result];
+        const outputs = result.outputs || (result.filename ? [result] : []);
         const firstOutput = outputs[0];
-        addSessionOutputs(outputs, result);
-        currentOriginalOutput = {
-          ...firstOutput,
-          model: result.model,
-          lora_name: result.lora_name,
-          device: result.device,
-        };
-        resetProcessedOutput();
-        audioPlayer.src = `${firstOutput.audio_url}?t=${Date.now()}`;
-        audioPlayer.load();
-        downloadLink.href = firstOutput.audio_url;
-        downloadLink.download = firstOutput.filename;
-        postprocessButton.disabled = false;
-        await waitForAudioReady(audioPlayer);
-        outputPanel.classList.add("visible");
+        if (outputs.length) {
+          addSessionOutputs(outputs, result);
+          currentOriginalOutput = {
+            ...firstOutput,
+            model: result.model,
+            lora_name: result.lora_name,
+            device: result.device,
+          };
+          resetProcessedOutput();
+          audioPlayer.src = `${firstOutput.audio_url}?t=${Date.now()}`;
+          audioPlayer.load();
+          downloadLink.href = firstOutput.audio_url;
+          downloadLink.download = firstOutput.filename;
+          postprocessButton.disabled = false;
+          await waitForAudioReady(audioPlayer);
+          outputPanel.classList.add("visible");
+        }
+        renderInferenceProgress(result, true);
         const cacheLabel = result.input_cache_hit
           ? " · 输入缓存命中"
           : result.input_cache_created ? " · 输入已缓存" : "";
         const outputLabel = outputs.length > 1
           ? `${outputs.length} 条音频`
-          : `音频 ${Number(firstOutput.duration).toFixed(2)} 秒`;
+          : outputs.length === 1 ? `音频 ${Number(firstOutput.duration).toFixed(2)} 秒` : "未完成音频";
         const loraLabel = result.lora_name ? ` · ${result.lora_name}` : "";
         const exportLabel = result.batch_output_dir
           ? ` · 已保存到指定目录${result.training_pairs_created ? "并生成训练对" : ""}`
           : "";
-        message.textContent = `${result.model}${loraLabel} · ${result.device.toUpperCase()} · ${outputLabel}${cacheLabel}${exportLabel} · 用时 ${formatElapsed(performance.now() - startedAt)}`;
+        message.textContent = result.cancelled
+          ? `已中止 · 保留并导出 ${outputs.length}/${result.task_count} 条 · 用时 ${formatElapsed(performance.now() - startedAt)}`
+          : `${result.model}${loraLabel} · ${result.device.toUpperCase()} · ${outputLabel}${cacheLabel}${exportLabel} · 用时 ${formatElapsed(performance.now() - startedAt)}`;
       } catch (error) {
         message.className = "message error";
         message.textContent = `${error.message} · ${formatElapsed(performance.now() - startedAt)}`;
       } finally {
         clearInterval(timerId);
+        await pollInferenceProgress(true);
+        stopInferencePolling();
+        cancelInferenceButton.disabled = true;
+        cancelInferenceButton.textContent = "中止";
         button.disabled = false;
+        localInferenceRequest = false;
         updateSegmentCount();
       }
     });
@@ -1518,6 +1629,9 @@
     updateBatchExportState();
     renderSessionOutputs();
     loadStatus();
+    pollInferenceProgress().then((status) => {
+      if (status?.running) startInferencePolling();
+    });
     loadTrainingDatasets();
     loadBatchOutputDirectories();
   </script>

@@ -113,6 +113,113 @@ class ModelConfig:
     load_denoiser: bool
 
 
+class BatchOutputError(RuntimeError):
+    pass
+
+
+class InferenceJobRuntime:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._cancel_event: threading.Event | None = None
+        self._state = self._idle_state()
+
+    @staticmethod
+    def _idle_state() -> dict:
+        return {
+            "job_id": None,
+            "status": "idle",
+            "running": False,
+            "cancel_requested": False,
+            "batch_mode": None,
+            "model": None,
+            "lora_name": None,
+            "device": None,
+            "total_tasks": 0,
+            "completed_tasks": 0,
+            "total_segments": 0,
+            "completed_segments": 0,
+            "outputs": [],
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "error": None,
+        }
+
+    def start(
+        self,
+        *,
+        batch_mode: str,
+        model: str,
+        lora_name: str | None,
+        device: str,
+        total_tasks: int,
+        total_segments: int,
+    ) -> threading.Event:
+        with self._lock:
+            if self._state["running"]:
+                raise HTTPException(status_code=409, detail="已有推理任务正在运行")
+            self._cancel_event = threading.Event()
+            self._state = {
+                **self._idle_state(),
+                "job_id": f"{time.time_ns():x}",
+                "status": "running",
+                "running": True,
+                "batch_mode": batch_mode,
+                "model": model,
+                "lora_name": lora_name,
+                "device": device,
+                "total_tasks": total_tasks,
+                "total_segments": total_segments,
+                "started_at": time.time(),
+            }
+            return self._cancel_event
+
+    def record_segment(self) -> None:
+        with self._lock:
+            self._state["completed_segments"] = min(
+                self._state["total_segments"],
+                self._state["completed_segments"] + 1,
+            )
+
+    def record_output(self, output: dict) -> None:
+        with self._lock:
+            self._state["outputs"].append(dict(output))
+            self._state["completed_tasks"] = len(self._state["outputs"])
+
+    def request_cancel(self) -> dict:
+        with self._lock:
+            accepted = bool(self._state["running"] and self._cancel_event is not None)
+            if accepted:
+                self._cancel_event.set()
+                self._state["cancel_requested"] = True
+                self._state["status"] = "cancelling"
+            return {"accepted": accepted, **self.snapshot()}
+
+    def finish(self, *, cancelled: bool = False, error: str | None = None) -> None:
+        with self._lock:
+            self._state["running"] = False
+            self._state["finished_at"] = time.time()
+            self._state["error"] = error
+            if error:
+                self._state["status"] = "error"
+            elif cancelled:
+                self._state["status"] = "cancelled"
+            else:
+                self._state["status"] = "completed"
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            state = {**self._state, "outputs": [dict(output) for output in self._state["outputs"]]}
+            now = time.time()
+            finished_at = state["finished_at"] or now
+            state["elapsed_seconds"] = (
+                round(max(0.0, finished_at - state["started_at"]), 3) if state["started_at"] else 0.0
+            )
+            state["progress"] = (
+                state["completed_segments"] / state["total_segments"] if state["total_segments"] else 0.0
+            )
+            return state
+
+
 class ModelRuntime:
     def __init__(self) -> None:
         self._model: VoxCPM | None = None
@@ -257,6 +364,32 @@ class ModelRuntime:
         lora_strength: float = 1.0,
         **kwargs,
     ):
+        task_results, sample_rate, cache_hit, _, _ = self.generate_tasks(
+            config,
+            [texts],
+            prompt_cache_key,
+            prompt_build_kwargs,
+            lora_checkpoint,
+            lora_strength=lora_strength,
+            collect_results=True,
+            **kwargs,
+        )
+        return task_results[0], sample_rate, cache_hit
+
+    def generate_tasks(
+        self,
+        config: ModelConfig,
+        text_tasks: list[list[str]],
+        prompt_cache_key: tuple | None = None,
+        prompt_build_kwargs: dict | None = None,
+        lora_checkpoint: dict | None = None,
+        lora_strength: float = 1.0,
+        cancel_event: threading.Event | None = None,
+        on_segment_complete=None,
+        on_task_complete=None,
+        collect_results: bool = False,
+        **kwargs,
+    ):
         with self._lock:
             try:
                 model = self.get(config, lora_checkpoint, lora_strength)
@@ -276,13 +409,36 @@ class ModelRuntime:
                             self._prompt_cache = prompt_cache
                             self._prompt_cache_key = prompt_cache_key
 
-                results = []
-                for text in texts:
-                    segment_started = time.perf_counter()
-                    wav = model.generate(text=text, prompt_cache=prompt_cache, **kwargs)
-                    successful_seed = getattr(model.tts_model, "last_successful_seed", kwargs.get("seed"))
-                    results.append((wav, successful_seed, time.perf_counter() - segment_started))
-                return results, model.tts_model.sample_rate, cache_hit
+                collected_results = []
+                completed_tasks = 0
+                cancelled = False
+                sample_rate = model.tts_model.sample_rate
+                for task_index, texts in enumerate(text_tasks):
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
+                    results = []
+                    for text in texts:
+                        if cancel_event is not None and cancel_event.is_set():
+                            cancelled = True
+                            break
+                        segment_started = time.perf_counter()
+                        wav = model.generate(text=text, prompt_cache=prompt_cache, **kwargs)
+                        successful_seed = getattr(model.tts_model, "last_successful_seed", kwargs.get("seed"))
+                        result = (wav, successful_seed, time.perf_counter() - segment_started)
+                        results.append(result)
+                        if on_segment_complete is not None:
+                            on_segment_complete()
+                    if len(results) != len(texts):
+                        break
+                    if on_task_complete is not None:
+                        on_task_complete(task_index, results, sample_rate, cache_hit)
+                    if collect_results:
+                        collected_results.append(results)
+                    completed_tasks += 1
+                if cancel_event is not None and cancel_event.is_set() and completed_tasks < len(text_tasks):
+                    cancelled = True
+                return collected_results, sample_rate, cache_hit, cancelled, completed_tasks
             except torch.OutOfMemoryError:
                 self._release()
                 raise
@@ -293,6 +449,7 @@ class ModelRuntime:
 
 
 runtime = ModelRuntime()
+inference_job = InferenceJobRuntime()
 
 
 def read_lab_text(path: Path) -> str:
@@ -1793,6 +1950,77 @@ def merge_text_task_results(tasks: list[dict], generation_results: list[tuple]) 
     return merged_results
 
 
+def persist_generation_task(
+    *,
+    task: dict,
+    generation_results: list[tuple],
+    final_texts: list[str],
+    task_index: int,
+    task_count: int,
+    total_segment_count: int,
+    sample_rate: int,
+    first_created_at: datetime,
+    request_started: float,
+    metadata_base: dict,
+    batch_output_directory: Path | None,
+    create_training_pairs: bool,
+) -> dict:
+    task_result = merge_text_task_results([task], generation_results)[0]
+    task_created_at = first_created_at if task_index == 1 else datetime.now().astimezone()
+    output_path = timestamped_output_path(task_created_at)
+    wav = task_result["wav"]
+    sf.write(output_path, wav, sample_rate)
+    duration = round(len(wav) / sample_rate, 3)
+    successful_seeds = task_result["successful_seeds"]
+    export_path = (
+        batch_export_destination(output_path, batch_output_directory, create_training_pairs)
+        if batch_output_directory is not None
+        else None
+    )
+    metadata = {
+        **metadata_base,
+        "created_at": task_created_at.isoformat(timespec="seconds"),
+        "filename": output_path.name,
+        "text": task_result["text"],
+        "final_text": " ".join(final_texts),
+        "exported_path": str(export_path) if export_path else None,
+        "task_index": task_index,
+        "task_count": task_count,
+        "segments": task_result["segments"],
+        "segment_processing_seconds": task_result["segment_processing_seconds"],
+        "segment_count": len(task_result["segments"]),
+        "total_segment_count": total_segment_count,
+        "successful_seed": successful_seeds[0] if len(set(successful_seeds)) == 1 else None,
+        "successful_seeds": successful_seeds,
+        "sample_rate": sample_rate,
+        "duration_seconds": duration,
+        "processing_seconds": round(time.perf_counter() - request_started, 3),
+        "task_processing_seconds": task_result["processing_seconds"],
+    }
+    write_wav_metadata(output_path, metadata)
+    try:
+        export_result = (
+            export_batch_audio(output_path, export_path, task_result["text"], create_training_pairs)
+            if export_path is not None
+            else {"exported_path": None, "lab_path": None}
+        )
+    except OSError as exc:
+        raise BatchOutputError(f"批量音频保存失败: {exc}") from exc
+    return {
+        "audio_url": f"/api/audio/{output_path.name}",
+        "filename": output_path.name,
+        "text": task_result["text"],
+        "task_index": task_index,
+        "task_count": task_count,
+        "sentence_count": len(task_result["segments"]),
+        "duration": duration,
+        "processing_seconds": task_result["processing_seconds"],
+        "successful_seed": metadata["successful_seed"],
+        "successful_seeds": successful_seeds,
+        **export_result,
+    }
+
+
 def build_prompt_kwargs(mode: str, reference_path: Path | None, prompt_text: str, denoise: bool) -> dict | None:
     if reference_path is None:
         return None
@@ -1853,6 +2081,16 @@ def validate_request(
         raise HTTPException(status_code=400, detail="Inference steps must be between 1 and 100")
     if not 1 <= min_len <= max_len <= 4096:
         raise HTTPException(status_code=400, detail="Length range is invalid")
+
+
+@app.get("/api/inference/status")
+def inference_status() -> dict:
+    return inference_job.snapshot()
+
+
+@app.post("/api/inference/cancel")
+def cancel_inference() -> dict:
+    return inference_job.request_cancel()
 
 
 @app.post("/api/generate")
@@ -1940,6 +2178,12 @@ async def generate(
     text_tasks = build_text_tasks(source_text, batch_mode)
     segments = validate_text_task_limits(text_tasks, batch_mode)
     final_texts = [f"({control.strip()}){segment}" if control.strip() else segment for segment in segments]
+    final_text_tasks = []
+    final_text_index = 0
+    for task in text_tasks:
+        task_segment_count = len(task["segments"])
+        final_text_tasks.append(final_texts[final_text_index : final_text_index + task_segment_count])
+        final_text_index += task_segment_count
     # reduce-overhead compilation produces near-silent output with LoRALinear.
     config = ModelConfig(
         model_key,
@@ -1950,152 +2194,136 @@ async def generate(
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     reference_filename = Path(reference_audio.filename or "reference.wav").name if reference_audio else None
     reference_hash = None
+    task_count = len(text_tasks)
+    segment_count = len(segments)
+    cancel_event = inference_job.start(
+        batch_mode=batch_mode,
+        model=model_key,
+        lora_name=lora_checkpoint["display_name"] if lora_checkpoint else None,
+        device=device,
+        total_tasks=task_count,
+        total_segments=segment_count,
+    )
+    outputs = []
+    sample_rate = 0
+    input_cache_hit = False
+    input_cache_created = False
+    cancelled = False
 
-    with tempfile.TemporaryDirectory(prefix="voxcpm_web_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        reference_path = await save_upload(reference_audio, temp_dir) if reference_audio else None
-        if reference_path is not None:
-            reference_hash = file_sha256(reference_path)
-        kwargs = {
-            "cfg_value": cfg_value,
-            "inference_timesteps": inference_timesteps,
-            "min_len": min_len,
-            "max_len": max_len,
-            "normalize": normalize,
-            "seed": seed,
-        }
-        if mode == "ultimate":
-            # A failed continuation is expensive on the CPU-side autoregressive
-            # path. One pace-aware attempt followed by isolated-reference fallback
-            # is both faster and prevents prompt transcript leakage.
-            kwargs["retry_badcase_max_times"] = 1
-        prompt_build_kwargs = build_prompt_kwargs(mode, reference_path, prompt_text, denoise)
+    try:
+        with tempfile.TemporaryDirectory(prefix="voxcpm_web_") as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            reference_path = await save_upload(reference_audio, temp_dir) if reference_audio else None
+            if reference_path is not None:
+                reference_hash = file_sha256(reference_path)
+            kwargs = {
+                "cfg_value": cfg_value,
+                "inference_timesteps": inference_timesteps,
+                "min_len": min_len,
+                "max_len": max_len,
+                "normalize": normalize,
+                "seed": seed,
+            }
+            if mode == "ultimate":
+                # One pace-aware attempt followed by isolated-reference fallback
+                # prevents expensive retries and prompt transcript leakage.
+                kwargs["retry_badcase_max_times"] = 1
+            prompt_build_kwargs = build_prompt_kwargs(mode, reference_path, prompt_text, denoise)
+            prompt_cache_key = (
+                (
+                    model_key,
+                    lora_checkpoint["id"] if lora_checkpoint else None,
+                    lora_strength if lora_checkpoint else None,
+                    mode,
+                    reference_hash,
+                    prompt_text.strip() if mode == "ultimate" else "",
+                    bool(denoise and reference_path is not None),
+                )
+                if reference_path is not None
+                else None
+            )
 
-        prompt_cache_key = (
-            model_key,
-            lora_checkpoint["id"] if lora_checkpoint else None,
-            lora_strength if lora_checkpoint else None,
-            mode,
-            reference_hash,
-            prompt_text.strip() if mode == "ultimate" else "",
-            bool(denoise and reference_path is not None),
-        ) if reference_path is not None else None
+            def on_task_complete(task_index: int, results: list[tuple], current_sample_rate: int, cache_hit: bool) -> None:
+                nonlocal input_cache_hit, input_cache_created
+                input_cache_hit = cache_hit
+                input_cache_created = device == "hybrid" and reference_path is not None and not cache_hit
+                metadata_base = {
+                    "schema": "voxcpm-generation-v1",
+                    "source_text": source_text,
+                    "batch_mode": batch_mode,
+                    "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
+                    "create_training_pairs": create_training_pairs,
+                    "model_key": model_key,
+                    "lora_id": lora_checkpoint["id"] if lora_checkpoint else None,
+                    "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
+                    "lora_strength": lora_strength if lora_checkpoint else None,
+                    "lora_path": lora_checkpoint["path"] if lora_checkpoint else None,
+                    "lora_config": lora_checkpoint["lora_config"] if lora_checkpoint else None,
+                    "mode": mode,
+                    "control": control.strip(),
+                    "prompt_text": prompt_text.strip(),
+                    "device": device,
+                    "cfg_value": cfg_value,
+                    "inference_timesteps": inference_timesteps,
+                    "min_len": min_len,
+                    "max_len": max_len,
+                    "requested_seed": seed,
+                    "normalize": normalize,
+                    "denoise": denoise and reference_filename is not None,
+                    "optimize_requested": optimize,
+                    "optimize_effective": config.optimize,
+                    "input_cache_hit": cache_hit,
+                    "input_cache_created": input_cache_created,
+                    "reference_filename": reference_filename,
+                    "reference_sha256": reference_hash,
+                    "torch_version": torch.__version__,
+                }
+                output = persist_generation_task(
+                    task=text_tasks[task_index],
+                    generation_results=results,
+                    final_texts=final_text_tasks[task_index],
+                    task_index=task_index + 1,
+                    task_count=task_count,
+                    total_segment_count=segment_count,
+                    sample_rate=current_sample_rate,
+                    first_created_at=created_at,
+                    request_started=request_started,
+                    metadata_base=metadata_base,
+                    batch_output_directory=batch_output_directory,
+                    create_training_pairs=create_training_pairs,
+                )
+                outputs.append(output)
+                inference_job.record_output(output)
 
-        try:
-            generation_results, sample_rate, input_cache_hit = await asyncio.to_thread(
-                runtime.generate_many,
+            _, sample_rate, input_cache_hit, cancelled, _ = await asyncio.to_thread(
+                runtime.generate_tasks,
                 config,
-                final_texts,
+                final_text_tasks,
                 prompt_cache_key,
                 prompt_build_kwargs,
                 lora_checkpoint,
                 lora_strength=lora_strength,
+                cancel_event=cancel_event,
+                on_segment_complete=inference_job.record_segment,
+                on_task_complete=on_task_complete,
                 **kwargs,
             )
-        except torch.OutOfMemoryError as exc:
-            raise HTTPException(status_code=507, detail=f"CUDA out of memory: {exc}") from exc
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
-
-    request_inference_seconds = round(time.perf_counter() - request_started, 3)
-    input_cache_created = device == "hybrid" and reference_path is not None and not input_cache_hit
-    task_results = merge_text_task_results(text_tasks, generation_results)
-    outputs = []
-    task_count = len(task_results)
-    segment_count = len(generation_results)
-    final_text_index = 0
-    for task_index, task_result in enumerate(task_results, start=1):
-        task_created_at = datetime.now().astimezone() if task_index > 1 else created_at
-        output_path = timestamped_output_path(task_created_at)
-        filename = output_path.name
-        wav = task_result["wav"]
-        sf.write(output_path, wav, sample_rate)
-        duration = round(len(wav) / sample_rate, 3)
-        task_final_texts = final_texts[final_text_index : final_text_index + len(task_result["segments"])]
-        final_text_index += len(task_final_texts)
-        successful_seeds = task_result["successful_seeds"]
-        export_path = (
-            batch_export_destination(output_path, batch_output_directory, create_training_pairs)
-            if batch_output_directory is not None
-            else None
-        )
-        metadata = {
-            "schema": "voxcpm-generation-v1",
-            "created_at": task_created_at.isoformat(timespec="seconds"),
-            "filename": filename,
-            "text": task_result["text"],
-            "source_text": source_text,
-            "final_text": " ".join(task_final_texts),
-            "batch_mode": batch_mode,
-            "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
-            "create_training_pairs": create_training_pairs,
-            "exported_path": str(export_path) if export_path else None,
-            "task_index": task_index,
-            "task_count": task_count,
-            "segments": task_result["segments"],
-            "segment_processing_seconds": task_result["segment_processing_seconds"],
-            "segment_count": len(task_result["segments"]),
-            "total_segment_count": segment_count,
-            "model_key": model_key,
-            "lora_id": lora_checkpoint["id"] if lora_checkpoint else None,
-            "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
-            "lora_strength": lora_strength if lora_checkpoint else None,
-            "lora_path": lora_checkpoint["path"] if lora_checkpoint else None,
-            "lora_config": lora_checkpoint["lora_config"] if lora_checkpoint else None,
-            "mode": mode,
-            "control": control.strip(),
-            "prompt_text": prompt_text.strip(),
-            "device": device,
-            "cfg_value": cfg_value,
-            "inference_timesteps": inference_timesteps,
-            "min_len": min_len,
-            "max_len": max_len,
-            "requested_seed": seed,
-            "successful_seed": successful_seeds[0] if len(set(successful_seeds)) == 1 else None,
-            "successful_seeds": successful_seeds,
-            "normalize": normalize,
-            "denoise": denoise and reference_filename is not None,
-            "optimize_requested": optimize,
-            "optimize_effective": config.optimize,
-            "input_cache_hit": input_cache_hit,
-            "input_cache_created": input_cache_created,
-            "reference_filename": reference_filename,
-            "reference_sha256": reference_hash,
-            "sample_rate": sample_rate,
-            "duration_seconds": duration,
-            "processing_seconds": request_inference_seconds,
-            "task_processing_seconds": task_result["processing_seconds"],
-            "torch_version": torch.__version__,
-        }
-        write_wav_metadata(output_path, metadata)
-        try:
-            export_result = (
-                export_batch_audio(output_path, export_path, task_result["text"], create_training_pairs)
-                if export_path is not None
-                else {"exported_path": None, "lab_path": None}
-            )
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"批量音频保存失败: {exc}") from exc
-        outputs.append(
-            {
-                "audio_url": f"/api/audio/{filename}",
-                "filename": filename,
-                "text": task_result["text"],
-                "task_index": task_index,
-                "task_count": task_count,
-                "sentence_count": len(task_result["segments"]),
-                "duration": duration,
-                "processing_seconds": task_result["processing_seconds"],
-                "successful_seed": metadata["successful_seed"],
-                "successful_seeds": successful_seeds,
-                **export_result,
-            }
-        )
+        inference_job.finish(cancelled=cancelled)
+    except torch.OutOfMemoryError as exc:
+        inference_job.finish(error=f"CUDA out of memory: {exc}")
+        raise HTTPException(status_code=507, detail=f"CUDA out of memory: {exc}") from exc
+    except BatchOutputError as exc:
+        inference_job.finish(error=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except HTTPException as exc:
+        inference_job.finish(error=str(exc.detail))
+        raise
+    except Exception as exc:
+        inference_job.finish(error=str(exc))
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
     processing_seconds = round(time.perf_counter() - request_started, 3)
-    first_output = outputs[0]
-    return {
-        **first_output,
+    response = {
         "outputs": outputs,
         "sample_rate": sample_rate,
         "model": model_key,
@@ -2107,11 +2335,17 @@ async def generate(
         "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
         "training_pairs_created": bool(batch_output_directory and create_training_pairs),
         "task_count": task_count,
+        "completed_task_count": len(outputs),
         "segment_count": segment_count,
+        "completed_segment_count": inference_job.snapshot()["completed_segments"],
         "processing_seconds": processing_seconds,
         "input_cache_hit": input_cache_hit,
         "input_cache_created": input_cache_created,
+        "cancelled": cancelled,
     }
+    if outputs:
+        response = {**outputs[0], **response}
+    return response
 
 
 def main() -> None:

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import json
+import threading
 import zipfile
 
 import numpy as np
@@ -15,6 +16,7 @@ from safetensors.torch import save_file
 import webui
 from webui import (
     LoRATrainingRuntime,
+    InferenceJobRuntime,
     ModelConfig,
     ModelRuntime,
     build_text_tasks,
@@ -171,18 +173,37 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
     output_root.mkdir()
     export_root.mkdir()
 
-    def fake_generate_many(config, texts, prompt_cache_key, prompt_build_kwargs, lora_checkpoint, **kwargs):
-        generated_texts.extend(texts)
-        results = [
-            (np.full(2, 0.1, dtype=np.float32), 42, 0.1),
-            (np.full(3, 0.2, dtype=np.float32), 42, 0.2),
-            (np.full(4, 0.3, dtype=np.float32), 42, 0.3),
+    def fake_generate_tasks(
+        config,
+        text_tasks,
+        prompt_cache_key,
+        prompt_build_kwargs,
+        lora_checkpoint,
+        on_segment_complete=None,
+        on_task_complete=None,
+        **kwargs,
+    ):
+        task_results = [
+            [
+                (np.full(2, 0.1, dtype=np.float32), 42, 0.1),
+                (np.full(3, 0.2, dtype=np.float32), 42, 0.2),
+            ],
+            [(np.full(4, 0.3, dtype=np.float32), 42, 0.3)],
         ]
-        return results, 16000, False
+        for task_index, (texts, results) in enumerate(zip(text_tasks, task_results)):
+            if task_index == 1:
+                assert len(list(output_root.glob("*.wav"))) == 1
+                assert len(list(export_root.glob("*.wav"))) == 1
+                assert len(list(export_root.glob("*.lab"))) == 1
+            generated_texts.extend(texts)
+            for _ in results:
+                on_segment_complete()
+            on_task_complete(task_index, results, 16000, False)
+        return [], 16000, False, False, len(text_tasks)
 
     monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
     monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", tmp_path / "batch-directories.json")
-    monkeypatch.setattr(webui.runtime, "generate_many", fake_generate_many)
+    monkeypatch.setattr(webui.runtime, "generate_tasks", fake_generate_tasks)
     webui.register_batch_output_directory(export_root)
     response = TestClient(webui.app).post(
         "/api/generate",
@@ -219,6 +240,105 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         "第一句。第二句！",
         "第三句？",
     ]
+
+
+def test_inference_job_tracks_progress_outputs_and_soft_cancel():
+    job = InferenceJobRuntime()
+    cancel_event = job.start(
+        batch_mode="batch",
+        model="voxcpm1.5",
+        lora_name=None,
+        device="cuda",
+        total_tasks=2,
+        total_segments=3,
+    )
+
+    job.record_segment()
+    job.record_output({"filename": "first.wav"})
+    cancel_result = job.request_cancel()
+    job.finish(cancelled=True)
+    status = job.snapshot()
+
+    assert cancel_result["accepted"] is True
+    assert cancel_event.is_set() is True
+    assert status["status"] == "cancelled"
+    assert status["completed_tasks"] == 1
+    assert status["completed_segments"] == 1
+    assert status["progress"] == pytest.approx(1 / 3)
+    assert status["outputs"] == [{"filename": "first.wav"}]
+
+
+def test_generate_tasks_stops_before_next_segment_after_cancel():
+    config = ModelConfig("voxcpm2", "hybrid", False, True)
+    runtime, model = make_runtime_with_model(config)
+    cancel_event = threading.Event()
+    completed_tasks = []
+
+    def on_segment_complete():
+        cancel_event.set()
+
+    _, _, _, cancelled, task_count = runtime.generate_tasks(
+        config,
+        [["第一句。", "第二句。"], ["第三句。"]],
+        ("cache",),
+        {"reference_wav_path": "reference.wav", "denoise": True},
+        cancel_event=cancel_event,
+        on_segment_complete=on_segment_complete,
+        on_task_complete=lambda *args: completed_tasks.append(args),
+        seed=42,
+    )
+
+    assert cancelled is True
+    assert task_count == 0
+    assert completed_tasks == []
+    assert model.generate_count == 1
+
+
+def test_generate_tasks_exports_completed_task_before_cancel_stops_next_task():
+    config = ModelConfig("voxcpm2", "hybrid", False, True)
+    runtime, model = make_runtime_with_model(config)
+    cancel_event = threading.Event()
+    completed_tasks = []
+
+    _, _, _, cancelled, task_count = runtime.generate_tasks(
+        config,
+        [["第一条。"], ["第二条。"]],
+        ("cache",),
+        {"reference_wav_path": "reference.wav", "denoise": True},
+        cancel_event=cancel_event,
+        on_segment_complete=cancel_event.set,
+        on_task_complete=lambda task_index, *args: completed_tasks.append(task_index),
+        seed=42,
+    )
+
+    assert cancelled is True
+    assert task_count == 1
+    assert completed_tasks == [0]
+    assert model.generate_count == 1
+
+
+def test_inference_status_and_cancel_endpoints(monkeypatch):
+    job = InferenceJobRuntime()
+    monkeypatch.setattr(webui, "inference_job", job)
+    job.start(
+        batch_mode="batch",
+        model="voxcpm1.5",
+        lora_name="speaker",
+        device="cuda",
+        total_tasks=4,
+        total_segments=6,
+    )
+    client = TestClient(webui.app)
+
+    status = client.get("/api/inference/status")
+    cancelled = client.post("/api/inference/cancel")
+
+    assert status.status_code == 200
+    assert status.json()["running"] is True
+    assert status.json()["total_tasks"] == 4
+    assert cancelled.status_code == 200
+    assert cancelled.json()["accepted"] is True
+    assert cancelled.json()["cancel_requested"] is True
 
 
 def test_generate_ordinary_rejects_batch_export_options():
