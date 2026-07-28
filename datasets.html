@@ -59,6 +59,9 @@
     .audio-column { min-width: 0; }
     .filename { display: block; margin-bottom: 8px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     audio { display: block; width: 100%; min-width: 0; max-width: 100%; height: 36px; }
+    .spectrogram { display: block; width: 100%; height: 84px; margin-top: 8px; border: 1px solid #303b40; border-radius: 4px; background: #11181b; }
+    .spectrogram[data-state="queued"], .spectrogram[data-state="loading"] { background: linear-gradient(90deg,#11181b 0%,#202b2f 48%,#11181b 100%); background-size: 200% 100%; animation: spectrum-loading 1.2s linear infinite; }
+    @keyframes spectrum-loading { to { background-position: -200% 0; } }
     .transcript { min-width: 0; color: var(--ink); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
     .transcript.missing { color: var(--red); }
     .item-actions { display: flex; gap: 8px; }
@@ -144,12 +147,162 @@
     const pendingCount = document.getElementById("pendingCount");
     const totalCount = document.getElementById("totalCount");
     const controls = [datasetSelect, browseButton, refreshButton, deduplicateButton, resetButton];
+    const spectrumQueue = [];
+    const spectrumConcurrency = 2;
+    let spectrumActive = 0;
+    let spectrumAudioContext = null;
     let currentSnapshot = null;
 
     function setBusy(busy) { controls.forEach((control) => { control.disabled = busy; }); }
     function setStatus(message, error = false) { status.textContent = message; status.classList.toggle("error", error); }
     function selectedDirectory() { return datasetSelect.value || ""; }
     function formatSize(bytes) { return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`; }
+
+    function fftMagnitude(samples) {
+      const size = samples.length;
+      const real = Float64Array.from(samples);
+      const imaginary = new Float64Array(size);
+      for (let index = 1, reversed = 0; index < size; index += 1) {
+        let bit = size >> 1;
+        while (reversed & bit) { reversed ^= bit; bit >>= 1; }
+        reversed ^= bit;
+        if (index < reversed) {
+          const swap = real[index]; real[index] = real[reversed]; real[reversed] = swap;
+        }
+      }
+      for (let length = 2; length <= size; length <<= 1) {
+        const angle = -2 * Math.PI / length;
+        const stepReal = Math.cos(angle);
+        const stepImaginary = Math.sin(angle);
+        for (let start = 0; start < size; start += length) {
+          let twiddleReal = 1;
+          let twiddleImaginary = 0;
+          for (let offset = 0; offset < length / 2; offset += 1) {
+            const even = start + offset;
+            const odd = even + length / 2;
+            const oddReal = real[odd] * twiddleReal - imaginary[odd] * twiddleImaginary;
+            const oddImaginary = real[odd] * twiddleImaginary + imaginary[odd] * twiddleReal;
+            real[odd] = real[even] - oddReal;
+            imaginary[odd] = imaginary[even] - oddImaginary;
+            real[even] += oddReal;
+            imaginary[even] += oddImaginary;
+            const nextReal = twiddleReal * stepReal - twiddleImaginary * stepImaginary;
+            twiddleImaginary = twiddleReal * stepImaginary + twiddleImaginary * stepReal;
+            twiddleReal = nextReal;
+          }
+        }
+      }
+      const magnitude = new Float32Array(size / 2);
+      for (let bin = 0; bin < magnitude.length; bin += 1) {
+        magnitude[bin] = 2 * Math.hypot(real[bin], imaginary[bin]) / size;
+      }
+      return magnitude;
+    }
+
+    function drawSpectrogram(canvas, audioBuffer) {
+      const cssWidth = Math.max(220, Math.round(canvas.clientWidth || 320));
+      const cssHeight = 84;
+      const pixelRatio = Math.min(devicePixelRatio || 1, 2);
+      const width = Math.round(cssWidth * pixelRatio);
+      const height = Math.round(cssHeight * pixelRatio);
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: false });
+      const image = context.createImageData(width, height);
+      const fftSize = 512;
+      const frame = new Float32Array(fftSize);
+      const channelCount = audioBuffer.numberOfChannels;
+      const channels = Array.from({ length: channelCount }, (_, index) => audioBuffer.getChannelData(index));
+      const maxBin = fftSize / 2 - 1;
+      const floorDb = -82;
+      const ceilingDb = -18;
+      for (let x = 0; x < width; x += 1) {
+        const center = Math.round((x + 0.5) * audioBuffer.length / width);
+        const start = center - fftSize / 2;
+        for (let sample = 0; sample < fftSize; sample += 1) {
+          const sourceIndex = start + sample;
+          let value = 0;
+          if (sourceIndex >= 0 && sourceIndex < audioBuffer.length) {
+            for (const channel of channels) value += channel[sourceIndex];
+            value /= channelCount;
+          }
+          frame[sample] = value * (0.5 - 0.5 * Math.cos(2 * Math.PI * sample / (fftSize - 1)));
+        }
+        const magnitudes = fftMagnitude(frame);
+        for (let y = 0; y < height; y += 1) {
+          const highToLow = 1 - y / Math.max(1, height - 1);
+          const bin = Math.max(1, Math.round(highToLow * maxBin));
+          const decibels = 20 * Math.log10(Math.max(magnitudes[bin], 1e-8));
+          const intensity = Math.pow(Math.max(0, Math.min(1, (decibels - floorDb) / (ceilingDb - floorDb))), 0.82);
+          const red = 15 + intensity * (45 + 195 * highToLow);
+          const green = 15 + intensity * 52;
+          const blue = 15 + intensity * (220 - 180 * highToLow);
+          const pixel = (y * width + x) * 4;
+          image.data[pixel] = Math.round(red);
+          image.data[pixel + 1] = Math.round(green);
+          image.data[pixel + 2] = Math.round(blue);
+          image.data[pixel + 3] = 255;
+        }
+      }
+      context.putImageData(image, 0, 0);
+      canvas.dataset.state = "ready";
+    }
+
+    function spectrumContext() {
+      if (!spectrumAudioContext) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        spectrumAudioContext = new AudioContextClass();
+      }
+      return spectrumAudioContext;
+    }
+
+    async function renderSpectrogram(canvas, audioUrl) {
+      canvas.dataset.state = "loading";
+      try {
+        const response = await fetch(audioUrl);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const audioBuffer = await spectrumContext().decodeAudioData(await response.arrayBuffer());
+        if (canvas.isConnected) drawSpectrogram(canvas, audioBuffer);
+      } catch (error) {
+        canvas.dataset.state = "error";
+        canvas.title = `频谱渲染失败：${error.message}`;
+      }
+    }
+
+    function runSpectrumQueue() {
+      while (spectrumActive < spectrumConcurrency && spectrumQueue.length) {
+        const task = spectrumQueue.shift();
+        if (!task.canvas.isConnected) continue;
+        spectrumActive += 1;
+        renderSpectrogram(task.canvas, task.audioUrl).finally(() => {
+          spectrumActive -= 1;
+          runSpectrumQueue();
+        });
+      }
+    }
+
+    function queueSpectrogram(canvas, audioUrl) {
+      if (canvas.dataset.state !== "waiting") return;
+      canvas.dataset.state = "queued";
+      spectrumQueue.push({ canvas, audioUrl });
+      runSpectrumQueue();
+    }
+
+    const spectrumObserver = "IntersectionObserver" in window
+      ? new IntersectionObserver((entries, observer) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          observer.unobserve(entry.target);
+          queueSpectrogram(entry.target, entry.target.dataset.audioUrl);
+        }
+      }, { rootMargin: "360px 0px" })
+      : null;
+
+    function observeSpectrogram(canvas, audioUrl) {
+      canvas.dataset.audioUrl = audioUrl;
+      if (spectrumObserver) spectrumObserver.observe(canvas);
+      else queueSpectrogram(canvas, audioUrl);
+    }
 
     async function readJson(response, fallback) {
       const result = await response.json();
@@ -210,7 +363,14 @@
       const params = new URLSearchParams({ dataset_dir: directory, filename: item.filename });
       params.set("v", String(item.version || ""));
       audio.src = `/api/dataset-review/audio?${params}`;
-      audioColumn.append(name, audio);
+      const spectrogram = document.createElement("canvas");
+      spectrogram.className = "spectrogram";
+      spectrogram.dataset.state = "waiting";
+      spectrogram.setAttribute("role", "img");
+      spectrogram.setAttribute("aria-label", `${item.filename} 的频谱图，高频在上、低频在下`);
+      spectrogram.title = "高频在上（红），低频在下（蓝）";
+      audioColumn.append(name, audio, spectrogram);
+      observeSpectrogram(spectrogram, audio.src);
       const transcript = document.createElement("div");
       transcript.className = `transcript${item.has_lab ? "" : " missing"}`;
       transcript.textContent = item.has_lab ? (item.text || "[LAB 内容为空]") : "缺少同名 LAB 文本";
@@ -237,6 +397,8 @@
       currentSnapshot = snapshot;
       updateCounts(snapshot);
       directoryState.textContent = snapshot.directory;
+      if (spectrumObserver) spectrumObserver.disconnect();
+      spectrumQueue.length = 0;
       queue.replaceChildren();
       if (!snapshot.items.length) {
         const empty = document.createElement("div");
@@ -255,7 +417,9 @@
       const row = [...queue.querySelectorAll(".review-item")].find((item) => item.dataset.filename === result.removed_filename);
       if (row) {
         const audio = row.querySelector("audio");
+        const spectrogram = row.querySelector(".spectrogram");
         if (audio) audio.pause();
+        if (spectrogram && spectrumObserver) spectrumObserver.unobserve(spectrogram);
         row.remove();
       }
       if (result.replacement_item && ![...queue.querySelectorAll(".review-item")].some((item) => item.dataset.filename === result.replacement_item.filename)) {
