@@ -114,6 +114,32 @@ class DummyModel:
         return []
 
 
+def test_lora_linear_runtime_scale_interpolates_adapter_output():
+    module = _load_module(
+        "voxcpm_test_lora_scaling",
+        SRC / "voxcpm" / "modules" / "layers" / "lora.py",
+    )
+    base = torch.nn.Linear(2, 1, bias=False)
+    base.weight.data.zero_()
+    layer = module.LoRALinear(base, r=1, alpha=1)
+    layer.lora_A.data.fill_(1.0)
+    layer.lora_B.data.fill_(2.0)
+    inputs = torch.tensor([[1.0, 2.0]])
+
+    layer.set_scale(1.0)
+    nominal = layer(inputs)
+    layer.set_scale(1.5)
+    amplified = layer(inputs)
+    layer.set_scale(0.0)
+    disabled = layer(inputs)
+
+    assert nominal.item() == pytest.approx(6.0)
+    assert amplified.item() == pytest.approx(9.0)
+    assert disabled.item() == pytest.approx(0.0)
+    with pytest.raises(ValueError):
+        layer.set_scale(float("nan"))
+
+
 @pytest.mark.parametrize("module_name", ["v1", "v2"])
 def test_load_lora_weights_accepts_tensor_only_legacy_checkpoints(monkeypatch, tmp_path, module_name):
     VoxCPMModel, VoxCPM2Model = bootstrap_repo_modules(monkeypatch)

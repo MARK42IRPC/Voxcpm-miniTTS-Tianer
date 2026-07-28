@@ -1521,6 +1521,11 @@ class VoxCPM2Model(nn.Module):
         for module in self._iter_lora_modules():
             module.set_enabled(enabled)
 
+    def set_lora_scale(self, multiplier: float):
+        """Set the runtime multiplier for all LoRA layers."""
+        for module in self._iter_lora_modules():
+            module.set_scale(multiplier)
+
     def reset_lora_weights(self):
         """Reset all LoRA weights (A: kaiming, B: zeros), effectively unloading LoRA."""
         for module in self._iter_lora_modules():

@@ -426,6 +426,10 @@ class VoxCPM:
         """
         self.tts_model.set_lora_enabled(enabled)
 
+    def set_lora_scale(self, multiplier: float):
+        """Set LoRA strength relative to the adapter's configured alpha/rank."""
+        self.tts_model.set_lora_scale(multiplier)
+
     def get_lora_state_dict(self) -> dict:
         """Get current LoRA parameters state dict.
 

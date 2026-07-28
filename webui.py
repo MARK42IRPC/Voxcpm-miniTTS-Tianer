@@ -115,6 +115,7 @@ class ModelRuntime:
         self._identity: tuple[str, str, bool] | None = None
         self._lora_id: str | None = None
         self._lora_signature: str | None = None
+        self._lora_strength = 1.0
         self._prompt_cache: dict | None = None
         self._prompt_cache_key: tuple | None = None
         self._lock = threading.Lock()
@@ -129,6 +130,7 @@ class ModelRuntime:
         self._identity = None
         self._lora_id = None
         self._lora_signature = None
+        self._lora_strength = 1.0
         self._prompt_cache = None
         self._prompt_cache_key = None
         gc.collect()
@@ -148,7 +150,12 @@ class ModelRuntime:
                 f"skipped {len(skipped_keys)}"
             )
 
-    def get(self, config: ModelConfig, lora_checkpoint: dict | None = None) -> VoxCPM:
+    def get(
+        self,
+        config: ModelConfig,
+        lora_checkpoint: dict | None = None,
+        lora_strength: float = 1.0,
+    ) -> VoxCPM:
         identity = (config.model_key, config.device, config.optimize)
         denoiser_device = "gpu" if config.device == "hybrid" else "cpu"
         if self._model is not None and self._identity == identity:
@@ -158,6 +165,7 @@ class ModelRuntime:
                 if self._lora_id is not None:
                     self._model.set_lora_enabled(False)
                     self._lora_id = None
+                    self._lora_strength = 1.0
                     self._clear_prompt_cache()
             elif lora_checkpoint is not None and self._lora_signature == requested_signature:
                 if self._lora_id != requested_lora_id:
@@ -174,7 +182,10 @@ class ModelRuntime:
                         self._lora_id = requested_lora_id
                         self._clear_prompt_cache()
                 if self._model is not None:
-                    self._model.set_lora_enabled(True)
+                    if not math.isclose(self._lora_strength, lora_strength):
+                        self._clear_prompt_cache()
+                    self._model.set_lora_scale(lora_strength)
+                    self._lora_strength = lora_strength
             elif lora_checkpoint is not None:
                 self._release()
 
@@ -208,6 +219,8 @@ class ModelRuntime:
             if lora_checkpoint:
                 self._lora_id = lora_checkpoint["id"]
                 self._lora_signature = lora_checkpoint["signature"]
+                self._model.set_lora_scale(lora_strength)
+                self._lora_strength = lora_strength
             if config.load_denoiser:
                 self._model.ensure_denoiser(str(DENOISER_PATH), device=denoiser_device)
         except Exception:
@@ -225,6 +238,10 @@ class ModelRuntime:
     def lora_id(self) -> str | None:
         return self._lora_id
 
+    @property
+    def lora_strength(self) -> float:
+        return self._lora_strength
+
     def generate_many(
         self,
         config: ModelConfig,
@@ -232,11 +249,12 @@ class ModelRuntime:
         prompt_cache_key: tuple | None = None,
         prompt_build_kwargs: dict | None = None,
         lora_checkpoint: dict | None = None,
+        lora_strength: float = 1.0,
         **kwargs,
     ):
         with self._lock:
             try:
-                model = self.get(config, lora_checkpoint)
+                model = self.get(config, lora_checkpoint, lora_strength)
                 prompt_cache = None
                 cache_hit = False
                 if prompt_build_kwargs:
@@ -1590,6 +1608,7 @@ async def generate(
     text: str = Form(...),
     model_key: str = Form("voxcpm2"),
     lora_id: str = Form(""),
+    lora_strength: float = Form(1.0),
     mode: str = Form("design"),
     control: str = Form(""),
     prompt_text: str = Form(""),
@@ -1638,6 +1657,10 @@ async def generate(
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     lora_checkpoint = resolve_lora_checkpoint(lora_id, model_key)
+    if not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0:
+        raise HTTPException(status_code=400, detail="LoRA strength must be between 0 and 2")
+    if lora_checkpoint is None and not math.isclose(lora_strength, 1.0):
+        raise HTTPException(status_code=400, detail="Select a LoRA before changing its strength")
     if device not in {"cuda", "cpu", *HYBRID_DEVICES}:
         raise HTTPException(status_code=400, detail="Device must be cuda, cpu, hybrid, or hybrid-max")
     if device in {"cuda", *HYBRID_DEVICES} and not torch.cuda.is_available():
@@ -1709,6 +1732,7 @@ async def generate(
         prompt_cache_key = (
             model_key,
             lora_checkpoint["id"] if lora_checkpoint else None,
+            lora_strength if lora_checkpoint else None,
             mode,
             reference_hash,
             prompt_text.strip() if mode == "ultimate" else "",
@@ -1723,6 +1747,7 @@ async def generate(
                 prompt_cache_key,
                 prompt_build_kwargs,
                 lora_checkpoint,
+                lora_strength=lora_strength,
                 **kwargs,
             )
         except torch.OutOfMemoryError as exc:
@@ -1772,6 +1797,7 @@ async def generate(
             "model_key": model_key,
             "lora_id": lora_checkpoint["id"] if lora_checkpoint else None,
             "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
+            "lora_strength": lora_strength if lora_checkpoint else None,
             "lora_path": lora_checkpoint["path"] if lora_checkpoint else None,
             "lora_config": lora_checkpoint["lora_config"] if lora_checkpoint else None,
             "mode": mode,
@@ -1833,6 +1859,7 @@ async def generate(
         "model": model_key,
         "lora_id": lora_checkpoint["id"] if lora_checkpoint else None,
         "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
+        "lora_strength": lora_strength if lora_checkpoint else None,
         "device": device,
         "batch_mode": batch_mode,
         "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,

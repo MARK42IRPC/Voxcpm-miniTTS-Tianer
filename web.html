@@ -553,6 +553,10 @@
                 <button class="icon-button" id="refreshLoraButton" type="button" title="刷新 LoRA 列表" aria-label="刷新 LoRA 列表"><span aria-hidden="true">↻</span></button>
               </div>
             </div>
+            <div class="field">
+              <div class="field-row"><label class="tooltip-trigger" for="loraStrength" tabindex="0" data-tooltip="缩放 LoRA 对基础模型的影响。0x 等同基础模型，1x 为训练时标准强度，提高后可能增强音色，也可能放大失真或损伤发音。">LoRA 强度</label><span class="value" id="loraStrengthOutput">1.00x</span></div>
+              <input id="loraStrength" name="lora_strength" type="range" min="0" max="2" value="1" step="0.05" disabled>
+            </div>
             <div class="device-group">
               <input id="deviceCuda" type="radio" name="device" value="cuda" checked>
               <label class="tooltip-trigger" for="deviceCuda" tabindex="0" data-tooltip="将完整模型放入显卡推理，通常速度最快。2B 模型完整 GPU 推理需要约 8 GB 显存；1.5 可在本机 4 GB 显存上实验加载，显存不足时服务会释放模型并报告错误。">GPU</label>
@@ -697,6 +701,7 @@
     const deviceInputs = [...document.querySelectorAll('input[name="device"]')];
     const modelKey = document.getElementById("modelKey");
     const loraSelect = document.getElementById("loraSelect");
+    const loraStrength = document.getElementById("loraStrength");
     const refreshLoraButton = document.getElementById("refreshLoraButton");
     const modeDesign = document.getElementById("modeDesign");
     const modeReference = document.getElementById("modeReference");
@@ -1196,6 +1201,7 @@
       const useStableHybrid = deviceHybrid.checked;
       const useHybridMax = deviceHybridMax.checked;
       const useLora = Boolean(loraSelect.value);
+      loraStrength.disabled = !useLora;
       const optimize = document.getElementById("optimize");
       const supportsOptimize = useCuda || useStableHybrid;
       optimize.disabled = !supportsOptimize || useLora;
@@ -1223,7 +1229,7 @@
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "LoRA 列表刷新失败");
         loraCheckpoints = data.checkpoints || [];
-        renderLoraOptions();
+        updateDevice();
         const compatibleCount = loraCheckpoints.filter((item) => item.model_key === modelKey.value).length;
         message.className = "message";
         message.textContent = `LoRA 列表已刷新 · 当前模型 ${compatibleCount} 个可用检查点`;
@@ -1314,6 +1320,7 @@
     ["dragleave", "drop"].forEach((eventName) => dropzone.addEventListener(eventName, () => dropzone.classList.remove("active")));
     bindRange("cfgValue", "cfgOutput", (value) => Number(value).toFixed(1));
     bindRange("timesteps", "timestepsOutput");
+    bindRange("loraStrength", "loraStrengthOutput", (value) => `${Number(value).toFixed(2)}x`);
     clearSession.addEventListener("click", () => {
       sessionOutputs = [];
       saveSessionOutputs();

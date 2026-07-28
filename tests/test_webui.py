@@ -38,6 +38,7 @@ class FakeModel:
         self.generate_count = 0
         self.loaded_loras = []
         self.lora_enabled = None
+        self.lora_scale = None
         self.tts_model = SimpleNamespace(sample_rate=48000, last_successful_seed=None)
 
     def build_prompt_cache(self, **kwargs):
@@ -59,6 +60,9 @@ class FakeModel:
 
     def set_lora_enabled(self, enabled):
         self.lora_enabled = enabled
+
+    def set_lora_scale(self, multiplier):
+        self.lora_scale = multiplier
 
 
 def make_runtime_with_model(config):
@@ -402,8 +406,30 @@ def test_compatible_lora_switch_is_hot_and_invalidates_prompt_cache():
 
     assert selected_model is model
     assert model.loaded_loras == ["new-checkpoint"]
-    assert model.lora_enabled is True
+    assert model.lora_scale == 1.0
     assert runtime.lora_id == "new"
+    assert runtime.prompt_cache_ready is False
+
+
+def test_lora_strength_updates_hot_and_invalidates_prompt_cache():
+    config = ModelConfig("voxcpm-0.5b", "cpu", False, False)
+    runtime, model = make_runtime_with_model(config)
+    runtime._lora_id = "same"
+    runtime._lora_signature = "same-config"
+    runtime._prompt_cache = {"encoded": True}
+    runtime._prompt_cache_key = ("same", 1.0)
+    checkpoint = {
+        "id": "same",
+        "path": "same-checkpoint",
+        "signature": "same-config",
+    }
+
+    selected_model = runtime.get(config, checkpoint, 1.5)
+
+    assert selected_model is model
+    assert model.loaded_loras == []
+    assert model.lora_scale == 1.5
+    assert runtime.lora_strength == 1.5
     assert runtime.prompt_cache_ready is False
 
     runtime._prompt_cache = {"encoded": True}

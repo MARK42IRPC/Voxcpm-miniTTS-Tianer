@@ -72,8 +72,15 @@ class LoRALinear(nn.Module):
 
     def set_enabled(self, enabled: bool):
         """启用/禁用 LoRA（通过 scaling 控制，兼容 torch.compile）"""
-        # 使用 fill_ 原地修改 buffer 值，不会触发重编译
-        self.scaling.fill_(self._base_scaling if enabled else 0.0)
+        self.set_scale(1.0 if enabled else 0.0)
+
+    def set_scale(self, multiplier: float):
+        """Set the runtime LoRA multiplier without changing adapter weights."""
+        multiplier = float(multiplier)
+        if not math.isfinite(multiplier) or multiplier < 0:
+            raise ValueError("LoRA scale must be a finite non-negative value")
+        # In-place updates preserve compiled graphs and avoid model reloads.
+        self.scaling.fill_(self._base_scaling * multiplier)
 
     @property
     def enabled(self) -> bool:
