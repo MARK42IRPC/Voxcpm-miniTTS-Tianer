@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>学生模型导出</title>
+  <style>
+    :root { color-scheme: light; --canvas:#f4f6f7; --surface:#fff; --surface-muted:#eef1f2; --ink:#171a1c; --muted:#657078; --line:#d9dfe2; --line-strong:#aeb8bd; --teal:#147684; --green:#147a55; --green-hover:#0f6848; --red:#b43b3b; --amber:#a86400; --shadow:0 12px 30px rgba(25,35,40,.08); }
+    * { box-sizing: border-box; }
+    html { overflow-x: hidden; }
+    body { min-width:320px; min-height:100vh; margin:0; background:var(--canvas); color:var(--ink); font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif; letter-spacing:0; }
+    button,input,select,textarea { min-width:0; max-width:100%; font:inherit; letter-spacing:0; }
+    button,label,select,input[type="checkbox"] { cursor:pointer; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; height:64px; padding:0 24px; border-bottom:1px solid var(--line); background:var(--surface); }
+    .brand { display:flex; align-items:center; gap:12px; min-width:0; }
+    .brand img { width:34px; height:34px; object-fit:contain; }
+    .brand strong { font-size:17px; white-space:nowrap; }
+    .nav { display:flex; align-items:center; gap:4px; padding:3px; border-radius:6px; background:var(--surface-muted); }
+    .nav a { padding:7px 11px; border-radius:4px; color:var(--muted); font-size:13px; text-decoration:none; }
+    .nav a.active { background:var(--surface); color:var(--ink); box-shadow:0 1px 4px rgba(20,28,32,.12); }
+    .runtime { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; white-space:nowrap; }
+    .status-dot { width:8px; height:8px; border-radius:50%; background:#9aa3a8; }
+    .status-dot.ready { background:var(--green); }
+    .status-dot.busy { background:var(--amber); }
+    main { width:100%; max-width:1500px; margin:0 auto; padding:24px; }
+    .command-panel { overflow:hidden; border:1px solid var(--line); border-radius:8px; background:var(--surface); box-shadow:var(--shadow); }
+    .command-grid { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(310px,.72fr); }
+    .preview-pane,.export-pane { min-width:0; padding:22px; }
+    .export-pane { border-left:1px solid var(--line); background:#fafbfb; }
+    .section-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:16px; }
+    .section-head h1,.section-head h2 { margin:0; font-size:15px; }
+    .selected-summary { min-width:0; max-width:70%; color:var(--muted); font-size:11px; text-align:right; overflow-wrap:anywhere; }
+    .field { display:grid; gap:7px; min-width:0; }
+    .field + .field { margin-top:14px; }
+    .field label,.field-title { font-size:12px; font-weight:700; }
+    textarea,select,input[type="number"],input[type="search"] { width:100%; border:1px solid #c9d0d4; border-radius:6px; outline:0; background:var(--surface); color:var(--ink); transition:border-color 120ms,box-shadow 120ms; }
+    textarea:focus,select:focus,input:focus { border-color:var(--teal); box-shadow:0 0 0 3px rgba(20,118,132,.12); }
+    textarea { min-height:108px; padding:11px 12px; resize:vertical; line-height:1.55; }
+    select,input[type="number"],input[type="search"] { height:39px; padding:0 10px; }
+    .parameter-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+    .parameter-grid .field { margin:0; }
+    .help { color:var(--muted); font-size:10px; line-height:1.45; }
+    .preview-actions,.export-actions { display:flex; align-items:center; justify-content:flex-end; gap:9px; margin-top:16px; }
+    .primary,.secondary,.download-action { display:inline-flex; align-items:center; justify-content:center; height:40px; padding:0 14px; border-radius:6px; font-size:12px; font-weight:700; text-decoration:none; white-space:nowrap; }
+    .primary { border:0; background:var(--green); color:#fff; }
+    .primary:hover:not(:disabled) { background:var(--green-hover); }
+    .secondary,.download-action { border:1px solid var(--line-strong); background:var(--surface); color:var(--teal); }
+    .primary:disabled,.secondary:disabled,.download-action.disabled { cursor:wait; opacity:.48; pointer-events:none; }
+    .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-top:14px; font-size:12px; }
+    .switch { position:relative; width:42px; height:24px; flex:0 0 auto; }
+    .switch input { position:absolute; opacity:0; }
+    .switch span { position:absolute; inset:0; border-radius:12px; background:#bdc5c9; transition:background 120ms; }
+    .switch span::after { content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff; transition:transform 120ms; }
+    .switch input:checked + span { background:var(--green); }
+    .switch input:checked + span::after { transform:translateX(18px); }
+    .export-note { min-height:46px; margin-top:12px; padding:10px 11px; border-left:3px solid var(--teal); background:#eef8f9; color:#38545a; font-size:11px; line-height:1.5; }
+    .feedback { min-height:18px; margin-top:12px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .feedback.error { color:var(--red); }
+    .preview-result { display:none; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:14px; padding:14px 22px; border-top:1px solid var(--line); background:#fafcfc; }
+    .preview-result.visible { display:grid; }
+    .preview-result audio { width:100%; height:38px; }
+    .preview-meta { color:var(--muted); font-size:11px; white-space:nowrap; }
+    .library { margin-top:20px; }
+    .library-head { display:flex; align-items:end; justify-content:space-between; gap:16px; margin-bottom:12px; }
+    .library-head h2 { margin:0 0 4px; font-size:16px; }
+    .library-head p { margin:0; color:var(--muted); font-size:11px; }
+    .refresh { height:36px; padding:0 12px; border:1px solid var(--line-strong); border-radius:6px; background:var(--surface); color:var(--teal); font-size:12px; font-weight:700; }
+    .filters { display:grid; grid-template-columns:minmax(220px,1.4fr) auto minmax(180px,.6fr) minmax(150px,.5fr); align-items:end; gap:12px; padding:14px; border:1px solid var(--line); border-radius:7px; background:var(--surface); }
+    .filter-types { display:flex; align-items:center; gap:7px; min-height:39px; }
+    .check-filter { display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 9px; border:1px solid var(--line); border-radius:5px; background:var(--surface); color:var(--muted); font-size:11px; white-space:nowrap; }
+    .check-filter:has(input:checked) { border-color:#8fbcae; background:#f1f9f6; color:var(--ink); }
+    .check-filter input { width:14px; height:14px; margin:0; accent-color:var(--green); }
+    .card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(285px,1fr)); gap:12px; margin-top:12px; }
+    .model-card { min-width:0; padding:15px; border:1px solid var(--line); border-radius:7px; background:var(--surface); cursor:pointer; transition:border-color 120ms,box-shadow 120ms,transform 120ms; }
+    .model-card:hover { border-color:#9ab4bb; transform:translateY(-1px); }
+    .model-card.selected { border-color:var(--green); box-shadow:0 0 0 2px rgba(20,122,85,.14); }
+    .model-card:focus-visible { outline:2px solid var(--teal); outline-offset:2px; }
+    .card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .card-title { min-width:0; margin:0; font-size:13px; line-height:1.45; overflow-wrap:anywhere; }
+    .badges { display:flex; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end; gap:4px; }
+    .badge { padding:2px 5px; border:1px solid var(--line); border-radius:3px; background:var(--surface-muted); color:var(--muted); font-size:9px; font-weight:700; text-transform:uppercase; }
+    .badge.onnx { border-color:#76aaaF; background:#eef8f9; color:var(--teal); }
+    .badge.checkpoint { border-color:#d7ae61; background:#fff8df; color:var(--amber); }
+    .card-info { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:13px; }
+    .datum { min-width:0; }
+    .datum span { display:block; color:var(--muted); font-size:9px; }
+    .datum strong { display:block; margin-top:2px; font-size:11px; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .card-path { margin-top:12px; color:var(--muted); font-family:Consolas,monospace; font-size:9px; line-height:1.45; overflow-wrap:anywhere; }
+    .card-actions { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:13px; padding-top:11px; border-top:1px solid var(--line); }
+    .select-label { color:var(--green); font-size:11px; font-weight:700; }
+    .card-download { color:var(--teal); font-size:10px; font-weight:700; text-decoration:none; }
+    .empty { grid-column:1/-1; padding:44px 16px; border:1px dashed var(--line-strong); border-radius:7px; background:var(--surface); color:var(--muted); font-size:13px; text-align:center; }
+    .tooltip-trigger { display:inline-flex; align-items:center; gap:5px; width:max-content; max-width:100%; outline:0; }
+    .tooltip-trigger::after { content:"?"; display:inline-grid; place-items:center; width:15px; height:15px; flex:0 0 15px; border:1px solid var(--line-strong); border-radius:50%; color:var(--muted); font-size:9px; }
+    .property-tooltip { position:fixed; z-index:1000; width:max-content; max-width:min(320px,calc(100vw - 24px)); padding:8px 10px; border:1px solid #3e484d; border-radius:5px; background:#20272a; color:#fff; box-shadow:0 8px 20px rgba(20,28,32,.18); font-size:12px; line-height:1.55; pointer-events:none; opacity:0; transform:translateY(2px); transition:opacity 100ms,transform 100ms; }
+    .property-tooltip.visible { opacity:1; transform:translateY(0); }
+    @media (max-width:900px) { .topbar { height:auto; min-height:64px; align-items:stretch; flex-direction:column; padding:10px 14px; } .brand,.runtime { display:none; } .nav { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); } .nav a { min-width:0; padding:7px 2px; overflow:hidden; font-size:11px; text-align:center; text-overflow:ellipsis; white-space:nowrap; } main { padding:12px; } .command-grid { grid-template-columns:minmax(0,1fr); } .export-pane { border-top:1px solid var(--line); border-left:0; } .parameter-grid { grid-template-columns:1fr 1fr; } .filters { grid-template-columns:1fr 1fr; } }
+    @media (max-width:560px) { .preview-pane,.export-pane { padding:16px; } .section-head { align-items:flex-start; flex-direction:column; gap:6px; } .selected-summary { max-width:100%; text-align:left; } .parameter-grid,.filters { grid-template-columns:minmax(0,1fr); } .filter-types { flex-wrap:wrap; } .preview-actions,.export-actions { display:grid; grid-template-columns:1fr; } .primary,.secondary,.download-action { width:100%; } .preview-result { grid-template-columns:1fr; } .preview-meta { white-space:normal; } .card-grid { grid-template-columns:minmax(0,1fr); } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 学生模型导出</strong></div>
+    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a href="/distill">蒸馏</a><a class="active" href="/export">导出</a></nav>
+    <div class="runtime"><span class="status-dot" id="statusDot"></span><span id="runtimeState">正在扫描学生模型</span></div>
+  </header>
+  <main>
+    <section class="command-panel">
+      <div class="command-grid">
+        <div class="preview-pane">
+          <div class="section-head"><h1>推理试听</h1><span class="selected-summary" id="selectedSummary">请从下方选择模型</span></div>
+          <div class="field"><label class="tooltip-trigger" for="previewText" tabindex="0" data-tooltip="由当前选中的学生模型生成试听，支持 1-500 个字符。检查点首次试听需要先生成缓存运行模型。">试听文本</label><textarea id="previewText">你好，这是学生模型导出前的试听。Welcome to the bilingual model test.</textarea></div>
+          <div class="parameter-grid">
+            <div class="field"><label class="tooltip-trigger" for="lengthScale" tabindex="0" data-tooltip="时长倍率。大于 1 更慢，小于 1 更快；MeloTTS 会换算为对应语速。">时长倍率</label><input id="lengthScale" type="number" min="0.2" max="3" step="0.05" value="1"></div>
+            <div class="field"><label class="tooltip-trigger" for="noiseScale" tabindex="0" data-tooltip="Piper 音色随机度。MeloTTS/Sherpa 模型会忽略此项。">音色随机度</label><input id="noiseScale" type="number" min="0" max="2" step="0.01" value="0.667"></div>
+            <div class="field"><label class="tooltip-trigger" for="noiseWScale" tabindex="0" data-tooltip="Piper 韵律随机度。MeloTTS/Sherpa 模型会忽略此项。">韵律随机度</label><input id="noiseWScale" type="number" min="0" max="2" step="0.01" value="0.8"></div>
+            <div class="field"><label class="tooltip-trigger" for="volume" tabindex="0" data-tooltip="试听文件的线性音量倍率，1 为模型原始音量。">音量</label><input id="volume" type="number" min="0.1" max="3" step="0.05" value="1"></div>
+          </div>
+          <div class="preview-actions"><button class="primary" id="previewButton" type="button" disabled>生成试听音频</button></div>
+        </div>
+        <div class="export-pane">
+          <div class="section-head"><h2>导出选项</h2><span class="selected-summary" id="exportState">未选择</span></div>
+          <div class="field"><label class="tooltip-trigger" for="exportPrecision" tabindex="0" data-tooltip="FP32 兼容性最高；FP16 需要客户端运行时支持半精度算子；INT8 通常最适合 CPU 边缘部署。低精度 ONNX 不支持反向恢复为高精度。">导出精度</label><select id="exportPrecision" disabled></select></div>
+          <div class="export-note" id="precisionNote">选择模型后会显示可用精度和兼容性。</div>
+          <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="导出完成后立即下载包含模型及运行配置的 ZIP。检查点原文件不会被修改。">完成后自动下载模型包</span><label class="switch"><input id="autoDownload" type="checkbox"><span></span></label></div>
+          <div class="export-actions"><a class="download-action disabled" id="downloadOriginal" href="#">下载当前资产</a><button class="primary" id="exportButton" type="button" disabled>生成导出</button></div>
+          <div class="feedback" id="feedback" aria-live="polite">就绪</div>
+        </div>
+      </div>
+      <div class="preview-result" id="previewResult"><audio id="previewAudio" controls preload="none"></audio><span class="preview-meta" id="previewMeta"></span></div>
+    </section>
+
+    <section class="library">
+      <div class="library-head"><div><h2>学生模型库</h2><p id="librarySummary">正在读取资产</p></div><button class="refresh" id="refreshButton" type="button">刷新</button></div>
+      <div class="filters">
+        <div class="field"><span class="field-title">搜索</span><input id="searchInput" type="search" placeholder="名称、路径或语言"></div>
+        <div class="field"><span class="field-title">资产类型</span><div class="filter-types"><label class="check-filter"><input id="filterOnnx" type="checkbox" checked><span>ONNX</span></label><label class="check-filter"><input id="filterCheckpoint" type="checkbox" checked><span>检查点</span></label></div></div>
+        <div class="field"><label for="architectureFilter">模型架构</label><select id="architectureFilter"><option value="all">全部架构</option></select></div>
+        <div class="field"><label for="precisionFilter">当前精度</label><select id="precisionFilter"><option value="all">全部精度</option><option value="fp32">FP32</option><option value="fp16">FP16</option><option value="int8">INT8</option></select></div>
+      </div>
+      <div class="card-grid" id="cardGrid"><div class="empty">正在扫描学生模型与检查点</div></div>
+    </section>
+  </main>
+  <div class="property-tooltip" id="propertyTooltip" role="tooltip" aria-hidden="true"></div>
+  <script>
+    const statusDot = document.getElementById("statusDot");
+    const runtimeState = document.getElementById("runtimeState");
+    const selectedSummary = document.getElementById("selectedSummary");
+    const exportState = document.getElementById("exportState");
+    const previewText = document.getElementById("previewText");
+    const lengthScale = document.getElementById("lengthScale");
+    const noiseScale = document.getElementById("noiseScale");
+    const noiseWScale = document.getElementById("noiseWScale");
+    const volume = document.getElementById("volume");
+    const previewButton = document.getElementById("previewButton");
+    const exportPrecision = document.getElementById("exportPrecision");
+    const precisionNote = document.getElementById("precisionNote");
+    const autoDownload = document.getElementById("autoDownload");
+    const downloadOriginal = document.getElementById("downloadOriginal");
+    const exportButton = document.getElementById("exportButton");
+    const feedback = document.getElementById("feedback");
+    const previewResult = document.getElementById("previewResult");
+    const previewAudio = document.getElementById("previewAudio");
+    const previewMeta = document.getElementById("previewMeta");
+    const searchInput = document.getElementById("searchInput");
+    const filterOnnx = document.getElementById("filterOnnx");
+    const filterCheckpoint = document.getElementById("filterCheckpoint");
+    const architectureFilter = document.getElementById("architectureFilter");
+    const precisionFilter = document.getElementById("precisionFilter");
+    const librarySummary = document.getElementById("librarySummary");
+    const refreshButton = document.getElementById("refreshButton");
+    const cardGrid = document.getElementById("cardGrid");
+    const precisionDescriptions = new Map();
+    let state = null;
+    let selectedId = localStorage.getItem("voxcpm-export-selected") || "";
+    let busy = false;
+
+    function selectedArtifact() { return state?.artifacts.find((item) => item.id === selectedId) || null; }
+    function kindLabel(item) { return item.kind === "onnx" ? "ONNX" : item.kind === "melo_checkpoint" ? "Melo PTH" : "Piper CKPT"; }
+    function setFeedback(text, error = false) { feedback.textContent = text; feedback.classList.toggle("error", error); }
+    function setBusy(value) { busy = value; previewButton.disabled = value || !selectedArtifact(); exportButton.disabled = value || !selectedArtifact() || state?.busy; refreshButton.disabled = value; }
+    function formatDate(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString("zh-CN", { hour12:false }); }
+
+    function visibleArtifacts() {
+      if (!state) return [];
+      const query = searchInput.value.trim().toLocaleLowerCase();
+      return state.artifacts.filter((item) => {
+        const typeVisible = item.kind === "onnx" ? filterOnnx.checked : filterCheckpoint.checked;
+        const architectureVisible = architectureFilter.value === "all" || item.architecture === architectureFilter.value;
+        const precisionVisible = precisionFilter.value === "all" || item.precision === precisionFilter.value;
+        const searchable = `${item.name} ${item.relative_path} ${item.language || ""} ${item.engine_label}`.toLocaleLowerCase();
+        return typeVisible && architectureVisible && precisionVisible && (!query || searchable.includes(query));
+      });
+    }
+
+    function createDatum(label, value) {
+      const cell = document.createElement("div"); cell.className = "datum";
+      const key = document.createElement("span"); key.textContent = label;
+      const content = document.createElement("strong"); content.textContent = value || "未知"; content.title = value || "未知";
+      cell.append(key, content); return cell;
+    }
+
+    function selectArtifact(id, scroll = false) {
+      selectedId = id;
+      localStorage.setItem("voxcpm-export-selected", id);
+      updateSelectedControls();
+      renderCards();
+      if (scroll) document.querySelector(".command-panel")?.scrollIntoView({ behavior:"smooth", block:"start" });
+    }
+
+    function createCard(item) {
+      const card = document.createElement("article");
+      card.className = `model-card${item.id === selectedId ? " selected" : ""}`;
+      card.tabIndex = 0; card.dataset.id = item.id; card.setAttribute("aria-selected", String(item.id === selectedId));
+      const head = document.createElement("div"); head.className = "card-head";
+      const title = document.createElement("h3"); title.className = "card-title"; title.textContent = item.name;
+      const badges = document.createElement("div"); badges.className = "badges";
+      const kind = document.createElement("span"); kind.className = `badge ${item.kind === "onnx" ? "onnx" : "checkpoint"}`; kind.textContent = kindLabel(item);
+      const precision = document.createElement("span"); precision.className = "badge"; precision.textContent = item.precision;
+      badges.append(kind, precision); head.append(title, badges);
+      const info = document.createElement("div"); info.className = "card-info";
+      info.append(createDatum("架构", item.engine_label), createDatum("体积", `${Number(item.size_mb).toFixed(2)} MB`), createDatum("采样率", item.sample_rate ? `${item.sample_rate} Hz` : "未知"), createDatum("语言", item.language || "未知"));
+      const path = document.createElement("div"); path.className = "card-path"; path.textContent = item.relative_path;
+      const actions = document.createElement("div"); actions.className = "card-actions";
+      const select = document.createElement("span"); select.className = "select-label"; select.textContent = item.id === selectedId ? "当前选中" : "点击选中";
+      const download = document.createElement("a"); download.className = "card-download"; download.href = `/api/piper/download/${item.id}`; download.textContent = item.kind === "onnx" ? "下载模型包" : "下载检查点"; download.addEventListener("click", (event) => event.stopPropagation());
+      actions.append(select, download); card.append(head, info, path, actions);
+      card.addEventListener("click", () => selectArtifact(item.id));
+      card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectArtifact(item.id); } });
+      return card;
+    }
+
+    function renderCards() {
+      const items = visibleArtifacts();
+      cardGrid.replaceChildren();
+      librarySummary.textContent = state ? `显示 ${items.length} / ${state.artifacts.length} 个资产` : "正在读取资产";
+      if (!items.length) { const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前筛选条件下没有学生模型"; cardGrid.append(empty); return; }
+      items.forEach((item) => cardGrid.append(createCard(item)));
+    }
+
+    function updatePrecisionNote() {
+      const item = selectedArtifact();
+      const precision = exportPrecision.value;
+      if (!item || !precision) { precisionNote.textContent = "选择模型后会显示可用精度和兼容性。"; return; }
+      const base = precisionDescriptions.get(precision) || "";
+      const action = item.kind === "onnx" && precision === item.precision ? "当前模型已是该精度，将直接复用现有模型包。" : `将新建 ${precision.toUpperCase()} ONNX，原资产保持不变。`;
+      precisionNote.textContent = `${base} ${action}`;
+      exportButton.textContent = item.kind === "onnx" && precision === item.precision ? "准备当前模型包" : `导出 ${precision.toUpperCase()}`;
+    }
+
+    function updateSelectedControls() {
+      const item = selectedArtifact();
+      if (!item) {
+        selectedSummary.textContent = "请从下方选择模型"; exportState.textContent = "未选择";
+        previewButton.disabled = true; exportButton.disabled = true; exportPrecision.disabled = true;
+        downloadOriginal.classList.add("disabled"); downloadOriginal.href = "#"; return;
+      }
+      selectedSummary.textContent = `${item.name} · ${kindLabel(item)} · ${item.engine_label}`;
+      exportState.textContent = `${item.precision.toUpperCase()} · ${Number(item.size_mb).toFixed(2)} MB`;
+      exportPrecision.replaceChildren();
+      item.export_precisions.forEach((precision) => exportPrecision.add(new Option(precision.toUpperCase(), precision)));
+      const preferred = localStorage.getItem(`voxcpm-export-precision-${item.architecture}`) || (item.export_precisions.includes("int8") ? "int8" : item.precision);
+      exportPrecision.value = item.export_precisions.includes(preferred) ? preferred : item.export_precisions[0];
+      exportPrecision.disabled = busy || state.busy;
+      previewButton.disabled = busy || state.busy || !item.previewable;
+      exportButton.disabled = busy || state.busy || !item.export_precisions.length;
+      downloadOriginal.classList.remove("disabled"); downloadOriginal.href = `/api/piper/download/${item.id}`;
+      updatePrecisionNote();
+    }
+
+    async function loadArtifacts(preserveSelection = true) {
+      refreshButton.disabled = true; runtimeState.textContent = "正在扫描学生模型";
+      try {
+        const response = await fetch("/api/export/artifacts", { cache:"no-store" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "学生模型扫描失败");
+        state = result;
+        precisionDescriptions.clear(); result.precisions.forEach((item) => precisionDescriptions.set(item.id, item.description));
+        architectureFilter.replaceChildren(new Option("全部架构", "all"));
+        result.architectures.forEach((item) => architectureFilter.add(new Option(item.label, item.id)));
+        if (!preserveSelection || !result.artifacts.some((item) => item.id === selectedId)) selectedId = result.artifacts[0]?.id || "";
+        if (selectedId) localStorage.setItem("voxcpm-export-selected", selectedId);
+        statusDot.className = `status-dot ${result.busy ? "busy" : "ready"}`;
+        runtimeState.textContent = result.busy ? "学生模型训练运行中" : `${result.artifacts.length} 个学生资产`;
+        updateSelectedControls(); renderCards();
+      } catch (error) {
+        statusDot.className = "status-dot"; runtimeState.textContent = "扫描失败"; setFeedback(error.message, true);
+      } finally { refreshButton.disabled = false; }
+    }
+
+    async function generatePreview() {
+      const item = selectedArtifact(); if (!item) return;
+      setBusy(true); setFeedback(item.kind === "checkpoint" ? "首次检查点试听会先生成缓存 ONNX" : `正在使用 ${item.name} 生成试听`);
+      const data = new FormData();
+      data.set("artifact_id", item.id); data.set("text", previewText.value); data.set("length_scale", lengthScale.value); data.set("noise_scale", noiseScale.value); data.set("noise_w_scale", noiseWScale.value); data.set("volume", volume.value);
+      try {
+        const response = await fetch("/api/export/preview", { method:"POST", body:data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "试听生成失败");
+        previewAudio.src = `${result.audio_url}?v=${Date.now()}`; previewAudio.load(); previewResult.classList.add("visible");
+        previewMeta.textContent = `${result.model} · ${Number(result.duration).toFixed(2)} 秒${result.cached ? " · 命中缓存" : ""}`;
+        setFeedback("试听音频已生成");
+      } catch (error) { setFeedback(error.message, true); }
+      finally { setBusy(false); updateSelectedControls(); }
+    }
+
+    async function exportSelected() {
+      const item = selectedArtifact(); if (!item) return;
+      const precision = exportPrecision.value; setBusy(true); setFeedback(`正在导出 ${item.name} · ${precision.toUpperCase()}，请保持页面打开`);
+      const data = new FormData(); data.set("precision", precision);
+      try {
+        const response = await fetch(`/api/export/artifact/${item.id}`, { method:"POST", body:data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "学生模型导出失败");
+        selectedId = result.artifact.id; localStorage.setItem("voxcpm-export-selected", selectedId);
+        setFeedback(result.reused ? "当前模型已经是目标精度，可直接下载" : `已生成 ${result.artifact.name}`);
+        await loadArtifacts(true);
+        if (autoDownload.checked) { const link = document.createElement("a"); link.href = result.download_url; link.click(); }
+      } catch (error) { setFeedback(error.message, true); }
+      finally { setBusy(false); updateSelectedControls(); }
+    }
+
+    [searchInput, filterOnnx, filterCheckpoint, architectureFilter, precisionFilter].forEach((control) => control.addEventListener("input", renderCards));
+    exportPrecision.addEventListener("change", () => { const item = selectedArtifact(); if (item) localStorage.setItem(`voxcpm-export-precision-${item.architecture}`, exportPrecision.value); updatePrecisionNote(); });
+    previewButton.addEventListener("click", generatePreview); exportButton.addEventListener("click", exportSelected); refreshButton.addEventListener("click", () => loadArtifacts(true));
+    autoDownload.checked = localStorage.getItem("voxcpm-export-auto-download") === "true";
+    autoDownload.addEventListener("change", () => localStorage.setItem("voxcpm-export-auto-download", String(autoDownload.checked)));
+
+    const tooltip = document.getElementById("propertyTooltip"); let tooltipTarget = null; let tooltipTimer = null;
+    function showTooltip(target, immediate = false) { clearTimeout(tooltipTimer); const reveal = () => { tooltipTarget = target; tooltip.textContent = target.dataset.tooltip; tooltip.classList.add("visible"); const rect = target.getBoundingClientRect(), tip = tooltip.getBoundingClientRect(); const left = Math.max(12, Math.min(rect.left, innerWidth - tip.width - 12)); let top = rect.bottom + 8; if (top + tip.height > innerHeight - 12) top = rect.top - tip.height - 8; tooltip.style.left = `${left}px`; tooltip.style.top = `${Math.max(12,top)}px`; }; if (immediate) reveal(); else tooltipTimer = setTimeout(reveal, 300); }
+    function hideTooltip() { clearTimeout(tooltipTimer); tooltipTarget = null; tooltip.classList.remove("visible"); }
+    document.addEventListener("mouseover", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target && target !== tooltipTarget) showTooltip(target); });
+    document.addEventListener("mouseout", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target && !target.contains(event.relatedTarget)) hideTooltip(); });
+    document.addEventListener("focusin", (event) => { const target = event.target.closest?.(".tooltip-trigger"); if (target) showTooltip(target, true); });
+    document.addEventListener("focusout", hideTooltip); window.addEventListener("scroll", hideTooltip, true); window.addEventListener("resize", hideTooltip);
+    loadArtifacts(false);
+  </script>
+</body>
+</html>

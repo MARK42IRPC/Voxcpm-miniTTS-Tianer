@@ -473,8 +473,10 @@
 
     @media (max-width: 440px) {
       main { padding: 10px; }
-      .brand strong, .status { display: none; }
-      .nav a { padding: 7px 9px; }
+      .brand, .status { display: none; }
+      .top-actions, .nav { width: 100%; }
+      .nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .nav a { min-width: 0; padding: 7px 2px; overflow: hidden; font-size: 11px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
       .app-layout, .content-stack, form, .workspace { max-width: calc(100vw - 20px); }
       .composer, .settings { padding: 14px; }
       .mode-tabs label { font-size: 12px; }
@@ -497,6 +499,7 @@
         <a href="/lora">LoRA 训练</a>
         <a href="/datasets">训练集</a>
         <a href="/distill">蒸馏</a>
+        <a href="/export">导出</a>
       </nav>
       <div class="status" id="deviceStatus">
         <span class="status-dot"></span>

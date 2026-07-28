@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -28,6 +29,7 @@ from fastapi.responses import FileResponse
 
 ROOT = Path(__file__).resolve().parent
 DISTILL_PAGE = ROOT / "distill.html"
+EXPORT_PAGE = ROOT / "export.html"
 PIPER_ROOT = ROOT / "piper"
 PIPER_MODELS_ROOT = PIPER_ROOT / "models"
 PIPER_RUNS_ROOT = PIPER_ROOT / "runs"
@@ -39,6 +41,8 @@ MELO_BASE_CHECKPOINT = MELO_BASE_DIR / "checkpoint.pth"
 MELO_SOURCE_ROOT = ROOT / "third_party" / "MeloTTS"
 MELO_RESOURCE_TEMPLATE = PIPER_MODELS_ROOT / "vits-melo-tts-zh_en-int8"
 MELO_EXPORT_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "melo-exports"
+STUDENT_PREVIEW_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "student-previews"
+ONNX_TEMP_ROOT = Path(os.environ.get("VOXCPM_ONNX_TEMP_DIR", r"C:\tmp\voxcpm-onnx" if os.name == "nt" else "/tmp/voxcpm-onnx"))
 PIPER_ESPEAK_DATA = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "piper-espeak-data"
 PIPER_RESOURCE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "piper-resources"
 PIPER_BERT_TOKENIZER = PIPER_RESOURCE_ROOT / "bert-base-chinese"
@@ -46,6 +50,8 @@ SHERPA_RUNTIME_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm"))
 DEFAULT_TRAINING_DATASET = Path(r"D:\音频素材\爱弥斯语音训练集\train\wavs")
 DEFAULT_PIPER_CHECKPOINT_DIR = "pretrained-zh_CN-huayan-medium"
 STUDENT_MANIFEST_NAME = "voxcpm-model.json"
+STUDENT_EXPORT_PRECISIONS = ("fp32", "fp16", "int8")
+ONNX_CONVERSION_LOCK = threading.Lock()
 
 for directory in (PIPER_MODELS_ROOT, PIPER_RUNS_ROOT, PIPER_DOWNLOAD_ROOT, PIPER_OUTPUT_ROOT, MELO_BASE_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
@@ -293,6 +299,25 @@ def _read_voice_summary(config_path: Path | None, artifact_path: Path | None = N
     }
 
 
+def _artifact_precision(kind: str, path: Path, manifest: dict | None, quality: str | None) -> str:
+    if kind != "onnx":
+        return "fp32"
+    values = " ".join((path.name, str(quality or ""), str((manifest or {}).get("precision", "")))).lower()
+    if "int8" in values or "qint8" in values:
+        return "int8"
+    if "fp16" in values or "float16" in values:
+        return "fp16"
+    return "fp32"
+
+
+def _artifact_export_precisions(kind: str, precision: str) -> list[str]:
+    if kind in ("checkpoint", "melo_checkpoint"):
+        return list(STUDENT_EXPORT_PRECISIONS)
+    if precision == "fp32":
+        return list(STUDENT_EXPORT_PRECISIONS)
+    return [precision]
+
+
 def _find_melo_config(path: Path) -> Path | None:
     for directory in (path.parent, path.parent.parent):
         candidate = directory / "config.json"
@@ -354,6 +379,7 @@ def list_piper_artifacts() -> list[dict]:
             else _read_voice_summary(config_path, path)
         )
         engine = "sherpa_onnx" if kind == "melo_checkpoint" else manifest.get("engine", "piper") if manifest else "piper"
+        precision = _artifact_precision(kind, path, manifest, summary.get("quality"))
         recommended = kind == "checkpoint" and DEFAULT_PIPER_CHECKPOINT_DIR in relative.parts
         display_name = path.stem
         if kind == "melo_checkpoint" and path.parent.parent != PIPER_RUNS_ROOT:
@@ -370,7 +396,10 @@ def list_piper_artifacts() -> list[dict]:
                 "previewable": (kind == "onnx" and (config_path is not None or manifest is not None)) or (kind == "melo_checkpoint" and config_path is not None),
                 "downloadable": kind in ("checkpoint", "melo_checkpoint") or (kind == "onnx" and (config_path is not None or manifest is not None)),
                 "engine": engine,
+                "architecture": "melotts" if engine == "sherpa_onnx" else "piper",
                 "engine_label": "MeloTTS" if kind == "melo_checkpoint" else manifest.get("engine_label", "Piper") if manifest else "Piper",
+                "precision": precision,
+                "export_precisions": _artifact_export_precisions(kind, precision),
                 "license": manifest.get("license") if manifest else None,
                 "recommended": recommended,
                 **summary,
@@ -506,7 +535,8 @@ class SherpaVoiceRuntime:
                 self._tts = sherpa_onnx.OfflineTts(config)
                 self._identity = identity
 
-            generated = self._tts.generate(text, sid=int(manifest.get("speaker_id", 0)), speed=1.0)
+            speed = 1 / max(0.2, float(settings.get("length_scale", 1.0)))
+            generated = self._tts.generate(text, sid=int(manifest.get("speaker_id", 0)), speed=speed)
             samples = np.asarray(generated.samples, dtype=np.float32) * float(settings["volume"])
             sf.write(output_path, np.clip(samples, -1.0, 1.0), int(generated.sample_rate), subtype="PCM_16")
 
@@ -539,6 +569,111 @@ def export_piper_checkpoint(checkpoint_path: Path, output_path: Path, config_pat
     )
     if completed.returncode != 0:
         raise RuntimeError((completed.stdout + "\n" + completed.stderr).strip()[-4000:])
+    shutil.copy2(config_path, Path(f"{output_path}.json"))
+    return output_path
+
+
+def convert_onnx_precision(source_path: Path, output_path: Path, precision: str) -> Path:
+    precision = str(precision).strip().lower()
+    if precision not in STUDENT_EXPORT_PRECISIONS:
+        raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
+    if source_path.resolve() == output_path.resolve():
+        raise ValueError("导出路径不能覆盖源 ONNX")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.stem}.{time.time_ns():x}.tmp.onnx")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        if precision == "fp32":
+            shutil.copy2(source_path, temporary_path)
+        elif precision == "fp16":
+            import onnx
+            from onnxruntime.transformers.float16 import convert_float_to_float16
+
+            model = onnx.load(source_path)
+            converted = convert_float_to_float16(model, keep_io_types=True)
+            _sort_onnx_graph(converted.graph)
+            onnx.checker.check_model(converted)
+            onnx.save(converted, temporary_path)
+        else:
+            import onnx
+            from onnxruntime.quantization import QuantType, quantize_dynamic
+
+            quant_cache = STUDENT_PREVIEW_CACHE_ROOT / "onnx-quant" / hashlib.sha256(
+                f"{source_path.resolve()}:{source_path.stat().st_mtime_ns}".encode("utf-8")
+            ).hexdigest()[:16]
+            quant_source = quant_cache / "model.onnx"
+            quant_cache.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, quant_source)
+            ONNX_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+            with ONNX_CONVERSION_LOCK:
+                previous_tempdir = tempfile.tempdir
+                tempfile.tempdir = str(ONNX_TEMP_ROOT)
+                try:
+                    quantize_dynamic(
+                        str(quant_source),
+                        str(temporary_path),
+                        weight_type=QuantType.QInt8,
+                        op_types_to_quantize=["Conv", "MatMul", "Gemm", "Gather"],
+                    )
+                finally:
+                    tempfile.tempdir = previous_tempdir
+                    shutil.rmtree(quant_cache, ignore_errors=True)
+            onnx.checker.check_model(onnx.load(temporary_path))
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return output_path
+
+
+def _sort_onnx_graph(graph) -> None:
+    for node in graph.node:
+        for attribute in node.attribute:
+            if attribute.type == attribute.GRAPH:
+                _sort_onnx_graph(attribute.g)
+            elif attribute.type == attribute.GRAPHS:
+                for child in attribute.graphs:
+                    _sort_onnx_graph(child)
+    remaining = list(graph.node)
+    produced = {name for node in remaining for name in node.output if name}
+    available = {value.name for value in graph.input}
+    available.update(initializer.name for initializer in graph.initializer)
+    available.update(
+        name
+        for node in remaining
+        for name in node.input
+        if name and name not in produced
+    )
+    ordered = []
+    while remaining:
+        ready = [node for node in remaining if all(not name or name in available for name in node.input)]
+        if not ready:
+            raise RuntimeError("FP16 ONNX 转换后无法建立有效的节点拓扑")
+        for node in ready:
+            ordered.append(node)
+            available.update(name for name in node.output if name)
+            remaining.remove(node)
+    del graph.node[:]
+    graph.node.extend(ordered)
+
+
+def export_piper_checkpoint_precision(
+    checkpoint_path: Path,
+    output_path: Path,
+    config_path: Path,
+    precision: str,
+) -> Path:
+    precision = str(precision).strip().lower()
+    if precision not in STUDENT_EXPORT_PRECISIONS:
+        raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
+    if precision == "fp32":
+        return export_piper_checkpoint(checkpoint_path, output_path, config_path)
+    cache_dir = STUDENT_PREVIEW_CACHE_ROOT / "exports" / hashlib.sha256(
+        f"{checkpoint_path.resolve()}:{checkpoint_path.stat().st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:16]
+    fp32_path = cache_dir / "model.fp32.onnx"
+    if not fp32_path.is_file():
+        export_piper_checkpoint(checkpoint_path, fp32_path, config_path)
+    convert_onnx_precision(fp32_path, output_path, precision)
     shutil.copy2(config_path, Path(f"{output_path}.json"))
     return output_path
 
@@ -584,18 +719,26 @@ def preview_melo_checkpoint(checkpoint_path: Path, config_path: Path, text: str,
     return output_path
 
 
-def export_melo_checkpoint(checkpoint_path: Path, output_dir: Path, config_path: Path) -> Path:
+def export_melo_checkpoint(
+    checkpoint_path: Path,
+    output_dir: Path,
+    config_path: Path,
+    precision: str = "int8",
+) -> Path:
+    precision = str(precision).strip().lower()
+    if precision not in STUDENT_EXPORT_PRECISIONS:
+        raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
     if not (MELO_RESOURCE_TEMPLATE / "tokens.txt").is_file():
         raise RuntimeError("MeloTTS 部署资源模板缺失，请先保留内置双语 INT8 模型")
     python_path = ROOT / ".venv" / "Scripts" / "python.exe"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "model.int8.onnx"
+    output_path = output_dir / f"model.{precision}.onnx"
     cache_key = hashlib.sha256(
-        f"{checkpoint_path.resolve()}:{checkpoint_path.stat().st_mtime_ns}".encode("utf-8")
+        f"{checkpoint_path.resolve()}:{checkpoint_path.stat().st_mtime_ns}:{precision}".encode("utf-8")
     ).hexdigest()[:16]
     runtime_dir = MELO_EXPORT_CACHE_ROOT / cache_key
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    runtime_output = runtime_dir / "model.int8.onnx"
+    runtime_output = runtime_dir / f"model.{precision}.onnx"
     command = [
         str(python_path),
         "-X",
@@ -607,7 +750,8 @@ def export_melo_checkpoint(checkpoint_path: Path, output_dir: Path, config_path:
         str(config_path),
         "--output",
         str(runtime_output),
-        "--int8",
+        "--precision",
+        precision,
     ]
     completed = subprocess.run(
         command,
@@ -624,7 +768,7 @@ def export_melo_checkpoint(checkpoint_path: Path, output_dir: Path, config_path:
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
     bundle_files = [
-        "model.int8.onnx",
+        output_path.name,
         "tokens.txt",
         "lexicon.txt",
         "dict",
@@ -648,14 +792,15 @@ def export_melo_checkpoint(checkpoint_path: Path, output_dir: Path, config_path:
     manifest = {
         "engine": "sherpa_onnx",
         "engine_label": "MeloTTS",
-        "display_name": f"{output_dir.name} · INT8",
+        "display_name": f"{output_dir.name} · {precision.upper()}",
         "model": output_path.name,
         "tokens": "tokens.txt",
         "lexicon": "lexicon.txt",
         "dict_dir": "dict",
         "rule_fsts": ["phone.fst", "date.fst", "number.fst", "new_heteronym.fst"],
         "sample_rate": 44100,
-        "quality": "int8-finetuned",
+        "quality": f"{precision}-finetuned",
+        "precision": precision,
         "language": "zh_CN+en_US",
         "license": "MIT",
         "speaker_id": 1,
@@ -666,6 +811,99 @@ def export_melo_checkpoint(checkpoint_path: Path, output_dir: Path, config_path:
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return output_path
+
+
+def export_existing_onnx_precision(artifact: dict, source_path: Path, precision: str) -> Path:
+    precision = str(precision).strip().lower()
+    if precision not in artifact.get("export_precisions", []):
+        raise ValueError(f"{artifact['precision'].upper()} ONNX 不能转换为 {precision.upper()}")
+    if precision == artifact["precision"]:
+        return source_path
+    output_name = safe_piper_job_name(f"{source_path.parent.name}-{source_path.stem}-{precision}")
+    output_dir = PIPER_MODELS_ROOT / output_name
+    manifest = _read_student_manifest(source_path)
+    if manifest is not None:
+        output_path = output_dir / f"model.{precision}.onnx"
+        convert_onnx_precision(source_path, output_path, precision)
+        bundle_files = []
+        for relative_name in manifest.get("bundle_files", []):
+            if relative_name in (manifest.get("model"), STUDENT_MANIFEST_NAME):
+                continue
+            source = _manifest_resource(source_path, relative_name)
+            destination = output_dir / relative_name
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            elif source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            bundle_files.append(relative_name)
+        bundle_files = [output_path.name, *bundle_files, STUDENT_MANIFEST_NAME]
+        exported_manifest = {
+            **manifest,
+            "display_name": f"{artifact['name']} · {precision.upper()}",
+            "model": output_path.name,
+            "quality": precision,
+            "precision": precision,
+            "source_model": artifact["relative_path"],
+            "bundle_files": bundle_files,
+        }
+        (output_dir / STUDENT_MANIFEST_NAME).write_text(
+            json.dumps(exported_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return output_path
+
+    config_path = _find_voice_config(source_path)
+    if config_path is None:
+        raise ValueError("Piper ONNX 缺少 JSON 配置")
+    output_path = output_dir / f"{safe_piper_job_name(source_path.stem)}.{precision}.onnx"
+    convert_onnx_precision(source_path, output_path, precision)
+    shutil.copy2(config_path, Path(f"{output_path}.json"))
+    return output_path
+
+
+def preview_piper_checkpoint(
+    artifact: dict,
+    checkpoint_path: Path,
+    text: str,
+    settings: dict,
+) -> dict:
+    config_path = _find_voice_config(checkpoint_path)
+    if config_path is None:
+        raise ValueError("Piper 检查点目录缺少 voice.json/config.json")
+    model_cache = STUDENT_PREVIEW_CACHE_ROOT / artifact["id"]
+    model_path = model_cache / "model.fp32.onnx"
+    signature_path = model_cache / "source.json"
+    signature = {
+        "checkpoint": str(checkpoint_path.resolve()),
+        "size": checkpoint_path.stat().st_size,
+        "mtime_ns": checkpoint_path.stat().st_mtime_ns,
+    }
+    cached_signature = None
+    if signature_path.is_file():
+        try:
+            cached_signature = json.loads(signature_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if cached_signature != signature or not model_path.is_file():
+        model_cache.mkdir(parents=True, exist_ok=True)
+        export_piper_checkpoint(checkpoint_path, model_path, config_path)
+        signature_path.write_text(json.dumps(signature, ensure_ascii=False, indent=2), encoding="utf-8")
+    digest = hashlib.sha256(
+        json.dumps({"source": signature, "text": text, **settings}, sort_keys=True, ensure_ascii=True).encode("ascii")
+    ).hexdigest()[:8]
+    output_path = PIPER_OUTPUT_ROOT / f"piper-ckpt-{datetime.now():%y%m%d}-{digest}.wav"
+    cached = output_path.is_file()
+    if not cached:
+        piper_voice_runtime.synthesize(model_path, Path(f"{model_path}.json"), text, output_path, settings)
+    info = sf.info(output_path)
+    return {
+        "filename": output_path.name,
+        "audio_url": f"/api/piper/audio/{output_path.name}",
+        "duration": round(float(info.duration), 3),
+        "cached": cached,
+        "model": artifact["name"],
+    }
 
 
 class PiperTrainingRuntime:
@@ -903,6 +1141,11 @@ def distill_index() -> FileResponse:
     return FileResponse(DISTILL_PAGE)
 
 
+@router.get("/export")
+def export_index() -> FileResponse:
+    return FileResponse(EXPORT_PAGE)
+
+
 @router.get("/api/piper/status")
 def piper_status() -> dict:
     artifacts = list_piper_artifacts()
@@ -931,6 +1174,83 @@ def piper_status() -> dict:
         "checkpoints": [item for item in artifacts if item["kind"] == "checkpoint"],
         "melo_checkpoints": [item for item in artifacts if item["kind"] == "melo_checkpoint"],
     }
+
+
+@router.get("/api/export/artifacts")
+def export_artifacts() -> dict:
+    artifacts = list_piper_artifacts()
+    return {
+        "artifacts": artifacts,
+        "architectures": [
+            {"id": "piper", "label": "Piper"},
+            {"id": "melotts", "label": "MeloTTS / Sherpa-ONNX"},
+        ],
+        "precisions": [
+            {"id": "fp32", "label": "FP32", "description": "最高兼容性，体积最大"},
+            {"id": "fp16", "label": "FP16", "description": "约半体积，依赖运行端 FP16 算子支持"},
+            {"id": "int8", "label": "INT8", "description": "边缘 CPU 推荐，体积与内存最低"},
+        ],
+        "busy": piper_training.running or melo_training.running,
+    }
+
+
+@router.post("/api/export/preview")
+async def preview_student_artifact(
+    artifact_id: str = Form(...),
+    text: str = Form(...),
+    length_scale: float = Form(1.0),
+    noise_scale: float = Form(0.667),
+    noise_w_scale: float = Form(0.8),
+    volume: float = Form(1.0),
+) -> dict:
+    clean_text = text.strip()
+    if not clean_text or len(clean_text) > 500:
+        raise HTTPException(status_code=400, detail="试听文本长度必须为 1-500 个字符")
+    values = (length_scale, noise_scale, noise_w_scale, volume)
+    if not all(math.isfinite(value) for value in values):
+        raise HTTPException(status_code=400, detail="试听参数无效")
+    if not 0.2 <= length_scale <= 3 or not 0 <= noise_scale <= 2 or not 0 <= noise_w_scale <= 2 or not 0.1 <= volume <= 3:
+        raise HTTPException(status_code=400, detail="试听参数超出范围")
+    try:
+        artifact, artifact_path = resolve_piper_artifact(artifact_id)
+        if artifact["kind"] == "onnx":
+            return await piper_preview(
+                model_id=artifact_id,
+                text=clean_text,
+                length_scale=length_scale,
+                noise_scale=noise_scale,
+                noise_w_scale=noise_w_scale,
+                volume=volume,
+            )
+        if artifact["kind"] == "melo_checkpoint":
+            return await melo_checkpoint_preview(
+                checkpoint_id=artifact_id,
+                text=clean_text,
+                speed=1 / length_scale,
+                volume=volume,
+            )
+        if artifact["kind"] != "checkpoint":
+            raise ValueError("该学生资产不支持试听")
+        if piper_training.running or melo_training.running:
+            raise HTTPException(status_code=409, detail="训练运行时不能试听检查点")
+        settings = {
+            "length_scale": length_scale,
+            "noise_scale": noise_scale,
+            "noise_w_scale": noise_w_scale,
+            "volume": volume,
+            "speaker_id": None,
+        }
+        return await asyncio.to_thread(
+            preview_piper_checkpoint,
+            artifact,
+            artifact_path,
+            clean_text,
+            settings,
+        )
+    except HTTPException:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/api/piper/dataset")
@@ -1058,11 +1378,12 @@ async def melo_checkpoint_preview(
     checkpoint_id: str = Form(...),
     text: str = Form(...),
     speed: float = Form(1.0),
+    volume: float = Form(1.0),
 ) -> dict:
     clean_text = text.strip()
     if not clean_text or len(clean_text) > 500:
         raise HTTPException(status_code=400, detail="试听文本长度必须为 1-500 个字符")
-    if not math.isfinite(speed) or not 0.3 <= speed <= 3:
+    if not math.isfinite(speed) or not math.isfinite(volume) or not 0.3 <= speed <= 3 or not 0.1 <= volume <= 3:
         raise HTTPException(status_code=400, detail="MeloTTS 试听语速超出范围")
     if piper_training.running or melo_training.running:
         raise HTTPException(status_code=409, detail="训练运行时不能试听 MeloTTS 检查点")
@@ -1072,7 +1393,7 @@ async def melo_checkpoint_preview(
         if config_path is None:
             raise ValueError("MeloTTS 检查点缺少完整 config.json")
         digest = hashlib.sha256(
-            f"{checkpoint_path}:{checkpoint_path.stat().st_mtime_ns}:{clean_text}:{speed}".encode("utf-8")
+            f"{checkpoint_path}:{checkpoint_path.stat().st_mtime_ns}:{clean_text}:{speed}:{volume}".encode("utf-8")
         ).hexdigest()[:8]
         output_path = PIPER_OUTPUT_ROOT / f"melo-{datetime.now():%y%m%d}-{digest}.wav"
         cached = output_path.is_file()
@@ -1088,6 +1409,9 @@ async def melo_checkpoint_preview(
                 output_path,
                 speed,
             )
+            if not math.isclose(volume, 1.0):
+                samples, sample_rate = sf.read(output_path, dtype="float32")
+                sf.write(output_path, np.clip(samples * volume, -1.0, 1.0), sample_rate, subtype="PCM_16")
         info = sf.info(output_path)
         return {
             "filename": output_path.name,
@@ -1370,6 +1694,77 @@ async def export_piper_artifact(artifact_id: str) -> dict:
         await asyncio.to_thread(export_piper_checkpoint, checkpoint_path, output_path, config_path)
         exported = next(item for item in list_piper_artifacts() if item["kind"] == "onnx" and item["relative_path"] == str(output_path.relative_to(PIPER_ROOT)))
         return {"artifact": exported, "source": artifact}
+    except (OSError, ValueError, RuntimeError, StopIteration) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/api/export/artifact/{artifact_id}")
+async def export_student_artifact(artifact_id: str, precision: str = Form("int8")) -> dict:
+    if piper_training.running or melo_training.running:
+        raise HTTPException(status_code=409, detail="训练运行时不能导出学生模型")
+    precision = str(precision).strip().lower()
+    try:
+        artifact, source_path = resolve_piper_artifact(artifact_id)
+        if precision not in artifact.get("export_precisions", []):
+            raise ValueError(
+                f"{artifact['kind']} {artifact['precision'].upper()} 不支持导出为 {precision.upper()}"
+            )
+        reused = artifact["kind"] == "onnx" and precision == artifact["precision"]
+        if artifact["kind"] == "onnx":
+            output_path = await asyncio.to_thread(
+                export_existing_onnx_precision,
+                artifact,
+                source_path,
+                precision,
+            )
+        elif artifact["kind"] == "melo_checkpoint":
+            config_path = _find_melo_config(source_path)
+            if config_path is None:
+                raise ValueError("MeloTTS 检查点缺少完整 config.json")
+            job_name = source_path.parent.parent.name
+            output_dir = PIPER_MODELS_ROOT / safe_piper_job_name(
+                f"{job_name}-{source_path.stem}-{precision}"
+            )
+            output_path = await asyncio.to_thread(
+                export_melo_checkpoint,
+                source_path,
+                output_dir,
+                config_path,
+                precision,
+            )
+        elif artifact["kind"] == "checkpoint":
+            config_path = _find_voice_config(source_path)
+            if config_path is None:
+                raise ValueError("Piper 检查点目录缺少 voice.json/config.json")
+            job_name = safe_piper_job_name(source_path.relative_to(PIPER_RUNS_ROOT).parts[0])
+            output_dir = PIPER_MODELS_ROOT / safe_piper_job_name(
+                f"{job_name}-{source_path.stem}-{precision}"
+            )
+            output_path = output_dir / f"{job_name}-{source_path.stem}.{precision}.onnx"
+            await asyncio.to_thread(
+                export_piper_checkpoint_precision,
+                source_path,
+                output_path,
+                config_path,
+                precision,
+            )
+        else:
+            raise ValueError("该资产类型不能导出 ONNX")
+
+        output_resolved = output_path.resolve()
+        exported = next(
+            item
+            for item in list_piper_artifacts()
+            if item["kind"] == "onnx"
+            and (PIPER_ROOT / item["relative_path"]).resolve() == output_resolved
+        )
+        return {
+            "artifact": exported,
+            "source": artifact,
+            "precision": precision,
+            "reused": reused,
+            "download_url": f"/api/piper/download/{exported['id']}",
+        }
     except (OSError, ValueError, RuntimeError, StopIteration) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

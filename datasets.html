@@ -88,7 +88,7 @@
     @media (max-width: 800px) {
       .topbar { align-items: stretch; flex-direction: column; gap: 8px; padding: 10px 14px; }
       .brand { display: none; }
-      .nav { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); width: 100%; }
+      .nav { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); width: 100%; }
       .nav a { min-width: 0; padding: 7px 2px; overflow: hidden; font-size: 12px; text-align: center; text-overflow: ellipsis; }
       main { padding: 12px; }
       .section { padding: 18px 16px; }
@@ -110,7 +110,7 @@
 <body>
   <header class="topbar">
     <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 本地推理</strong></div>
-    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a class="active" href="/datasets">训练集</a><a href="/distill">蒸馏</a></nav>
+    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a class="active" href="/datasets">训练集</a><a href="/distill">蒸馏</a><a href="/export">导出</a></nav>
   </header>
   <main>
     <div class="workspace">
