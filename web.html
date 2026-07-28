@@ -134,7 +134,7 @@
     .field { display: grid; gap: 8px; margin-bottom: 16px; }
     .field:last-child { margin-bottom: 0; }
     .field-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-    .select-action-row { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 8px; }
+    .select-action-row { display: grid; grid-template-columns: minmax(0, 1fr) repeat(2, 40px); gap: 8px; }
     .icon-button {
       width: 40px;
       height: 40px;
@@ -550,7 +550,9 @@
                 <select id="loraSelect" name="lora_id">
                   <option value="">不使用 LoRA</option>
                 </select>
+                <button class="icon-button" id="importLoraButton" type="button" title="导入 LoRA" aria-label="导入 LoRA"><span aria-hidden="true">⇧</span></button>
                 <button class="icon-button" id="refreshLoraButton" type="button" title="刷新 LoRA 列表" aria-label="刷新 LoRA 列表"><span aria-hidden="true">↻</span></button>
+                <input id="loraImportFile" type="file" accept=".zip,.safetensors" hidden>
               </div>
             </div>
             <div class="field">
@@ -702,6 +704,8 @@
     const modelKey = document.getElementById("modelKey");
     const loraSelect = document.getElementById("loraSelect");
     const loraStrength = document.getElementById("loraStrength");
+    const importLoraButton = document.getElementById("importLoraButton");
+    const loraImportFile = document.getElementById("loraImportFile");
     const refreshLoraButton = document.getElementById("refreshLoraButton");
     const modeDesign = document.getElementById("modeDesign");
     const modeReference = document.getElementById("modeReference");
@@ -1221,7 +1225,7 @@
       loraSelect.value = compatible.some((item) => item.id === previousValue) ? previousValue : "";
     }
 
-    async function refreshLoraCheckpoints() {
+    async function refreshLoraCheckpoints(selectedId = "", announce = true) {
       refreshLoraButton.disabled = true;
       refreshLoraButton.classList.add("loading");
       try {
@@ -1229,16 +1233,58 @@
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "LoRA 列表刷新失败");
         loraCheckpoints = data.checkpoints || [];
+        renderLoraOptions();
+        if (selectedId && loraCheckpoints.some((item) => item.id === selectedId && item.model_key === modelKey.value)) {
+          loraSelect.value = selectedId;
+        }
         updateDevice();
         const compatibleCount = loraCheckpoints.filter((item) => item.model_key === modelKey.value).length;
-        message.className = "message";
-        message.textContent = `LoRA 列表已刷新 · 当前模型 ${compatibleCount} 个可用检查点`;
+        if (announce) {
+          message.className = "message";
+          message.textContent = `LoRA 列表已刷新 · 当前模型 ${compatibleCount} 个可用检查点`;
+        }
       } catch (error) {
         message.className = "message error";
         message.textContent = error.message;
       } finally {
         refreshLoraButton.disabled = false;
         refreshLoraButton.classList.remove("loading");
+      }
+    }
+
+    async function importLoraCheckpoint(file) {
+      const suffix = file.name.toLowerCase().split(".").pop();
+      if (!['zip', 'safetensors'].includes(suffix)) {
+        message.className = "message error";
+        message.textContent = "仅支持 ZIP 或 safetensors LoRA 检查点";
+        return;
+      }
+      importLoraButton.disabled = true;
+      refreshLoraButton.disabled = true;
+      const originalIcon = importLoraButton.querySelector("span").textContent;
+      importLoraButton.querySelector("span").textContent = "…";
+      message.className = "message";
+      message.textContent = `正在为 ${modelKey.options[modelKey.selectedIndex].text} 导入 ${file.name}`;
+      const data = new FormData();
+      data.set("checkpoint_file", file);
+      data.set("model_key", modelKey.value);
+      try {
+        const response = await fetch("/api/lora/checkpoints/import", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "LoRA 导入失败");
+        await refreshLoraCheckpoints(result.checkpoint.id, false);
+        message.className = "message";
+        message.textContent = result.reused
+          ? `LoRA 已存在并选中 · ${result.checkpoint.display_name}`
+          : `LoRA 已导入并选中 · ${result.checkpoint.display_name}`;
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        importLoraButton.disabled = false;
+        refreshLoraButton.disabled = false;
+        importLoraButton.querySelector("span").textContent = originalIcon;
+        loraImportFile.value = "";
       }
     }
 
@@ -1302,7 +1348,15 @@
     textInput.addEventListener("input", updateSegmentCount);
     modelKey.addEventListener("change", updateDevice);
     loraSelect.addEventListener("change", updateDevice);
-    refreshLoraButton.addEventListener("click", refreshLoraCheckpoints);
+    importLoraButton.addEventListener("click", () => {
+      loraImportFile.value = "";
+      loraImportFile.click();
+    });
+    loraImportFile.addEventListener("change", () => {
+      const file = loraImportFile.files[0];
+      if (file) importLoraCheckpoint(file);
+    });
+    refreshLoraButton.addEventListener("click", () => refreshLoraCheckpoints());
     deviceInputs.forEach((input) => input.addEventListener("change", updateDevice));
     referenceAudio.addEventListener("change", () => {
       const file = referenceAudio.files[0];

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,6 +45,7 @@ import yaml
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from safetensors import safe_open
 
 from voxcpm import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
@@ -91,6 +93,8 @@ TRAINING_DATASET_REGISTRY_LOCK = threading.RLock()
 BATCH_OUTPUT_DIRECTORY_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "batch-output-directories.json"
 BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_LORA_IMPORT_BYTES = 512 * 1024 * 1024
+MAX_LORA_ARCHIVE_MEMBERS = 1000
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
 HYBRID_MAX_GENERATION_LENGTH = 1024
@@ -607,6 +611,205 @@ def list_lora_checkpoints() -> list[dict]:
     return sorted(checkpoints, key=lambda item: item["modified_at"], reverse=True)
 
 
+def inspect_imported_lora_weights(weights_path: Path) -> dict:
+    try:
+        with safe_open(weights_path, framework="pt", device="cpu") as weights:
+            keys = list(weights.keys())
+            shapes = {key: tuple(weights.get_slice(key).get_shape()) for key in keys}
+    except Exception as exc:
+        raise ValueError(f"无法读取 safetensors LoRA 权重: {exc}") from exc
+    if not keys or len(keys) > 2000:
+        raise ValueError("safetensors 中没有 LoRA 权重或张量数量异常")
+    if any(not (key.endswith(".lora_A") or key.endswith(".lora_B")) for key in keys):
+        raise ValueError("safetensors 包含非 LoRA 张量，不支持作为适配器导入")
+
+    key_set = set(keys)
+    ranks = set()
+    lm_targets = set()
+    dit_targets = set()
+    proj_targets = set()
+    for key, shape in shapes.items():
+        if len(shape) != 2:
+            raise ValueError(f"LoRA 张量必须是二维矩阵: {key}")
+        if key.endswith(".lora_A"):
+            counterpart = f"{key[:-7]}.lora_B"
+            ranks.add(shape[0])
+        else:
+            counterpart = f"{key[:-7]}.lora_A"
+            ranks.add(shape[1])
+        if counterpart not in key_set:
+            raise ValueError(f"LoRA A/B 张量不完整: {key}")
+
+        module_path = key.rsplit(".", 1)[0]
+        target_name = module_path.rsplit(".", 1)[-1]
+        if key.startswith(("base_lm.", "residual_lm.")):
+            lm_targets.add(target_name)
+        elif key.startswith("feat_decoder.estimator."):
+            dit_targets.add(target_name)
+        elif "." not in module_path:
+            proj_targets.add(target_name)
+        else:
+            raise ValueError(f"无法识别 LoRA 权重所属模块: {key}")
+
+    if len(ranks) != 1:
+        raise ValueError("LoRA 权重使用了不一致的 Rank")
+    rank = ranks.pop()
+    if not 1 <= rank <= 256:
+        raise ValueError(f"LoRA Rank 超出支持范围: {rank}")
+    return {
+        "enable_lm": bool(lm_targets),
+        "enable_dit": bool(dit_targets),
+        "enable_proj": bool(proj_targets),
+        "r": rank,
+        "alpha": rank * 2,
+        "dropout": 0.0,
+        "target_modules_lm": sorted(lm_targets),
+        "target_modules_dit": sorted(dit_targets),
+        "target_proj_modules": sorted(proj_targets),
+    }
+
+
+def _validate_archive_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    members = archive.infolist()
+    if len(members) > MAX_LORA_ARCHIVE_MEMBERS:
+        raise ValueError("ZIP 文件条目过多")
+    for member in members:
+        normalized = member.filename.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or any(part == ".." for part in parts):
+            raise ValueError("ZIP 包含不安全路径")
+        if member.flag_bits & 0x1:
+            raise ValueError("不支持加密 ZIP")
+    return members
+
+
+def _read_small_archive_json(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> dict:
+    if member.file_size > 1024 * 1024:
+        raise ValueError(f"ZIP 配置文件过大: {member.filename}")
+    try:
+        return json.loads(archive.read(member).decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"ZIP 配置文件无效: {member.filename}") from exc
+
+
+def import_lora_checkpoint(source_path: Path, original_name: str, model_key: str) -> dict:
+    if model_key not in MODEL_PATHS:
+        raise ValueError("未知基础模型")
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in {".zip", ".safetensors"}:
+        raise ValueError("仅支持 ZIP 或 safetensors LoRA 检查点")
+
+    digest = file_sha256(source_path)[:10]
+    source_stem = safe_lora_job_name(Path(original_name).stem)[:40]
+    job_name = safe_lora_job_name(f"导入-{source_stem}-{model_key}-{digest}")
+    weights_source = source_path
+    saved_config = None
+    step = 0
+
+    with tempfile.TemporaryDirectory(prefix="voxcpm_lora_import_") as staging_name:
+        staging_root = Path(staging_name)
+        if suffix == ".zip":
+            try:
+                with zipfile.ZipFile(source_path) as archive:
+                    members = _validate_archive_members(archive)
+                    weight_members = [
+                        item for item in members if not item.is_dir() and Path(item.filename).name == "lora_weights.safetensors"
+                    ]
+                    if len(weight_members) != 1:
+                        raise ValueError("ZIP 必须包含且只能包含一个 lora_weights.safetensors")
+                    weight_member = weight_members[0]
+                    if weight_member.file_size > MAX_LORA_IMPORT_BYTES:
+                        raise ValueError("ZIP 中的 LoRA 权重过大")
+                    weights_source = staging_root / "lora_weights.safetensors"
+                    with archive.open(weight_member) as source, weights_source.open("wb") as destination:
+                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+
+                    parent = Path(weight_member.filename).parent.as_posix().rstrip(".")
+                    config_members = [
+                        item
+                        for item in members
+                        if not item.is_dir()
+                        and Path(item.filename).name == "lora_config.json"
+                        and Path(item.filename).parent.as_posix().rstrip(".") == parent
+                    ]
+                    if not config_members:
+                        all_configs = [
+                            item for item in members if not item.is_dir() and Path(item.filename).name == "lora_config.json"
+                        ]
+                        config_members = all_configs if len(all_configs) == 1 else []
+                    if config_members:
+                        saved_config = _read_small_archive_json(archive, config_members[0])
+
+                    state_members = [
+                        item
+                        for item in members
+                        if not item.is_dir()
+                        and Path(item.filename).name == "training_state.json"
+                        and Path(item.filename).parent.as_posix().rstrip(".") == parent
+                    ]
+                    if state_members:
+                        try:
+                            step = max(0, int(_read_small_archive_json(archive, state_members[0]).get("step", 0)))
+                        except (TypeError, ValueError):
+                            step = 0
+            except zipfile.BadZipFile as exc:
+                raise ValueError("ZIP 文件损坏或格式无效") from exc
+
+        inferred_config = inspect_imported_lora_weights(weights_source)
+        if saved_config is not None:
+            try:
+                archive_model_key = infer_lora_model_key(str(saved_config["base_model"]))
+                normalized_config = LoRAConfig(**saved_config["lora_config"]).model_dump()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("ZIP 中的 lora_config.json 无效") from exc
+            if archive_model_key and archive_model_key != model_key:
+                raise ValueError(f"该 LoRA 适用于 {archive_model_key}，当前选择的是 {model_key}")
+            if int(normalized_config["r"]) != inferred_config["r"]:
+                raise ValueError("LoRA 配置 Rank 与权重不一致")
+            for enabled_key in ("enable_lm", "enable_dit", "enable_proj"):
+                if inferred_config[enabled_key] and not normalized_config[enabled_key]:
+                    raise ValueError(f"LoRA 配置未启用权重所需模块: {enabled_key}")
+            for target_key in ("target_modules_lm", "target_modules_dit", "target_proj_modules"):
+                if not set(inferred_config[target_key]).issubset(normalized_config[target_key]):
+                    raise ValueError(f"LoRA 配置缺少权重目标: {target_key}")
+            lora_config = normalized_config
+        else:
+            lora_config = inferred_config
+        LoRAConfig(**lora_config)
+
+        step_folder = f"step_{step:07d}"
+        destination = LORA_ROOT / job_name / "checkpoints" / step_folder
+        reused = destination.is_dir()
+        if not reused:
+            temporary_destination = destination.with_name(f".{step_folder}-{os.getpid()}-{threading.get_ident()}")
+            temporary_destination.mkdir(parents=True, exist_ok=False)
+            try:
+                shutil.copy2(weights_source, temporary_destination / "lora_weights.safetensors")
+                (temporary_destination / "lora_config.json").write_text(
+                    json.dumps(
+                        {"base_model": str(MODEL_PATHS[model_key]), "lora_config": lora_config},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                (temporary_destination / "training_state.json").write_text(
+                    json.dumps({"step": step, "imported": True}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary_destination.replace(destination)
+            except Exception:
+                shutil.rmtree(temporary_destination, ignore_errors=True)
+                raise
+
+    checkpoint_id = destination.relative_to(LORA_ROOT).as_posix()
+    checkpoint = next((item for item in list_lora_checkpoints() if item["id"] == checkpoint_id), None)
+    if checkpoint is None:
+        raise RuntimeError("LoRA 已复制，但无法登记检查点")
+    return {"checkpoint": checkpoint, "reused": reused}
+
+
 def resolve_lora_checkpoint(lora_id: str, model_key: str) -> dict | None:
     selected_id = lora_id.strip()
     if not selected_id:
@@ -625,6 +828,35 @@ def resolve_lora_checkpoint(lora_id: str, model_key: str) -> dict | None:
 @app.get("/api/lora/checkpoints")
 def lora_checkpoints() -> dict:
     return {"checkpoints": list_lora_checkpoints(), "active_lora_id": runtime.lora_id}
+
+
+@app.post("/api/lora/checkpoints/import")
+async def import_lora_checkpoint_endpoint(
+    checkpoint_file: UploadFile = File(...),
+    model_key: str = Form(...),
+) -> dict:
+    original_name = Path((checkpoint_file.filename or "").replace("\\", "/")).name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in {".zip", ".safetensors"}:
+        raise HTTPException(status_code=400, detail="仅支持 ZIP 或 safetensors LoRA 检查点")
+    try:
+        with tempfile.TemporaryDirectory(prefix="voxcpm_lora_upload_") as temporary_name:
+            upload_path = Path(temporary_name) / f"upload{suffix}"
+            total_size = 0
+            with upload_path.open("wb") as destination:
+                while chunk := await checkpoint_file.read(1024 * 1024):
+                    total_size += len(chunk)
+                    if total_size > MAX_LORA_IMPORT_BYTES:
+                        raise ValueError("LoRA 导入文件不能超过 512 MB")
+                    destination.write(chunk)
+            if total_size == 0:
+                raise ValueError("LoRA 导入文件为空")
+            result = await asyncio.to_thread(import_lora_checkpoint, upload_path, original_name, model_key)
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await checkpoint_file.close()
+    return {"status": "imported", **result}
 
 
 @app.get("/api/lora/status")

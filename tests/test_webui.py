@@ -2,12 +2,15 @@ from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import json
+import zipfile
 
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from safetensors.torch import save_file
 
 import webui
 from webui import (
@@ -387,6 +390,106 @@ def test_lora_checkpoint_rejects_base_model_mismatch(monkeypatch):
 def test_voxcpm15_model_and_lora_key_are_registered():
     assert webui.MODEL_PATHS["voxcpm1.5"].name == "VoxCPM1.5"
     assert infer_lora_model_key(r"C:\models\VoxCPM1.5") == "voxcpm1.5"
+
+
+def make_importable_lora_weights(path: Path, rank: int = 4) -> None:
+    save_file(
+        {
+            "base_lm.layers.0.self_attn.q_proj.lora_A": torch.ones(rank, 8),
+            "base_lm.layers.0.self_attn.q_proj.lora_B": torch.ones(8, rank),
+            "feat_decoder.estimator.layers.0.self_attn.v_proj.lora_A": torch.ones(rank, 8),
+            "feat_decoder.estimator.layers.0.self_attn.v_proj.lora_B": torch.ones(8, rank),
+            "enc_to_lm_proj.lora_A": torch.ones(rank, 8),
+            "enc_to_lm_proj.lora_B": torch.ones(8, rank),
+        },
+        str(path),
+    )
+
+
+def test_import_standalone_lora_infers_config_and_reuses_duplicate(monkeypatch, tmp_path):
+    weights = tmp_path / "speaker.safetensors"
+    make_importable_lora_weights(weights)
+    monkeypatch.setattr(webui, "LORA_ROOT", tmp_path / "lora")
+    client = TestClient(webui.app)
+
+    def upload():
+        return client.post(
+            "/api/lora/checkpoints/import",
+            data={"model_key": "voxcpm1.5"},
+            files={"checkpoint_file": (weights.name, weights.read_bytes(), "application/octet-stream")},
+        )
+
+    first = upload()
+    second = upload()
+
+    assert first.status_code == 200
+    assert first.json()["reused"] is False
+    assert second.status_code == 200
+    assert second.json()["reused"] is True
+    checkpoint = first.json()["checkpoint"]
+    assert checkpoint["model_key"] == "voxcpm1.5"
+    assert checkpoint["rank"] == 4
+    config = checkpoint["lora_config"]
+    assert config["alpha"] == 8
+    assert config["enable_lm"] is True
+    assert config["enable_dit"] is True
+    assert config["enable_proj"] is True
+    assert len(webui.list_lora_checkpoints()) == 1
+
+
+def test_import_lora_zip_preserves_config_and_step(monkeypatch, tmp_path):
+    weights = tmp_path / "lora_weights.safetensors"
+    make_importable_lora_weights(weights)
+    config = {
+        "base_model": r"C:\models\VoxCPM1.5",
+        "lora_config": {
+            "enable_lm": True,
+            "enable_dit": True,
+            "enable_proj": True,
+            "r": 4,
+            "alpha": 12,
+            "dropout": 0.0,
+            "target_modules_lm": ["q_proj"],
+            "target_modules_dit": ["v_proj"],
+            "target_proj_modules": ["enc_to_lm_proj"],
+        },
+    }
+    archive_path = tmp_path / "speaker.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        parent = "export/checkpoints/step_0000042"
+        archive.write(weights, f"{parent}/lora_weights.safetensors")
+        archive.writestr(f"{parent}/lora_config.json", json.dumps(config))
+        archive.writestr(f"{parent}/training_state.json", json.dumps({"step": 42}))
+    monkeypatch.setattr(webui, "LORA_ROOT", tmp_path / "lora")
+
+    result = webui.import_lora_checkpoint(archive_path, archive_path.name, "voxcpm1.5")
+
+    assert result["checkpoint"]["name"] == "step_0000042"
+    assert result["checkpoint"]["alpha"] == 12
+    assert Path(result["checkpoint"]["path"], "lora_weights.safetensors").is_file()
+
+
+def test_import_lora_zip_rejects_model_mismatch_and_unsafe_paths(monkeypatch, tmp_path):
+    weights = tmp_path / "lora_weights.safetensors"
+    make_importable_lora_weights(weights)
+    monkeypatch.setattr(webui, "LORA_ROOT", tmp_path / "lora")
+
+    mismatch = tmp_path / "mismatch.zip"
+    config = {
+        "base_model": r"C:\models\VoxCPM2",
+        "lora_config": {"enable_lm": True, "enable_dit": True, "enable_proj": True, "r": 4, "alpha": 8},
+    }
+    with zipfile.ZipFile(mismatch, "w") as archive:
+        archive.write(weights, "step/lora_weights.safetensors")
+        archive.writestr("step/lora_config.json", json.dumps(config))
+    with pytest.raises(ValueError, match="适用于 voxcpm2"):
+        webui.import_lora_checkpoint(mismatch, mismatch.name, "voxcpm1.5")
+
+    unsafe = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(unsafe, "w") as archive:
+        archive.writestr("../lora_weights.safetensors", weights.read_bytes())
+    with pytest.raises(ValueError, match="不安全路径"):
+        webui.import_lora_checkpoint(unsafe, unsafe.name, "voxcpm1.5")
 
 
 def test_compatible_lora_switch_is_hot_and_invalidates_prompt_cache():
