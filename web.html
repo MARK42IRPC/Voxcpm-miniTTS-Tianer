@@ -125,6 +125,11 @@
     .text-mode-tabs label { padding: 6px 8px; border-radius: 4px; color: var(--muted); font-size: 12px; text-align: center; }
     .text-mode-tabs input:checked + label { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20, 28, 32, 0.12); }
     .segment-count { min-height: 16px; color: var(--muted); font-size: 12px; text-align: right; }
+    .batch-export-panel { margin: -4px 0 16px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .batch-export-panel .field { margin-bottom: 10px; }
+    .batch-output-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 40px; gap: 8px; }
+    .batch-export-status { min-height: 15px; margin-top: 7px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .batch-export-status.error { color: var(--red); }
 
     .field { display: grid; gap: 8px; margin-bottom: 16px; }
     .field:last-child { margin-bottom: 0; }
@@ -498,6 +503,15 @@
             <div class="segment-count" id="segmentCount"></div>
           </div>
 
+          <div class="batch-export-panel hidden" id="batchExportPanel">
+            <div class="field">
+              <label class="tooltip-trigger" for="batchOutputDir" tabindex="0" data-tooltip="批量任务完成后，将每条 WAV 同步复制到所选本地目录。WebUI 会话缓存仍保留，便于试听、下载和后处理。">批量保存路径</label>
+              <div class="batch-output-row"><input id="batchOutputDir" name="batch_output_dir" type="text" readonly placeholder="可选：选择批量音频保存文件夹"><button class="dataset-browse" id="batchOutputBrowse" type="button">选择文件夹</button><button class="icon-button tooltip-trigger" id="batchOutputClear" type="button" aria-label="清除批量保存路径" data-tooltip="清除批量保存路径并关闭训练对同步。"><span aria-hidden="true">×</span></button></div>
+              <div class="batch-export-status" id="batchExportStatus" aria-live="polite"></div>
+            </div>
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="在批量保存目录中为每条 WAV 同时生成同名 LAB，内容取自该行的完整合成文本，可直接作为训练对。">同步生成 WAV/LAB 训练对</span><label class="switch"><input id="createTrainingPairs" name="create_training_pairs" type="checkbox" disabled><span></span></label></div>
+          </div>
+
           <div class="field">
             <label class="tooltip-trigger" for="control" tabindex="0" data-tooltip="用自然语言描述音色、年龄、情绪、语速或语气。仅 VoxCPM2 声音设计模式支持，此描述不会作为朗读文本拼接。">声音控制</label>
             <input id="control" name="control" type="text" placeholder="年轻女声，语气温和，语速稍慢">
@@ -695,6 +709,12 @@
     const textInput = document.getElementById("text");
     const batchInputs = [...document.querySelectorAll('input[name="batch_mode"]')];
     const segmentCount = document.getElementById("segmentCount");
+    const batchExportPanel = document.getElementById("batchExportPanel");
+    const batchOutputDir = document.getElementById("batchOutputDir");
+    const batchOutputBrowse = document.getElementById("batchOutputBrowse");
+    const batchOutputClear = document.getElementById("batchOutputClear");
+    const batchExportStatus = document.getElementById("batchExportStatus");
+    const createTrainingPairs = document.getElementById("createTrainingPairs");
     const sessionList = document.getElementById("sessionList");
     const sessionCount = document.getElementById("sessionCount");
     const clearSession = document.getElementById("clearSession");
@@ -854,6 +874,59 @@
         ? `${taskCount} 条音频 · ${sentenceCount} 个推理片段`
         : "未检测到有效文本";
       button.textContent = mode === "batch" && taskCount > 1 ? `生成 ${taskCount} 条` : "开始生成";
+    }
+
+    function updateBatchExportState() {
+      const enabled = currentBatchMode() === "batch";
+      const hasDirectory = Boolean(batchOutputDir.value.trim());
+      batchExportPanel.classList.toggle("hidden", !enabled);
+      batchOutputDir.disabled = !enabled;
+      batchOutputBrowse.disabled = !enabled;
+      batchOutputClear.disabled = !enabled || !hasDirectory;
+      createTrainingPairs.disabled = !enabled || !hasDirectory;
+      if (!enabled || !hasDirectory) createTrainingPairs.checked = false;
+    }
+
+    async function loadBatchOutputDirectories() {
+      try {
+        const response = await fetch("/api/batch-output-directories", { cache: "no-store" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "批量保存路径读取失败");
+        if (!batchOutputDir.value) batchOutputDir.value = result.default || "";
+        batchOutputDir.title = batchOutputDir.value;
+        batchExportStatus.classList.remove("error");
+        batchExportStatus.textContent = batchOutputDir.value ? "已选择保存路径" : "";
+      } catch (error) {
+        batchExportStatus.classList.add("error");
+        batchExportStatus.textContent = error.message;
+      } finally {
+        updateBatchExportState();
+      }
+    }
+
+    async function browseBatchOutputDirectory() {
+      batchOutputBrowse.disabled = true;
+      batchExportStatus.classList.remove("error");
+      batchExportStatus.textContent = "选择中";
+      const data = new FormData();
+      data.set("initial_path", batchOutputDir.value);
+      try {
+        const response = await fetch("/api/batch-output-directories/browse", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "文件夹选择器启动失败");
+        if (result.cancelled) {
+          batchExportStatus.textContent = batchOutputDir.value ? "已保留原保存路径" : "";
+          return;
+        }
+        batchOutputDir.value = result.path;
+        batchOutputDir.title = result.path;
+        batchExportStatus.textContent = "已选择保存路径";
+      } catch (error) {
+        batchExportStatus.classList.add("error");
+        batchExportStatus.textContent = error.message;
+      } finally {
+        updateBatchExportState();
+      }
     }
 
     function loadSessionOutputs() {
@@ -1216,7 +1289,10 @@
     }
 
     modeInputs.forEach((input) => input.addEventListener("change", updateMode));
-    batchInputs.forEach((input) => input.addEventListener("change", updateSegmentCount));
+    batchInputs.forEach((input) => input.addEventListener("change", () => {
+      updateSegmentCount();
+      updateBatchExportState();
+    }));
     textInput.addEventListener("input", updateSegmentCount);
     modelKey.addEventListener("change", updateDevice);
     loraSelect.addEventListener("change", updateDevice);
@@ -1244,6 +1320,15 @@
       renderSessionOutputs();
     });
     datasetBrowse.addEventListener("click", browseTrainingDataset);
+    batchOutputBrowse.addEventListener("click", browseBatchOutputDirectory);
+    batchOutputClear.addEventListener("click", () => {
+      batchOutputDir.value = "";
+      batchOutputDir.title = "";
+      batchExportStatus.textContent = "";
+      batchExportStatus.classList.remove("error");
+      createTrainingPairs.checked = false;
+      updateBatchExportState();
+    });
     datasetAddToggle.addEventListener("click", () => setDatasetCreatorVisible(datasetCreateRow.classList.contains("hidden")));
     datasetCreateCancel.addEventListener("click", () => setDatasetCreatorVisible(false));
     datasetCreateConfirm.addEventListener("click", createTrainingDataset);
@@ -1351,7 +1436,10 @@
           ? `${outputs.length} 条音频`
           : `音频 ${Number(firstOutput.duration).toFixed(2)} 秒`;
         const loraLabel = result.lora_name ? ` · ${result.lora_name}` : "";
-        message.textContent = `${result.model}${loraLabel} · ${result.device.toUpperCase()} · ${outputLabel}${cacheLabel} · 用时 ${formatElapsed(performance.now() - startedAt)}`;
+        const exportLabel = result.batch_output_dir
+          ? ` · 已保存到指定目录${result.training_pairs_created ? "并生成训练对" : ""}`
+          : "";
+        message.textContent = `${result.model}${loraLabel} · ${result.device.toUpperCase()} · ${outputLabel}${cacheLabel}${exportLabel} · 用时 ${formatElapsed(performance.now() - startedAt)}`;
       } catch (error) {
         message.className = "message error";
         message.textContent = `${error.message} · ${formatElapsed(performance.now() - startedAt)}`;
@@ -1366,9 +1454,11 @@
     updateMode();
     updateDevice();
     updateSegmentCount();
+    updateBatchExportState();
     renderSessionOutputs();
     loadStatus();
     loadTrainingDatasets();
+    loadBatchOutputDirectories();
   </script>
 </body>
 </html>

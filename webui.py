@@ -88,6 +88,8 @@ TRAINING_DATASET_ROOT = Path(r"D:\音频素材")
 DEFAULT_TRAINING_DATASET = TRAINING_DATASET_ROOT / "爱弥斯语音训练集" / "train" / "wavs"
 TRAINING_DATASET_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "training-datasets.json"
 TRAINING_DATASET_REGISTRY_LOCK = threading.RLock()
+BATCH_OUTPUT_DIRECTORY_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "batch-output-directories.json"
+BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
@@ -811,6 +813,24 @@ async def browse_training_dataset(initial_path: str = Form("")) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/batch-output-directories")
+def batch_output_directories() -> dict:
+    directories = [str(path) for path in _read_registered_batch_output_directories()]
+    return {"directories": directories, "default": directories[-1] if directories else None}
+
+
+@app.post("/api/batch-output-directories/browse")
+async def browse_batch_output_directory(initial_path: str = Form("")) -> dict:
+    try:
+        selected = await asyncio.to_thread(choose_batch_output_directory, initial_path)
+        if selected is None:
+            return {"cancelled": True}
+        path = await asyncio.to_thread(register_batch_output_directory, selected)
+        return {"cancelled": False, "path": str(path)}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/audio/postprocess")
 async def postprocess_generated_audio(
     filename: str = Form(...),
@@ -1052,20 +1072,20 @@ def register_training_dataset(directory: str | Path) -> dict:
     }
 
 
-def choose_training_dataset_directory(initial_path: str = "") -> str | None:
+def _choose_windows_directory(initial_path: str, default_path: Path, description: str) -> str | None:
     if os.name != "nt":
         raise RuntimeError("文件夹选择器当前仅支持 Windows；请在 Windows 本地 WebUI 中使用")
-    initial = Path(initial_path).expanduser() if initial_path.strip() else DEFAULT_TRAINING_DATASET
+    initial = Path(initial_path).expanduser() if initial_path.strip() else default_path
     if not initial.is_dir():
-        initial = TRAINING_DATASET_ROOT if TRAINING_DATASET_ROOT.is_dir() else ROOT
+        initial = default_path if default_path.is_dir() else ROOT
     script = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '选择包含 WAV 和同名 LAB 的训练集文件夹'
+$dialog.Description = $env:VOXCPM_FOLDER_DIALOG_DESCRIPTION
 $dialog.ShowNewFolderButton = $true
-if ($env:VOXCPM_INITIAL_DATASET_DIR) { $dialog.SelectedPath = $env:VOXCPM_INITIAL_DATASET_DIR }
+if ($env:VOXCPM_INITIAL_FOLDER) { $dialog.SelectedPath = $env:VOXCPM_INITIAL_FOLDER }
 try {
     if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         [Console]::Write($dialog.SelectedPath)
@@ -1074,7 +1094,8 @@ try {
 finally { $dialog.Dispose() }
 """
     env = os.environ.copy()
-    env["VOXCPM_INITIAL_DATASET_DIR"] = str(initial.resolve())
+    env["VOXCPM_INITIAL_FOLDER"] = str(initial.resolve())
+    env["VOXCPM_FOLDER_DIALOG_DESCRIPTION"] = description
     completed = subprocess.run(
         ["powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
         cwd=ROOT,
@@ -1090,6 +1111,65 @@ finally { $dialog.Dispose() }
         raise RuntimeError(detail)
     selected = completed.stdout.strip()
     return selected or None
+
+
+def choose_training_dataset_directory(initial_path: str = "") -> str | None:
+    default_path = DEFAULT_TRAINING_DATASET if DEFAULT_TRAINING_DATASET.is_dir() else TRAINING_DATASET_ROOT
+    return _choose_windows_directory(initial_path, default_path, "选择包含 WAV 和同名 LAB 的训练集文件夹")
+
+
+def _read_registered_batch_output_directories() -> list[Path]:
+    with BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK:
+        if not BATCH_OUTPUT_DIRECTORY_REGISTRY.is_file():
+            return []
+        try:
+            values = json.loads(BATCH_OUTPUT_DIRECTORY_REGISTRY.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+    if not isinstance(values, list):
+        return []
+    directories = []
+    for value in values:
+        try:
+            directory = Path(str(value)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if directory.is_dir():
+            directories.append(directory)
+    return directories
+
+
+def register_batch_output_directory(directory: str | Path) -> Path:
+    selected = Path(directory).expanduser().resolve()
+    if not selected.is_dir():
+        raise ValueError(f"批量保存目录不存在: {selected}")
+    with BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK:
+        registered = _read_registered_batch_output_directories()
+        unique = {str(path).lower(): path for path in registered}
+        unique.pop(str(selected).lower(), None)
+        unique[str(selected).lower()] = selected
+        BATCH_OUTPUT_DIRECTORY_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = BATCH_OUTPUT_DIRECTORY_REGISTRY.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps([str(path) for path in unique.values()], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(BATCH_OUTPUT_DIRECTORY_REGISTRY)
+    return selected
+
+
+def choose_batch_output_directory(initial_path: str = "") -> str | None:
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    return _choose_windows_directory(initial_path, OUTPUT_ROOT, "选择批量音频与可选 LAB 训练对的保存文件夹")
+
+
+def resolve_registered_batch_output_directory(directory: str) -> Path:
+    requested = Path(directory).expanduser().resolve()
+    registered = {str(path).lower(): path for path in _read_registered_batch_output_directories()}
+    try:
+        return registered[str(requested).lower()]
+    except KeyError as exc:
+        raise ValueError("批量保存目录未通过文件夹选择器登记") from exc
 
 
 def list_training_datasets() -> list[dict]:
@@ -1321,6 +1401,49 @@ def timestamped_output_path(created_at: datetime) -> Path:
     return candidate
 
 
+def batch_export_destination(source_path: Path, output_directory: Path, create_training_pair: bool) -> Path:
+    if source_path.parent.resolve() == output_directory.resolve():
+        return source_path
+    candidate = output_directory / source_path.name
+    counter = 2
+    while candidate.exists() or (create_training_pair and candidate.with_suffix(".lab").exists()):
+        candidate = output_directory / f"{source_path.stem}-{counter:02d}.wav"
+        counter += 1
+    return candidate
+
+
+def export_batch_audio(
+    source_path: Path,
+    destination_path: Path,
+    transcript: str,
+    create_training_pair: bool,
+) -> dict:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path.resolve() != destination_path.resolve():
+        temporary_audio = destination_path.with_name(f".{destination_path.name}.tmp")
+        try:
+            shutil.copy2(source_path, temporary_audio)
+            temporary_audio.replace(destination_path)
+        except Exception:
+            temporary_audio.unlink(missing_ok=True)
+            raise
+
+    lab_path = None
+    if create_training_pair:
+        lab_path = destination_path.with_suffix(".lab")
+        temporary_lab = lab_path.with_name(f".{lab_path.name}.tmp")
+        try:
+            temporary_lab.write_text(transcript.strip(), encoding="utf-8")
+            temporary_lab.replace(lab_path)
+        except Exception:
+            temporary_lab.unlink(missing_ok=True)
+            raise
+    return {
+        "exported_path": str(destination_path),
+        "lab_path": str(lab_path) if lab_path else None,
+    }
+
+
 def split_sentence_text(text: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
@@ -1471,6 +1594,8 @@ async def generate(
     control: str = Form(""),
     prompt_text: str = Form(""),
     batch_mode: str = Form("ordinary"),
+    batch_output_dir: str = Form(""),
+    create_training_pairs: bool = Form(False),
     device: str = Form("cuda"),
     cfg_value: float = Form(2.0),
     inference_timesteps: int = Form(10),
@@ -1500,6 +1625,18 @@ async def generate(
         min_len,
         max_len,
     )
+    if batch_mode != "batch" and (batch_output_dir.strip() or create_training_pairs):
+        raise HTTPException(status_code=400, detail="批量保存选项仅可用于批量推理模式")
+    if create_training_pairs and not batch_output_dir.strip():
+        raise HTTPException(status_code=400, detail="同步生成训练对前请先选择批量保存目录")
+    try:
+        batch_output_directory = (
+            resolve_registered_batch_output_directory(batch_output_dir.strip())
+            if batch_output_dir.strip()
+            else None
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lora_checkpoint = resolve_lora_checkpoint(lora_id, model_key)
     if device not in {"cuda", "cpu", *HYBRID_DEVICES}:
         raise HTTPException(status_code=400, detail="Device must be cuda, cpu, hybrid, or hybrid-max")
@@ -1610,6 +1747,11 @@ async def generate(
         task_final_texts = final_texts[final_text_index : final_text_index + len(task_result["segments"])]
         final_text_index += len(task_final_texts)
         successful_seeds = task_result["successful_seeds"]
+        export_path = (
+            batch_export_destination(output_path, batch_output_directory, create_training_pairs)
+            if batch_output_directory is not None
+            else None
+        )
         metadata = {
             "schema": "voxcpm-generation-v1",
             "created_at": task_created_at.isoformat(timespec="seconds"),
@@ -1618,6 +1760,9 @@ async def generate(
             "source_text": source_text,
             "final_text": " ".join(task_final_texts),
             "batch_mode": batch_mode,
+            "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
+            "create_training_pairs": create_training_pairs,
+            "exported_path": str(export_path) if export_path else None,
             "task_index": task_index,
             "task_count": task_count,
             "segments": task_result["segments"],
@@ -1655,6 +1800,14 @@ async def generate(
             "torch_version": torch.__version__,
         }
         write_wav_metadata(output_path, metadata)
+        try:
+            export_result = (
+                export_batch_audio(output_path, export_path, task_result["text"], create_training_pairs)
+                if export_path is not None
+                else {"exported_path": None, "lab_path": None}
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"批量音频保存失败: {exc}") from exc
         outputs.append(
             {
                 "audio_url": f"/api/audio/{filename}",
@@ -1667,6 +1820,7 @@ async def generate(
                 "processing_seconds": task_result["processing_seconds"],
                 "successful_seed": metadata["successful_seed"],
                 "successful_seeds": successful_seeds,
+                **export_result,
             }
         )
 
@@ -1681,6 +1835,8 @@ async def generate(
         "lora_name": lora_checkpoint["display_name"] if lora_checkpoint else None,
         "device": device,
         "batch_mode": batch_mode,
+        "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
+        "training_pairs_created": bool(batch_output_directory and create_training_pairs),
         "task_count": task_count,
         "segment_count": segment_count,
         "processing_seconds": processing_seconds,

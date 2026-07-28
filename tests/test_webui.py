@@ -128,6 +128,10 @@ def test_merge_text_task_results_preserves_waveform_dtype_and_task_boundaries():
 
 def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tmp_path):
     generated_texts = []
+    output_root = tmp_path / "web-cache"
+    export_root = tmp_path / "batch-export"
+    output_root.mkdir()
+    export_root.mkdir()
 
     def fake_generate_many(config, texts, prompt_cache_key, prompt_build_kwargs, lora_checkpoint, **kwargs):
         generated_texts.extend(texts)
@@ -138,8 +142,10 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         ]
         return results, 16000, False
 
-    monkeypatch.setattr(webui, "OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", tmp_path / "batch-directories.json")
     monkeypatch.setattr(webui.runtime, "generate_many", fake_generate_many)
+    webui.register_batch_output_directory(export_root)
     response = TestClient(webui.app).post(
         "/api/generate",
         data={
@@ -150,6 +156,8 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
             "device": "cpu",
             "denoise": "false",
             "optimize": "false",
+            "batch_output_dir": str(export_root),
+            "create_training_pairs": "true",
         },
     )
 
@@ -158,13 +166,53 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
     assert generated_texts == ["第一句。", "第二句！", "第三句？"]
     assert result["task_count"] == 2
     assert result["segment_count"] == 3
+    assert result["batch_output_dir"] == str(export_root.resolve())
+    assert result["training_pairs_created"] is True
     assert len(result["outputs"]) == 2
-    first_path = tmp_path / result["outputs"][0]["filename"]
-    second_path = tmp_path / result["outputs"][1]["filename"]
+    first_path = output_root / result["outputs"][0]["filename"]
+    second_path = output_root / result["outputs"][1]["filename"]
     assert sf.info(first_path).frames == 5
     assert sf.info(second_path).frames == 4
     assert webui.read_wav_metadata(first_path)["segments"] == ["第一句。", "第二句！"]
     assert webui.read_wav_metadata(second_path)["text"] == "第三句？"
+    exported_paths = [Path(output["exported_path"]) for output in result["outputs"]]
+    assert all(path.parent == export_root.resolve() and path.is_file() for path in exported_paths)
+    assert [Path(output["lab_path"]).read_text(encoding="utf-8") for output in result["outputs"]] == [
+        "第一句。第二句！",
+        "第三句？",
+    ]
+
+
+def test_generate_ordinary_rejects_batch_export_options():
+    response = TestClient(webui.app).post(
+        "/api/generate",
+        data={
+            "text": "普通推理。",
+            "model_key": "voxcpm-0.5b",
+            "mode": "design",
+            "batch_mode": "ordinary",
+            "device": "cpu",
+            "batch_output_dir": "C:\\stale-batch-path",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "批量保存选项仅可用于批量推理模式"
+
+
+def test_batch_export_destination_does_not_overwrite_existing_pair(tmp_path):
+    source = tmp_path / "cache" / "voxcpm-26 07 28 12 00 00.wav"
+    destination = tmp_path / "export"
+    source.parent.mkdir()
+    destination.mkdir()
+    (destination / source.name).write_bytes(b"existing audio")
+    (destination / source.with_suffix(".lab").name).write_text("existing text", encoding="utf-8")
+
+    selected = webui.batch_export_destination(source, destination, create_training_pair=True)
+
+    assert selected.name == "voxcpm-26 07 28 12 00 00-02.wav"
+    assert (destination / source.name).read_bytes() == b"existing audio"
+    assert (destination / source.with_suffix(".lab").name).read_text(encoding="utf-8") == "existing text"
 
 
 def test_ultimate_prompt_uses_audio_once_as_continuation():
@@ -548,6 +596,51 @@ def test_browse_training_dataset_endpoint_registers_selection(monkeypatch, tmp_p
 def test_browse_training_dataset_endpoint_handles_cancel(monkeypatch):
     monkeypatch.setattr(webui, "choose_training_dataset_directory", lambda initial: None)
     response = TestClient(webui.app).post("/api/training-datasets/browse", data={"initial_path": ""})
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": True}
+
+
+def test_batch_output_directory_registry_persists_last_selection(monkeypatch, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    registry = tmp_path / "batch-output-directories.json"
+    monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", registry)
+
+    webui.register_batch_output_directory(first)
+    webui.register_batch_output_directory(second)
+    webui.register_batch_output_directory(first)
+    response = TestClient(webui.app).get("/api/batch-output-directories")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "directories": [str(second.resolve()), str(first.resolve())],
+        "default": str(first.resolve()),
+    }
+    assert webui.resolve_registered_batch_output_directory(str(first)) == first.resolve()
+
+
+def test_browse_batch_output_directory_endpoint_registers_selection(monkeypatch, tmp_path):
+    selected = tmp_path / "batch-output"
+    selected.mkdir()
+    monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", tmp_path / "registry.json")
+    monkeypatch.setattr(webui, "choose_batch_output_directory", lambda initial: str(selected))
+
+    response = TestClient(webui.app).post(
+        "/api/batch-output-directories/browse",
+        data={"initial_path": str(tmp_path)},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": False, "path": str(selected.resolve())}
+    assert json.loads((tmp_path / "registry.json").read_text(encoding="utf-8")) == [str(selected.resolve())]
+
+
+def test_browse_batch_output_directory_endpoint_handles_cancel(monkeypatch):
+    monkeypatch.setattr(webui, "choose_batch_output_directory", lambda initial: None)
+    response = TestClient(webui.app).post("/api/batch-output-directories/browse", data={"initial_path": ""})
+
     assert response.status_code == 200
     assert response.json() == {"cancelled": True}
 
