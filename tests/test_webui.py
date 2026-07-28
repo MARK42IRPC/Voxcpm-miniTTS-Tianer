@@ -109,16 +109,45 @@ def test_ordinary_text_builds_one_task_from_all_sentences_and_lines():
         {
             "text": "第一句。第二句！ 第三句？",
             "segments": ["第一句。", "第二句！", "第三句？"],
+            "sentence_count": 3,
         }
     ]
 
 
 def test_batch_text_builds_one_ordinary_task_per_non_empty_line():
     assert build_text_tasks("第一句。第二句！\n\n第三句？\r\n第四行", "batch") == [
-        {"text": "第一句。第二句！", "segments": ["第一句。", "第二句！"]},
-        {"text": "第三句？", "segments": ["第三句？"]},
-        {"text": "第四行", "segments": ["第四行"]},
+        {"text": "第一句。第二句！", "segments": ["第一句。", "第二句！"], "sentence_count": 2},
+        {"text": "第三句？", "segments": ["第三句？"], "sentence_count": 1},
+        {"text": "第四行", "segments": ["第四行"], "sentence_count": 1},
     ]
+
+
+def test_text_split_mode_none_keeps_each_output_task_whole():
+    assert build_text_tasks("第一句。第二句！\n第三句？", "ordinary", "none", 1) == [
+        {
+            "text": "第一句。第二句！ 第三句？",
+            "segments": ["第一句。第二句！ 第三句？"],
+            "sentence_count": 3,
+        }
+    ]
+    assert build_text_tasks("第一句。第二句！\n第三句？", "batch", "none", 1) == [
+        {"text": "第一句。第二句！", "segments": ["第一句。第二句！"], "sentence_count": 2},
+        {"text": "第三句？", "segments": ["第三句？"], "sentence_count": 1},
+    ]
+
+
+def test_text_split_groups_configured_sentence_count_and_preserves_english_spacing():
+    tasks = build_text_tasks("第一句。第二句！Third! Fourth.", "ordinary", "sentences", 2)
+
+    assert tasks[0]["segments"] == ["第一句。第二句！", "Third! Fourth."]
+    assert tasks[0]["sentence_count"] == 4
+
+
+def test_text_split_by_characters_rounds_up_to_sentence_boundary():
+    tasks = build_text_tasks("甲乙。丙丁戊！己。最后一句。", "ordinary", "characters", 5)
+
+    assert tasks[0]["segments"] == ["甲乙。丙丁戊！", "己。最后一句。"]
+    assert all(segment.endswith(("。", "！")) for segment in tasks[0]["segments"])
 
 
 def test_batch_seed_rotation_is_sequential_and_reproducible():
@@ -232,6 +261,8 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
     assert sf.info(first_path).frames == 5
     assert sf.info(second_path).frames == 4
     assert webui.read_wav_metadata(first_path)["segments"] == ["第一句。", "第二句！"]
+    assert webui.read_wav_metadata(first_path)["split_mode"] == "sentences"
+    assert webui.read_wav_metadata(first_path)["split_value"] == 1
     assert webui.read_wav_metadata(first_path)["seed_strategy"] == "sequential"
     assert webui.read_wav_metadata(first_path)["effective_seeds"] == [42, 43]
     assert webui.read_wav_metadata(second_path)["text"] == "第三句？"
@@ -241,6 +272,60 @@ def test_generate_batch_writes_one_merged_wav_per_non_empty_line(monkeypatch, tm
         "第一句。第二句！",
         "第三句？",
     ]
+
+
+def test_generate_applies_character_split_and_records_configuration(monkeypatch, tmp_path):
+    captured = {}
+    output_root = tmp_path / "web-cache"
+    output_root.mkdir()
+
+    def fake_generate_tasks(
+        config,
+        text_tasks,
+        *args,
+        on_segment_complete=None,
+        on_task_complete=None,
+        task_seeds=None,
+        **kwargs,
+    ):
+        captured["text_tasks"] = text_tasks
+        captured["task_seeds"] = task_seeds
+        results = [
+            (np.full(2, 0.1, dtype=np.float32), task_seeds[0][0], 0.1),
+            (np.full(3, 0.2, dtype=np.float32), task_seeds[0][1], 0.2),
+        ]
+        on_segment_complete()
+        on_segment_complete()
+        on_task_complete(0, results, 16000, False)
+        return [], 16000, False, False, 1
+
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui.runtime, "generate_tasks", fake_generate_tasks)
+    response = TestClient(webui.app).post(
+        "/api/generate",
+        data={
+            "text": "甲乙。丙丁戊！己。最后一句。",
+            "model_key": "voxcpm-0.5b",
+            "mode": "design",
+            "batch_mode": "ordinary",
+            "split_mode": "characters",
+            "split_value": 5,
+            "device": "cpu",
+            "denoise": "false",
+            "optimize": "false",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["text_tasks"] == [["甲乙。丙丁戊！", "己。最后一句。"]]
+    assert captured["task_seeds"] == [[42, 42]]
+    assert response.json()["segment_count"] == 2
+    assert response.json()["split_mode"] == "characters"
+    assert response.json()["split_value"] == 5
+    metadata = webui.read_wav_metadata(output_root / response.json()["filename"])
+    assert metadata["segments"] == ["甲乙。丙丁戊！", "己。最后一句。"]
+    assert metadata["sentence_count"] == 4
+    assert metadata["segment_count"] == 2
 
 
 def test_generate_keeps_optimization_enabled_with_lora(monkeypatch, tmp_path):
@@ -417,6 +502,34 @@ def test_generate_ordinary_rejects_batch_export_options():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "批量保存选项仅可用于批量推理模式"
+
+
+@pytest.mark.parametrize(
+    ("split_mode", "split_value", "expected_detail"),
+    [
+        ("unknown", 1, "Unknown text split mode"),
+        ("sentences", 0, "Sentences per segment must be between 1 and 100"),
+        ("sentences", 101, "Sentences per segment must be between 1 and 100"),
+        ("characters", 0, "Target characters must be between 1 and 10000"),
+        ("characters", 10001, "Target characters must be between 1 and 10000"),
+    ],
+)
+def test_generate_rejects_invalid_text_split_config(split_mode, split_value, expected_detail):
+    response = TestClient(webui.app).post(
+        "/api/generate",
+        data={
+            "text": "切分配置测试。",
+            "model_key": "voxcpm-0.5b",
+            "mode": "design",
+            "batch_mode": "ordinary",
+            "split_mode": split_mode,
+            "split_value": split_value,
+            "device": "cpu",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == expected_detail
 
 
 def test_batch_export_destination_does_not_overwrite_existing_pair(tmp_path):

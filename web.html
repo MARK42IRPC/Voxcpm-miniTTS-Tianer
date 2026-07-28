@@ -125,6 +125,13 @@
     .text-mode-tabs label { padding: 6px 8px; border-radius: 4px; color: var(--muted); font-size: 12px; text-align: center; }
     .text-mode-tabs input:checked + label { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20, 28, 32, 0.12); }
     .segment-count { min-height: 16px; color: var(--muted); font-size: 12px; text-align: right; }
+    .split-settings { display: grid; grid-template-columns: minmax(0, 1fr) 150px; align-items: end; gap: 12px; padding-top: 4px; }
+    .split-mode-group, .split-value-control { display: grid; gap: 7px; min-width: 0; }
+    .split-mode-group > label, .split-value-control > label { font-size: 12px; font-weight: 650; }
+    .split-mode-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 3px; background: var(--surface-muted); border-radius: 6px; }
+    .split-mode-tabs input { position: absolute; opacity: 0; pointer-events: none; }
+    .split-mode-tabs label { min-width: 0; padding: 7px 5px; border-radius: 4px; color: var(--muted); font-size: 12px; text-align: center; white-space: nowrap; }
+    .split-mode-tabs input:checked + label { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgba(20, 28, 32, 0.12); }
     .batch-export-panel { margin: -4px 0 16px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
     .batch-export-panel .field { margin-bottom: 10px; }
     .batch-output-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 40px; gap: 8px; }
@@ -450,6 +457,7 @@
       .postprocess-head { align-items: stretch; flex-direction: column; }
       .postprocess-preset { width: 100%; }
       .field-row.text-heading { align-items: flex-start; flex-direction: column; }
+      .split-settings { grid-template-columns: minmax(0, 1fr); }
     }
 
     @media (max-width: 440px) {
@@ -503,16 +511,33 @@
 
           <div class="field">
             <div class="field-row text-heading">
-              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。普通模式按句末标点分段推理并合成一个音频，最多 100 段；批量模式让每个非空行分别生成一个音频，不限制任务数量，可随时中止。">合成文本</label>
+              <label class="tooltip-trigger" for="text" tabindex="0" data-tooltip="最终需要朗读的内容。普通模式合成一个音频；批量模式让每个非空行分别生成一个音频。每个任务内部如何拆成推理片段由下方切分方式决定。">合成文本</label>
               <div class="text-mode-tabs" role="radiogroup" aria-label="文本处理模式">
                 <input id="batchOrdinary" type="radio" name="batch_mode" value="ordinary" checked>
-                <label class="tooltip-trigger" for="batchOrdinary" tabindex="0" data-tooltip="按句号、问号、感叹号、分号和省略号等句末符号切分推理片段，完成后合成为一个 WAV。">普通</label>
+                <label class="tooltip-trigger" for="batchOrdinary" tabindex="0" data-tooltip="全部输入作为一个普通任务，内部片段完成后合成为一个 WAV。普通任务最多允许 100 个推理片段。">普通</label>
                 <input id="batchMultiple" type="radio" name="batch_mode" value="batch">
-                <label class="tooltip-trigger" for="batchMultiple" tabindex="0" data-tooltip="按换行符拆成多个普通任务。每个非空行内部仍按句末标点分段推理，并各自合成为一个 WAV；任务数量不设上限，可随时中止。">批量</label>
+                <label class="tooltip-trigger" for="batchMultiple" tabindex="0" data-tooltip="按换行符拆成多个普通任务，每个非空行各自合成为一个 WAV；任务数量不设上限，可随时中止。">批量</label>
               </div>
             </div>
             <textarea id="text" name="text" required>你好，欢迎使用 VoxCPM 本地语音推理。</textarea>
             <div class="segment-count" id="segmentCount"></div>
+            <div class="split-settings">
+              <div class="split-mode-group">
+                <label class="tooltip-trigger" tabindex="0" data-tooltip="只改变每条输出音频内部的推理片段，不改变普通/批量模式决定的最终 WAV 数量。">推理切分</label>
+                <div class="split-mode-tabs" role="radiogroup" aria-label="推理切分方式">
+                  <input id="splitNone" type="radio" name="split_mode" value="none">
+                  <label class="tooltip-trigger" for="splitNone" tabindex="0" data-tooltip="整条任务只调用一次推理。超长文本可能增加显存、内存和失败风险。">不切</label>
+                  <input id="splitSentences" type="radio" name="split_mode" value="sentences" checked>
+                  <label class="tooltip-trigger" for="splitSentences" tabindex="0" data-tooltip="先识别句末标点，再按指定句子数量组合为一个推理片段。">按句数</label>
+                  <input id="splitCharacters" type="radio" name="split_mode" value="characters">
+                  <label class="tooltip-trigger" for="splitCharacters" tabindex="0" data-tooltip="累计完整句子；达到目标字数后在当前句末切分，不会从句子中间截断。">按字数</label>
+                </div>
+              </div>
+              <div class="split-value-control" id="splitValueField">
+                <label class="tooltip-trigger" id="splitValueLabel" for="splitValue" tabindex="0" data-tooltip="每个推理片段包含的句子数量，范围 1 到 100。">每段句数</label>
+                <input id="splitValue" name="split_value" type="number" min="1" max="100" step="1" value="1">
+              </div>
+            </div>
           </div>
 
           <div class="batch-export-panel hidden" id="batchExportPanel">
@@ -737,6 +762,10 @@
     const maxLen = document.getElementById("maxLen");
     const textInput = document.getElementById("text");
     const batchInputs = [...document.querySelectorAll('input[name="batch_mode"]')];
+    const splitModeInputs = [...document.querySelectorAll('input[name="split_mode"]')];
+    const splitValueField = document.getElementById("splitValueField");
+    const splitValueLabel = document.getElementById("splitValueLabel");
+    const splitValue = document.getElementById("splitValue");
     const segmentCount = document.getElementById("segmentCount");
     const batchExportPanel = document.getElementById("batchExportPanel");
     const batchOutputDir = document.getElementById("batchOutputDir");
@@ -852,6 +881,10 @@
       return batchInputs.find((input) => input.checked).value;
     }
 
+    function currentSplitMode() {
+      return splitModeInputs.find((input) => input.checked).value;
+    }
+
     function splitSentenceText(value) {
       const normalized = value.replace(/\s+/g, " ").trim();
       if (!normalized) return [];
@@ -889,12 +922,76 @@
       return parts;
     }
 
+    function joinSentenceText(sentences) {
+      let joined = "";
+      for (const sentence of sentences) {
+        if (joined && joined.charCodeAt(joined.length - 1) < 128 && sentence.charCodeAt(0) < 128) joined += " ";
+        joined += sentence;
+      }
+      return joined;
+    }
+
+    function groupTextSegments(taskText, sentences, splitMode = currentSplitMode(), rawSplitValue = splitValue.value) {
+      if (!sentences.length) return [];
+      if (splitMode === "none") return [taskText];
+      const size = Math.max(1, Number.parseInt(rawSplitValue, 10) || 1);
+      if (splitMode === "sentences") {
+        const groups = [];
+        for (let index = 0; index < sentences.length; index += size) groups.push(joinSentenceText(sentences.slice(index, index + size)));
+        return groups;
+      }
+      const groups = [];
+      let current = [];
+      let characterCount = 0;
+      for (const sentence of sentences) {
+        current.push(sentence);
+        characterCount += Array.from(sentence).length;
+        if (characterCount >= size) {
+          groups.push(joinSentenceText(current));
+          current = [];
+          characterCount = 0;
+        }
+      }
+      if (current.length) groups.push(joinSentenceText(current));
+      return groups;
+    }
+
     function planTextTasks(value, mode = currentBatchMode()) {
       const normalized = value.replace(/\r\n?/g, "\n");
       const sources = mode === "batch" ? normalized.split("\n") : [normalized];
       return sources
-        .map((source) => splitSentenceText(source))
-        .filter((sentences) => sentences.length);
+        .map((source) => {
+          const taskText = source.replace(/\s+/g, " ").trim();
+          return groupTextSegments(taskText, splitSentenceText(source));
+        })
+        .filter((segments) => segments.length);
+    }
+
+    const splitModeValues = { sentences: 1, characters: 100 };
+    let previousSplitMode = currentSplitMode();
+
+    function updateSplitControls() {
+      const mode = currentSplitMode();
+      if (previousSplitMode !== "none") splitModeValues[previousSplitMode] = Math.max(1, Number.parseInt(splitValue.value, 10) || 1);
+      previousSplitMode = mode;
+      const disabled = mode === "none";
+      splitValueField.classList.toggle("hidden", disabled);
+      splitValue.disabled = disabled;
+      if (!disabled) {
+        splitValue.value = splitModeValues[mode];
+        if (mode === "sentences") {
+          splitValue.min = "1";
+          splitValue.max = "100";
+          splitValueLabel.textContent = "每段句数";
+          splitValueLabel.dataset.tooltip = "每个推理片段包含的句子数量，范围 1 到 100。";
+        } else {
+          splitValue.min = "1";
+          splitValue.max = "10000";
+          splitValueLabel.textContent = "目标字数";
+          splitValueLabel.dataset.tooltip = "累计句子达到或超过该字数后，在当前句末切分；范围 1 到 10000。";
+        }
+      }
+      updateSegmentCount();
     }
 
     function updateSegmentCount() {
@@ -1440,6 +1537,8 @@
       updateSegmentCount();
       updateBatchExportState();
     }));
+    splitModeInputs.forEach((input) => input.addEventListener("change", updateSplitControls));
+    splitValue.addEventListener("input", updateSegmentCount);
     textInput.addEventListener("input", updateSegmentCount);
     modelKey.addEventListener("change", () => {
       updateDevice();
@@ -1598,6 +1697,8 @@
       outputPanel.classList.remove("visible");
 
       const data = new FormData(form);
+      data.set("split_mode", currentSplitMode());
+      data.set("split_value", currentSplitMode() === "none" ? "1" : splitValue.value);
       ["denoise", "optimize", "normalize"].forEach((name) => {
         data.set(name, document.getElementById(name).checked ? "true" : "false");
       });
@@ -1657,7 +1758,7 @@
     applyPostprocessPreset(postPreset.value);
     updateMode();
     updateDevice();
-    updateSegmentCount();
+    updateSplitControls();
     updateBatchExportState();
     renderSessionOutputs();
     loadStatus();

@@ -2278,15 +2278,54 @@ def split_sentence_text(text: str) -> list[str]:
     return parts
 
 
-def build_text_tasks(text: str, batch_mode: str) -> list[dict]:
+def join_sentence_text(sentences: list[str]) -> str:
+    joined = ""
+    for sentence in sentences:
+        if joined and joined[-1].isascii() and sentence[0].isascii():
+            joined += " "
+        joined += sentence
+    return joined
+
+
+def group_text_segments(task_text: str, sentences: list[str], split_mode: str, split_value: int) -> list[str]:
+    if not sentences:
+        return []
+    if split_mode == "none":
+        return [task_text]
+    if split_mode == "sentences":
+        return [join_sentence_text(sentences[index : index + split_value]) for index in range(0, len(sentences), split_value)]
+    if split_mode == "characters":
+        grouped = []
+        current = []
+        current_length = 0
+        for sentence in sentences:
+            current.append(sentence)
+            current_length += len(sentence)
+            if current_length >= split_value:
+                grouped.append(join_sentence_text(current))
+                current = []
+                current_length = 0
+        if current:
+            grouped.append(join_sentence_text(current))
+        return grouped
+    raise ValueError(f"Unknown text split mode: {split_mode}")
+
+
+def build_text_tasks(
+    text: str,
+    batch_mode: str,
+    split_mode: str = "sentences",
+    split_value: int = 1,
+) -> list[dict]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     task_sources = [normalized] if batch_mode == "ordinary" else normalized.split("\n")
     tasks = []
     for source in task_sources:
         task_text = re.sub(r"\s+", " ", source).strip()
-        segments = split_sentence_text(source)
+        sentences = split_sentence_text(source)
+        segments = group_text_segments(task_text, sentences, split_mode, split_value)
         if segments:
-            tasks.append({"text": task_text, "segments": segments})
+            tasks.append({"text": task_text, "segments": segments, "sentence_count": len(sentences)})
     return tasks
 
 
@@ -2327,6 +2366,7 @@ def merge_text_task_results(tasks: list[dict], generation_results: list[tuple]) 
             {
                 "text": task["text"],
                 "segments": task["segments"],
+                "sentence_count": task.get("sentence_count", len(task["segments"])),
                 "wav": waveforms[0] if len(waveforms) == 1 else np.concatenate(waveforms, axis=0),
                 "successful_seeds": [result[1] for result in task_results],
                 "segment_processing_seconds": [round(float(result[2]), 3) for result in task_results],
@@ -2373,6 +2413,7 @@ def persist_generation_task(
         "task_index": task_index,
         "task_count": task_count,
         "segments": task_result["segments"],
+        "sentence_count": task_result["sentence_count"],
         "segment_processing_seconds": task_result["segment_processing_seconds"],
         "segment_count": len(task_result["segments"]),
         "total_segment_count": total_segment_count,
@@ -2398,7 +2439,8 @@ def persist_generation_task(
         "text": task_result["text"],
         "task_index": task_index,
         "task_count": task_count,
-        "sentence_count": len(task_result["segments"]),
+        "sentence_count": task_result["sentence_count"],
+        "segment_count": len(task_result["segments"]),
         "duration": duration,
         "processing_seconds": task_result["processing_seconds"],
         "successful_seed": metadata["successful_seed"],
@@ -2439,6 +2481,8 @@ def validate_request(
     control: str,
     prompt_text: str,
     batch_mode: str,
+    split_mode: str,
+    split_value: int,
     cfg_value: float,
     inference_timesteps: int,
     min_len: int,
@@ -2450,6 +2494,12 @@ def validate_request(
         raise HTTPException(status_code=400, detail="Unknown generation mode")
     if batch_mode not in {"ordinary", "batch"}:
         raise HTTPException(status_code=400, detail="Unknown text processing mode")
+    if split_mode not in {"none", "sentences", "characters"}:
+        raise HTTPException(status_code=400, detail="Unknown text split mode")
+    if split_mode == "sentences" and not 1 <= split_value <= 100:
+        raise HTTPException(status_code=400, detail="Sentences per segment must be between 1 and 100")
+    if split_mode == "characters" and not 1 <= split_value <= 10000:
+        raise HTTPException(status_code=400, detail="Target characters must be between 1 and 10000")
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
     if control.strip() and model_key != "voxcpm2":
@@ -2498,6 +2548,8 @@ async def generate(
     control: str = Form(""),
     prompt_text: str = Form(""),
     batch_mode: str = Form("ordinary"),
+    split_mode: str = Form("sentences"),
+    split_value: int = Form(1),
     batch_output_dir: str = Form(""),
     create_training_pairs: bool = Form(False),
     rotate_seed: bool = Form(True),
@@ -2525,6 +2577,8 @@ async def generate(
         control,
         prompt_text,
         batch_mode,
+        split_mode,
+        split_value,
         cfg_value,
         inference_timesteps,
         min_len,
@@ -2571,7 +2625,7 @@ async def generate(
         raise HTTPException(status_code=400, detail="Reference audio is required")
 
     source_text = text.strip()
-    text_tasks = build_text_tasks(source_text, batch_mode)
+    text_tasks = build_text_tasks(source_text, batch_mode, split_mode, split_value)
     segments = validate_text_task_limits(text_tasks, batch_mode)
     rotate_seed_effective = batch_mode == "batch" and rotate_seed
     seed_tasks = build_generation_seed_tasks(text_tasks, seed, rotate_seed_effective)
@@ -2648,6 +2702,8 @@ async def generate(
                     "schema": "voxcpm-generation-v1",
                     "source_text": source_text,
                     "batch_mode": batch_mode,
+                    "split_mode": split_mode,
+                    "split_value": split_value if split_mode != "none" else None,
                     "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
                     "create_training_pairs": create_training_pairs,
                     "model_key": model_key,
@@ -2732,6 +2788,8 @@ async def generate(
         "lora_strength": lora_strength if lora_checkpoint else None,
         "device": device,
         "batch_mode": batch_mode,
+        "split_mode": split_mode,
+        "split_value": split_value if split_mode != "none" else None,
         "batch_output_dir": str(batch_output_directory) if batch_output_directory else None,
         "training_pairs_created": bool(batch_output_directory and create_training_pairs),
         "task_count": task_count,
