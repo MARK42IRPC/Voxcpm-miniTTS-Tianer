@@ -99,8 +99,9 @@ ALLOWED_AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg"}
 VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
 HYBRID_MAX_GENERATION_LENGTH = 1024
 HYBRID_DEVICES = {"hybrid", "hybrid-max"}
-MAX_INFERENCE_SEGMENTS = 100
-MAX_BATCH_TASKS = 100
+MAX_ORDINARY_INFERENCE_SEGMENTS = 100
+MAX_BATCH_INFERENCE_SEGMENTS = 1000
+MAX_BATCH_TASKS = 500
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -1749,6 +1750,25 @@ def build_text_tasks(text: str, batch_mode: str) -> list[dict]:
     return tasks
 
 
+def validate_text_task_limits(text_tasks: list[dict], batch_mode: str) -> list[str]:
+    if batch_mode == "batch" and len(text_tasks) > MAX_BATCH_TASKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"批量文本不能超过 {MAX_BATCH_TASKS} 个非空行",
+        )
+    segments = [segment for task in text_tasks for segment in task["segments"]]
+    segment_limit = (
+        MAX_BATCH_INFERENCE_SEGMENTS if batch_mode == "batch" else MAX_ORDINARY_INFERENCE_SEGMENTS
+    )
+    if len(segments) > segment_limit:
+        mode_label = "批量文本" if batch_mode == "batch" else "普通文本"
+        raise HTTPException(
+            status_code=400,
+            detail=f"{mode_label}不能超过 {segment_limit} 个推理分段",
+        )
+    return segments
+
+
 def merge_text_task_results(tasks: list[dict], generation_results: list[tuple]) -> list[dict]:
     expected_count = sum(len(task["segments"]) for task in tasks)
     if len(generation_results) != expected_count:
@@ -1918,17 +1938,7 @@ async def generate(
 
     source_text = text.strip()
     text_tasks = build_text_tasks(source_text, batch_mode)
-    if len(text_tasks) > MAX_BATCH_TASKS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Batch text contains more than {MAX_BATCH_TASKS} non-empty lines",
-        )
-    segments = [segment for task in text_tasks for segment in task["segments"]]
-    if len(segments) > MAX_INFERENCE_SEGMENTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Text contains more than {MAX_INFERENCE_SEGMENTS} inference segments",
-        )
+    segments = validate_text_task_limits(text_tasks, batch_mode)
     final_texts = [f"({control.strip()}){segment}" if control.strip() else segment for segment in segments]
     # reduce-overhead compilation produces near-silent output with LoRALinear.
     config = ModelConfig(

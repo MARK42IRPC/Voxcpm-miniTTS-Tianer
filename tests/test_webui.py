@@ -26,6 +26,7 @@ from webui import (
     resolve_lora_checkpoint,
     safe_lora_job_name,
     split_sentence_text,
+    validate_text_task_limits,
     infer_lora_model_key,
 )
 
@@ -113,6 +114,36 @@ def test_batch_text_builds_one_ordinary_task_per_non_empty_line():
         {"text": "第三句？", "segments": ["第三句？"]},
         {"text": "第四行", "segments": ["第四行"]},
     ]
+
+
+def test_batch_text_limit_allows_500_tasks_and_1000_segments():
+    tasks = build_text_tasks("\n".join(["第一句。第二句！"] * 500), "batch")
+
+    segments = validate_text_task_limits(tasks, "batch")
+
+    assert len(tasks) == 500
+    assert len(segments) == 1000
+
+
+def test_batch_text_limit_rejects_more_than_500_tasks():
+    tasks = build_text_tasks("\n".join(["一句。"] * 501), "batch")
+
+    with pytest.raises(HTTPException, match="500 个非空行"):
+        validate_text_task_limits(tasks, "batch")
+
+
+def test_batch_text_limit_rejects_more_than_1000_segments():
+    tasks = build_text_tasks("\n".join(["第一句。第二句！"] * 500) + "第三句？", "batch")
+
+    with pytest.raises(HTTPException, match="1000 个推理分段"):
+        validate_text_task_limits(tasks, "batch")
+
+
+def test_ordinary_text_limit_remains_100_segments():
+    tasks = build_text_tasks("一句。" * 101, "ordinary")
+
+    with pytest.raises(HTTPException, match="100 个推理分段"):
+        validate_text_task_limits(tasks, "ordinary")
 
 
 def test_merge_text_task_results_preserves_waveform_dtype_and_task_boundaries():
