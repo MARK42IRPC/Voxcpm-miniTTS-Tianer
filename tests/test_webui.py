@@ -1303,6 +1303,105 @@ def test_dataset_review_only_marks_fully_reproducible_metadata_for_redo(monkeypa
     assert items["mismatch.wav"]["redo_supported"] is False
 
 
+def test_dataset_review_filters_all_pending_audio_by_metadata_mark(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    monkeypatch.setitem(webui.MODEL_PATHS, "voxcpm-0.5b", model_dir)
+    create_redo_test_pair(dataset_dir, "a.wav", marked=True)
+    create_redo_test_pair(dataset_dir, "b.wav")
+    create_redo_test_pair(dataset_dir, "c.wav", marked=True)
+    client = TestClient(webui.app)
+
+    marked = client.get(
+        "/api/dataset-review",
+        params={"dataset_dir": str(dataset_dir), "mark_filter": "marked"},
+    )
+    unmarked = client.get(
+        "/api/dataset-review",
+        params={"dataset_dir": str(dataset_dir), "mark_filter": "unmarked"},
+    )
+    kept = client.post(
+        "/api/dataset-review/keep",
+        data={"dataset_dir": str(dataset_dir), "filename": "a.wav", "mark_filter": "marked"},
+    )
+    invalid = client.get(
+        "/api/dataset-review",
+        params={"dataset_dir": str(dataset_dir), "mark_filter": "unknown"},
+    )
+
+    assert marked.status_code == 200
+    assert [item["filename"] for item in marked.json()["items"]] == ["a.wav", "c.wav"]
+    assert all(item["marked"] for item in marked.json()["items"])
+    assert marked.json()["filtered_count"] == 2
+    assert marked.json()["pending_count"] == 3
+    assert [item["filename"] for item in unmarked.json()["items"]] == ["b.wav"]
+    assert kept.json()["filtered_count"] == 1
+    assert kept.json()["pending_count"] == 2
+    assert invalid.status_code == 400
+
+
+def test_generated_audio_mark_updates_cache_and_registered_export(monkeypatch, tmp_path):
+    output_root = tmp_path / "outputs"
+    export_root = tmp_path / "export"
+    output_root.mkdir()
+    export_root.mkdir()
+    registry = tmp_path / "batch-output-directories.json"
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", registry)
+    webui.register_batch_output_directory(export_root)
+    metadata = {
+        "schema": "voxcpm-generation-v1",
+        "created_at": "2026-07-28T18:00:00+08:00",
+        "filename": "sample.wav",
+        "text": "标记测试。",
+    }
+    for path in (output_root / "sample.wav", export_root / "sample.wav"):
+        sf.write(path, np.full(800, 0.1, dtype=np.float32), 16000)
+        webui.write_wav_metadata(path, metadata)
+
+    client = TestClient(webui.app)
+    marked_response = client.post(
+        "/api/audio/mark",
+        data={"filename": "sample.wav", "marked": "true", "exported_path": str(export_root / "sample.wav")},
+    )
+    marked = marked_response.json()
+    assert marked_response.status_code == 200
+    assert marked["marked"] is True
+    assert marked["marked_at"]
+    assert len(marked["updated_paths"]) == 2
+    for path in (output_root / "sample.wav", export_root / "sample.wav"):
+        latest = webui.read_wav_metadata(path)
+        assert latest["marked"] is True
+        assert latest["marked_at"] == marked["marked_at"]
+
+    unmarked_response = client.post(
+        "/api/audio/mark",
+        data={"filename": "sample.wav", "marked": "false", "exported_path": str(export_root / "sample.wav")},
+    )
+    unmarked = unmarked_response.json()
+
+    assert unmarked_response.status_code == 200
+    assert unmarked["marked"] is False
+    for path in (output_root / "sample.wav", export_root / "sample.wav"):
+        latest = webui.read_wav_metadata(path)
+        assert latest["marked"] is False
+        assert "marked_at" not in latest
+
+
+def test_web_session_output_updates_reuse_existing_audio_nodes():
+    source = webui.WEB_PAGE.read_text(encoding="utf-8")
+    render = source[source.index("function renderSessionOutputs()") : source.index("function addSessionOutputs")]
+    merge = source[source.index("function addSessionOutputs") : source.index("function renderInferenceProgress")]
+
+    assert 'existingRows.get(item.id) || createSessionOutputRow(item)' in render
+    assert 'if (row !== cursor) sessionList.insertBefore(row, cursor)' in render
+    assert render.index('if (!sessionOutputs.length)') < render.index('sessionList.replaceChildren()')
+    assert 'if (existing) Object.assign(existing, values)' in merge
+    assert "newFilenames" not in merge
+    assert ".slice(0, 500)" not in merge
+
+
 def test_wav_metadata_reader_uses_latest_appended_metadata(tmp_path):
     path = tmp_path / "metadata.wav"
     sf.write(path, np.zeros(1600, dtype=np.float32), 16000)
@@ -1330,6 +1429,8 @@ def test_dataset_review_redo_changes_only_seed_and_atomically_replaces_audio(mon
         max_len=2048,
         normalize=True,
         optimize_requested=True,
+        marked=True,
+        marked_at="2026-07-28T18:02:00+08:00",
     )
     captured = {}
 
@@ -1407,6 +1508,8 @@ def test_dataset_review_redo_changes_only_seed_and_atomically_replaces_audio(mon
     assert replaced_metadata["filename"] == original_path.name
     assert replaced_metadata["requested_seed"] == 314159
     assert replaced_metadata["redo_previous_seed"] == 42
+    assert replaced_metadata["marked"] is True
+    assert replaced_metadata["marked_at"] == "2026-07-28T18:02:00+08:00"
     assert not (output_root / "generated.wav").exists()
     assert webui.inference_job.snapshot()["status"] == "idle"
 

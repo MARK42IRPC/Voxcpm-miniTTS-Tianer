@@ -41,8 +41,11 @@
     .status { min-height: 18px; margin-top: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .status.error { color: var(--red); }
     .review-controls { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 18px; }
+    .review-options { display: flex; align-items: center; gap: 18px; }
     .review-actions { display: flex; gap: 8px; }
     .toggle-row { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 12px; }
+    .review-filter { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; }
+    .review-filter select { width: 112px; height: 34px; font-size: 12px; }
     .switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
     .switch input { position: absolute; opacity: 0; }
     .switch span { position: absolute; inset: 0; border-radius: 12px; background: #bdc5c9; transition: background 120ms; }
@@ -57,10 +60,12 @@
     .queue { display: grid; gap: 10px; }
     .review-item { display: grid; grid-template-columns: minmax(230px,320px) minmax(0,1fr) auto; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: #fafbfb; }
     .audio-column { min-width: 0; }
-    .filename { display: block; margin-bottom: 8px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .filename-line { display: flex; min-width: 0; align-items: center; gap: 7px; margin-bottom: 8px; }
+    .filename { min-width: 0; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+    .marked-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #e0a532; border-radius: 3px; background: #fff8df; color: #a86400; font-size: 9px; font-weight: 700; }
     audio { display: block; width: 100%; min-width: 0; max-width: 100%; height: 36px; }
-    .spectrogram { display: block; width: 100%; height: 84px; margin-top: 8px; border: 1px solid #303b40; border-radius: 4px; background: #11181b; }
-    .spectrogram[data-state="queued"], .spectrogram[data-state="loading"] { background: linear-gradient(90deg,#11181b 0%,#202b2f 48%,#11181b 100%); background-size: 200% 100%; animation: spectrum-loading 1.2s linear infinite; }
+    .spectrogram { display: block; width: 100%; height: 84px; margin-top: 8px; border: 1px solid #39484e; border-radius: 4px; background: #080d0f; }
+    .spectrogram[data-state="queued"], .spectrogram[data-state="loading"] { background: linear-gradient(90deg,#080d0f 0%,#26363c 48%,#080d0f 100%); background-size: 200% 100%; animation: spectrum-loading 1.2s linear infinite; }
     @keyframes spectrum-loading { to { background-position: -200% 0; } }
     .transcript { min-width: 0; color: var(--ink); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
     .transcript.missing { color: var(--red); }
@@ -92,6 +97,7 @@
       .dataset-row { grid-template-columns: minmax(0,1fr) 1fr; }
       .dataset-row select { grid-column: 1 / -1; }
       .review-controls { align-items: stretch; flex-direction: column; }
+      .review-options { justify-content: space-between; }
       .review-actions { display: grid; grid-template-columns: 1fr 1fr; }
       .review-actions button { width: 100%; padding: 0 8px; }
     }
@@ -113,7 +119,10 @@
         </div>
         <div class="status" id="status" aria-live="polite"></div>
         <div class="review-controls">
-          <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="每次队列更新后自动播放当前最顶部的音频一次。浏览器阻止自动播放时，可先手动播放任意一条。">自动轮播</span><label class="switch"><input id="autoPlay" type="checkbox"><span></span></label></div>
+          <div class="review-options">
+            <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="每次队列更新后自动播放当前最顶部的音频一次。浏览器阻止自动播放时，可先手动播放任意一条。">自动轮播</span><label class="switch"><input id="autoPlay" type="checkbox"><span></span></label></div>
+            <label class="review-filter"><span class="tooltip-trigger" tabindex="0" data-tooltip="按 WAV 元数据中的 marked 标记筛选整个待审核训练集，不只筛选当前显示的 40 条。">标记筛选</span><select id="markFilter"><option value="all">全部</option><option value="marked">已标记</option><option value="unmarked">未标记</option></select></label>
+          </div>
           <div class="review-actions">
             <button class="secondary tooltip-trigger" id="deduplicateButton" type="button" data-tooltip="按 LAB 去除 UTF-8 BOM 和首尾空白后的全文精确去重。每组保留文件名排序最前的一条，并删除其余真实音频及不再使用的 LAB。">快速去重</button>
             <button class="secondary tooltip-trigger" id="resetButton" type="button" data-tooltip="清除当前训练集的已保留记录，让所有仍在磁盘上的音频重新进入待审核队列；不会删除任何文件。">重新审核全部</button>
@@ -139,6 +148,7 @@
     const deduplicateButton = document.getElementById("deduplicateButton");
     const resetButton = document.getElementById("resetButton");
     const autoPlay = document.getElementById("autoPlay");
+    const markFilter = document.getElementById("markFilter");
     const status = document.getElementById("status");
     const directoryState = document.getElementById("directoryState");
     const queue = document.getElementById("queue");
@@ -146,7 +156,7 @@
     const confirmedCount = document.getElementById("confirmedCount");
     const pendingCount = document.getElementById("pendingCount");
     const totalCount = document.getElementById("totalCount");
-    const controls = [datasetSelect, browseButton, refreshButton, deduplicateButton, resetButton];
+    const controls = [datasetSelect, browseButton, refreshButton, deduplicateButton, resetButton, markFilter];
     const spectrumQueue = [];
     const spectrumConcurrency = 2;
     let spectrumActive = 0;
@@ -156,6 +166,7 @@
     function setBusy(busy) { controls.forEach((control) => { control.disabled = busy; }); }
     function setStatus(message, error = false) { status.textContent = message; status.classList.toggle("error", error); }
     function selectedDirectory() { return datasetSelect.value || ""; }
+    function selectedMarkFilter() { return markFilter.value || "all"; }
     function formatSize(bytes) { return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`; }
 
     function fftMagnitude(samples) {
@@ -214,8 +225,8 @@
       const channelCount = audioBuffer.numberOfChannels;
       const channels = Array.from({ length: channelCount }, (_, index) => audioBuffer.getChannelData(index));
       const maxBin = fftSize / 2 - 1;
-      const floorDb = -82;
-      const ceilingDb = -18;
+      const floorDb = -88;
+      const ceilingDb = -22;
       for (let x = 0; x < width; x += 1) {
         const center = Math.round((x + 0.5) * audioBuffer.length / width);
         const start = center - fftSize / 2;
@@ -233,10 +244,10 @@
           const highToLow = 1 - y / Math.max(1, height - 1);
           const bin = Math.max(1, Math.round(highToLow * maxBin));
           const decibels = 20 * Math.log10(Math.max(magnitudes[bin], 1e-8));
-          const intensity = Math.pow(Math.max(0, Math.min(1, (decibels - floorDb) / (ceilingDb - floorDb))), 0.82);
-          const red = 15 + intensity * (45 + 195 * highToLow);
-          const green = 15 + intensity * 52;
-          const blue = 15 + intensity * (220 - 180 * highToLow);
+          const intensity = Math.pow(Math.max(0, Math.min(1, (decibels - floorDb) / (ceilingDb - floorDb))), 0.62);
+          const red = 9 + intensity * (60 + 186 * highToLow);
+          const green = 10 + intensity * 72;
+          const blue = 9 + intensity * (246 - 196 * highToLow);
           const pixel = (y * width + x) * 4;
           image.data[pixel] = Math.round(red);
           image.data[pixel + 1] = Math.round(green);
@@ -357,6 +368,15 @@
       name.className = "filename";
       name.textContent = `${item.filename} · ${formatSize(item.size_bytes)}`;
       name.title = item.filename;
+      const filenameLine = document.createElement("div");
+      filenameLine.className = "filename-line";
+      filenameLine.append(name);
+      if (item.marked) {
+        const badge = document.createElement("span");
+        badge.className = "marked-badge";
+        badge.textContent = "已标记";
+        filenameLine.append(badge);
+      }
       const audio = document.createElement("audio");
       audio.controls = true;
       audio.preload = "none";
@@ -369,7 +389,7 @@
       spectrogram.setAttribute("role", "img");
       spectrogram.setAttribute("aria-label", `${item.filename} 的频谱图，高频在上、低频在下`);
       spectrogram.title = "高频在上（红），低频在下（蓝）";
-      audioColumn.append(name, audio, spectrogram);
+      audioColumn.append(filenameLine, audio, spectrogram);
       observeSpectrogram(spectrogram, audio.src);
       const transcript = document.createElement("div");
       transcript.className = `transcript${item.has_lab ? "" : " missing"}`;
@@ -387,14 +407,18 @@
       confirmedCount.textContent = result.confirmed_count;
       pendingCount.textContent = result.pending_count;
       totalCount.textContent = result.total_count;
-      const visibleCount = result.visible_count ?? Math.min(result.pending_count, result.window_size);
-      queueNote.textContent = result.pending_count > visibleCount ? `显示队首 ${visibleCount} / ${result.pending_count} 条` : `${visibleCount} 条待审核`;
+      const filteredCount = result.filtered_count ?? result.pending_count;
+      const visibleCount = result.visible_count ?? Math.min(filteredCount, result.window_size);
+      queueNote.textContent = selectedMarkFilter() === "all"
+        ? (result.pending_count > visibleCount ? `显示队首 ${visibleCount} / ${result.pending_count} 条` : `${visibleCount} 条待审核`)
+        : `当前筛选 ${visibleCount} / ${filteredCount} 条`;
       const selected = datasetSelect.selectedOptions[0];
       if (selected) selected.textContent = `${selected.dataset.name || selected.textContent.split(" · ")[0]} · ${result.total_count} 音频`;
     }
 
     function renderSnapshot(snapshot, shouldPlay = true) {
       currentSnapshot = snapshot;
+      markFilter.value = snapshot.mark_filter || selectedMarkFilter();
       updateCounts(snapshot);
       directoryState.textContent = snapshot.directory;
       if (spectrumObserver) spectrumObserver.disconnect();
@@ -403,7 +427,9 @@
       if (!snapshot.items.length) {
         const empty = document.createElement("div");
         empty.className = "empty";
-        empty.textContent = snapshot.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
+        empty.textContent = snapshot.filtered_count === 0 && snapshot.pending_count
+          ? "当前标记筛选下没有待审核音频"
+          : snapshot.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
         queue.append(empty);
         return;
       }
@@ -430,7 +456,9 @@
       if (!queue.querySelector(".review-item")) {
         const empty = document.createElement("div");
         empty.className = "empty";
-        empty.textContent = result.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
+        empty.textContent = result.filtered_count === 0 && result.pending_count
+          ? "当前标记筛选下没有待审核音频"
+          : result.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
         queue.append(empty);
       }
       setTimeout(playTopAudio, 0);
@@ -442,7 +470,7 @@
       setBusy(true);
       setStatus("正在扫描训练集");
       try {
-        const params = new URLSearchParams({ dataset_dir: directory, refresh: String(forceScan) });
+        const params = new URLSearchParams({ dataset_dir: directory, refresh: String(forceScan), mark_filter: selectedMarkFilter() });
         const snapshot = await readJson(await fetch(`/api/dataset-review?${params}`, { cache: "no-store" }), "训练集扫描失败");
         localStorage.setItem("voxcpm-review-dataset", snapshot.directory);
         renderSnapshot(snapshot, shouldPlay);
@@ -458,6 +486,7 @@
       const data = new FormData();
       data.set("dataset_dir", selectedDirectory());
       data.set("filename", filename);
+      data.set("mark_filter", selectedMarkFilter());
       try {
         const result = await readJson(await fetch(`/api/dataset-review/${action}`, { method: "POST", body: data }), "审核操作失败");
         applyReviewDelta(result);
@@ -473,6 +502,7 @@
       const data = new FormData();
       data.set("dataset_dir", selectedDirectory());
       data.set("filename", filename);
+      data.set("mark_filter", selectedMarkFilter());
       try {
         const result = await readJson(await fetch("/api/dataset-review/redo", { method: "POST", body: data }), "重做失败");
         const row = [...queue.querySelectorAll(".review-item")].find((item) => item.dataset.filename === filename);
@@ -500,7 +530,7 @@
     async function resetReview() {
       if (!selectedDirectory() || !confirm("重新审核当前训练集的全部音频？此操作不会删除文件。")) return;
       setBusy(true); setStatus("正在清除审核记录");
-      const data = new FormData(); data.set("dataset_dir", selectedDirectory());
+      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("mark_filter", selectedMarkFilter());
       try {
         const snapshot = await readJson(await fetch("/api/dataset-review/reset", { method: "POST", body: data }), "重新审核失败");
         renderSnapshot(snapshot, true); setStatus("全部音频已重新进入待审核队列");
@@ -511,7 +541,7 @@
     async function deduplicateReview() {
       if (!selectedDirectory() || !confirm("按 LAB 全文精确去重？每组只保留文件名排序最前的一条，其余真实音频与不再使用的 LAB 将永久删除。")) return;
       setBusy(true); setStatus("正在扫描 LAB 并删除重复训练对");
-      const data = new FormData(); data.set("dataset_dir", selectedDirectory());
+      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("mark_filter", selectedMarkFilter());
       try {
         const result = await readJson(await fetch("/api/dataset-review/deduplicate", { method: "POST", body: data }), "快速去重失败");
         renderSnapshot(result, true);
@@ -537,6 +567,11 @@
     });
 
     datasetSelect.addEventListener("change", () => refreshReview(true));
+    markFilter.value = localStorage.getItem("voxcpm-review-mark-filter") || "all";
+    markFilter.addEventListener("change", () => {
+      localStorage.setItem("voxcpm-review-mark-filter", selectedMarkFilter());
+      refreshReview(true);
+    });
     browseButton.addEventListener("click", browseDataset);
     refreshButton.addEventListener("click", () => refreshReview(true, true));
     deduplicateButton.addEventListener("click", deduplicateReview);

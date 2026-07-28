@@ -429,6 +429,10 @@
     .audio-item-meta { margin: 5px 0 9px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
     .audio-item audio { display: block; width: 100%; height: 36px; }
     .audio-item-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 7px; }
+    .mark-audio { border: 0; background: transparent; color: #a66c08; padding: 0; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .mark-audio:hover, .mark-audio.active { color: #d18b0d; }
+    .mark-audio.active { text-decoration: underline; text-underline-offset: 3px; }
+    .mark-audio:disabled { cursor: wait; opacity: 0.55; }
     .move-training { border: 0; background: transparent; color: var(--green); padding: 0; font-size: 12px; font-weight: 700; white-space: nowrap; }
     .move-training:disabled { cursor: wait; opacity: 0.55; }
 
@@ -1069,7 +1073,11 @@
     }
 
     function saveSessionOutputs() {
-      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionOutputs));
+      try {
+        sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionOutputs));
+      } catch (error) {
+        console.warn("Session audio cache exceeded browser storage capacity", error);
+      }
     }
 
     function pauseOtherPlayers(activePlayer) {
@@ -1217,11 +1225,101 @@
       }
     }
 
+    function updateMarkButton(button, marked) {
+      button.classList.toggle("active", Boolean(marked));
+      button.textContent = marked ? "已标记" : "标记";
+      button.title = marked ? "取消本条音频的元数据标记" : "在本条音频元数据中写入 marked 标记";
+      button.setAttribute("aria-pressed", String(Boolean(marked)));
+    }
+
+    async function markSessionItem(item, markButton) {
+      const nextMarked = !Boolean(item.marked);
+      markButton.disabled = true;
+      const data = new FormData();
+      data.set("filename", item.filename);
+      data.set("marked", String(nextMarked));
+      if (item.exported_path) data.set("exported_path", item.exported_path);
+      try {
+        const response = await fetch("/api/audio/mark", { method: "POST", body: data });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "标记失败");
+        item.marked = result.marked;
+        item.marked_at = result.marked_at;
+        saveSessionOutputs();
+        updateMarkButton(markButton, item.marked);
+        message.className = "message";
+        message.textContent = item.marked ? `已标记 ${item.filename}` : `已取消标记 ${item.filename}`;
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        markButton.disabled = false;
+      }
+    }
+
+    function createSessionOutputRow(item) {
+      const row = document.createElement("article");
+      row.className = "audio-item";
+      row.dataset.outputId = item.id;
+
+      const head = document.createElement("div");
+      head.className = "audio-item-head";
+      const title = document.createElement("p");
+      title.className = "audio-item-text";
+      title.textContent = item.text || item.filename;
+      const remove = document.createElement("button");
+      remove.className = "remove-button";
+      remove.type = "button";
+      remove.title = "从会话列表移除";
+      remove.setAttribute("aria-label", "从会话列表移除");
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        sessionOutputs = sessionOutputs.filter((entry) => entry.id !== item.id);
+        saveSessionOutputs();
+        renderSessionOutputs();
+      });
+      head.append(title, remove);
+
+      const meta = document.createElement("div");
+      meta.className = "audio-item-meta";
+      const loraLabel = item.lora_name ? ` · ${item.lora_name}` : "";
+      const modelLabel = item.model || "VoxCPM";
+      const deviceLabel = String(item.device || "").toUpperCase();
+      meta.textContent = `${modelLabel}${loraLabel}${deviceLabel ? ` · ${deviceLabel}` : ""} · ${Number(item.duration).toFixed(2)} 秒`;
+
+      const player = document.createElement("audio");
+      player.controls = true;
+      player.preload = "none";
+      player.src = item.audio_url;
+      player.addEventListener("play", () => pauseOtherPlayers(player));
+
+      const actions = document.createElement("div");
+      actions.className = "audio-item-actions";
+      const markButton = document.createElement("button");
+      markButton.className = "mark-audio";
+      markButton.type = "button";
+      updateMarkButton(markButton, item.marked);
+      markButton.addEventListener("click", () => markSessionItem(item, markButton));
+      const moveButton = document.createElement("button");
+      moveButton.className = "move-training";
+      moveButton.type = "button";
+      moveButton.textContent = "移动到训练集";
+      moveButton.addEventListener("click", () => moveSessionItemToTraining(item, moveButton));
+      const download = document.createElement("a");
+      download.className = "download";
+      download.href = item.audio_url;
+      download.download = item.filename;
+      download.textContent = "下载 WAV";
+      actions.append(markButton, moveButton, download);
+      row.append(head, meta, player, actions);
+      return row;
+    }
+
     function renderSessionOutputs() {
-      sessionList.replaceChildren();
       sessionCount.textContent = String(sessionOutputs.length);
       clearSession.disabled = sessionOutputs.length === 0;
       if (!sessionOutputs.length) {
+        sessionList.replaceChildren();
         const empty = document.createElement("div");
         empty.className = "session-empty";
         empty.textContent = "本次会话还没有生成音频";
@@ -1229,71 +1327,39 @@
         return;
       }
 
-      sessionOutputs.forEach((item) => {
-        const row = document.createElement("article");
-        row.className = "audio-item";
-
-        const head = document.createElement("div");
-        head.className = "audio-item-head";
-        const title = document.createElement("p");
-        title.className = "audio-item-text";
-        title.textContent = item.text || item.filename;
-        const remove = document.createElement("button");
-        remove.className = "remove-button";
-        remove.type = "button";
-        remove.title = "从会话列表移除";
-        remove.setAttribute("aria-label", "从会话列表移除");
-        remove.textContent = "×";
-        remove.addEventListener("click", () => {
-          sessionOutputs = sessionOutputs.filter((entry) => entry.id !== item.id);
-          saveSessionOutputs();
-          renderSessionOutputs();
-        });
-        head.append(title, remove);
-
-        const meta = document.createElement("div");
-        meta.className = "audio-item-meta";
-        const loraLabel = item.lora_name ? ` · ${item.lora_name}` : "";
-        const modelLabel = item.model || "VoxCPM";
-        const deviceLabel = String(item.device || "").toUpperCase();
-        meta.textContent = `${modelLabel}${loraLabel}${deviceLabel ? ` · ${deviceLabel}` : ""} · ${Number(item.duration).toFixed(2)} 秒`;
-
-        const player = document.createElement("audio");
-        player.controls = true;
-        player.preload = "metadata";
-        player.src = item.audio_url;
-        player.addEventListener("play", () => pauseOtherPlayers(player));
-
-        const actions = document.createElement("div");
-        actions.className = "audio-item-actions";
-        const moveButton = document.createElement("button");
-        moveButton.className = "move-training";
-        moveButton.type = "button";
-        moveButton.textContent = "移动到训练集";
-        moveButton.addEventListener("click", () => moveSessionItemToTraining(item, moveButton));
-        const download = document.createElement("a");
-        download.className = "download";
-        download.href = item.audio_url;
-        download.download = item.filename;
-        download.textContent = "下载 WAV";
-        actions.append(moveButton, download);
-        row.append(head, meta, player, actions);
-        sessionList.append(row);
+      sessionList.querySelector(".session-empty")?.remove();
+      const activeIds = new Set(sessionOutputs.map((item) => item.id));
+      const existingRows = new Map();
+      sessionList.querySelectorAll(".audio-item").forEach((row) => {
+        if (!activeIds.has(row.dataset.outputId)) row.remove();
+        else existingRows.set(row.dataset.outputId, row);
       });
+      let cursor = sessionList.firstElementChild;
+      for (const item of sessionOutputs) {
+        const row = existingRows.get(item.id) || createSessionOutputRow(item);
+        if (row !== cursor) sessionList.insertBefore(row, cursor);
+        const markButton = row.querySelector(".mark-audio");
+        if (markButton) updateMarkButton(markButton, item.marked);
+        cursor = row.nextElementSibling;
+      }
     }
 
     function addSessionOutputs(outputs, result) {
       const createdAt = Date.now();
-      const newItems = outputs.map((output, index) => ({
-        ...output,
-        id: `${createdAt}-${index}-${output.filename}`,
-        model: result.model,
-        lora_name: result.lora_name,
-        device: result.device,
-        created_at: createdAt,
-      }));
-      const newFilenames = new Set(newItems.map((item) => item.filename));
-      sessionOutputs = [...newItems, ...sessionOutputs.filter((item) => !newFilenames.has(item.filename))].slice(0, 500);
+      const existingByFilename = new Map(sessionOutputs.map((item) => [item.filename, item]));
+      const newItems = [];
+      outputs.forEach((output, index) => {
+        const existing = existingByFilename.get(output.filename);
+        const values = {
+          ...output,
+          model: result.model ?? existing?.model,
+          lora_name: result.lora_name ?? existing?.lora_name,
+          device: result.device ?? existing?.device,
+        };
+        if (existing) Object.assign(existing, values);
+        else newItems.push({ ...values, id: `${createdAt}-${index}-${output.filename}`, created_at: createdAt });
+      });
+      sessionOutputs = [...newItems, ...sessionOutputs];
       saveSessionOutputs();
       renderSessionOutputs();
     }

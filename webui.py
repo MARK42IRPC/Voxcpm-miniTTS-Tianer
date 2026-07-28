@@ -109,6 +109,7 @@ HYBRID_MAX_GENERATION_LENGTH = 1024
 HYBRID_DEVICES = {"hybrid", "hybrid-max"}
 MAX_ORDINARY_INFERENCE_SEGMENTS = 100
 DATASET_REVIEW_PAGE_SIZE = 40
+DATASET_MARK_FILTERS = {"all", "marked", "unmarked"}
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -131,9 +132,11 @@ class DatasetReviewIndex:
     lab_files: dict[str, Path]
     ordered_keys: list[str]
     kept: set[str]
+    marked: dict[str, bool]
 
 
 DATASET_REVIEW_INDEXES: dict[str, DatasetReviewIndex] = {}
+AUDIO_METADATA_LOCK = threading.RLock()
 
 
 class InferenceJobRuntime:
@@ -1274,9 +1277,9 @@ async def browse_training_dataset(initial_path: str = Form("")) -> dict:
 
 
 @app.get("/api/dataset-review")
-def dataset_review(dataset_dir: str, refresh: bool = False) -> dict:
+def dataset_review(dataset_dir: str, refresh: bool = False, mark_filter: str = "all") -> dict:
     try:
-        return build_dataset_review_snapshot(dataset_dir, refresh=refresh)
+        return build_dataset_review_snapshot(dataset_dir, refresh=refresh, mark_filter=mark_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1298,25 +1301,37 @@ def dataset_review_audio(dataset_dir: str, filename: str) -> FileResponse:
 
 
 @app.post("/api/dataset-review/keep")
-def keep_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+def keep_dataset_review_audio(
+    dataset_dir: str = Form(...),
+    filename: str = Form(...),
+    mark_filter: str = Form("all"),
+) -> dict:
     try:
-        return mark_dataset_review_audio_kept(dataset_dir, filename)
+        return mark_dataset_review_audio_kept(dataset_dir, filename, mark_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-review/delete")
-def delete_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+def delete_dataset_review_audio(
+    dataset_dir: str = Form(...),
+    filename: str = Form(...),
+    mark_filter: str = Form("all"),
+) -> dict:
     try:
-        return delete_dataset_review_pair(dataset_dir, filename)
+        return delete_dataset_review_pair(dataset_dir, filename, mark_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-review/redo")
-async def redo_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+async def redo_dataset_review_audio(
+    dataset_dir: str = Form(...),
+    filename: str = Form(...),
+    mark_filter: str = Form("all"),
+) -> dict:
     try:
-        return await redo_dataset_review_pair(dataset_dir, filename)
+        return await redo_dataset_review_pair(dataset_dir, filename, mark_filter)
     except HTTPException:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1324,18 +1339,18 @@ async def redo_dataset_review_audio(dataset_dir: str = Form(...), filename: str 
 
 
 @app.post("/api/dataset-review/reset")
-def reset_dataset_review(dataset_dir: str = Form(...)) -> dict:
+def reset_dataset_review(dataset_dir: str = Form(...), mark_filter: str = Form("all")) -> dict:
     try:
         clear_dataset_review_state(dataset_dir)
-        return build_dataset_review_snapshot(dataset_dir)
+        return build_dataset_review_snapshot(dataset_dir, mark_filter=mark_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-review/deduplicate")
-def deduplicate_dataset_review(dataset_dir: str = Form(...)) -> dict:
+def deduplicate_dataset_review(dataset_dir: str = Form(...), mark_filter: str = Form("all")) -> dict:
     try:
-        return deduplicate_dataset_review_pairs(dataset_dir)
+        return deduplicate_dataset_review_pairs(dataset_dir, mark_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1354,6 +1369,18 @@ async def browse_batch_output_directory(initial_path: str = Form("")) -> dict:
             return {"cancelled": True}
         path = await asyncio.to_thread(register_batch_output_directory, selected)
         return {"cancelled": False, "path": str(path)}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/audio/mark")
+async def mark_generated_audio(
+    filename: str = Form(...),
+    marked: bool = Form(True),
+    exported_path: str = Form(""),
+) -> dict:
+    try:
+        return await asyncio.to_thread(set_generated_audio_mark, filename, marked, exported_path)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1838,6 +1865,7 @@ def _scan_dataset_review_index(directory: Path) -> DatasetReviewIndex:
         lab_files=lab_files,
         ordered_keys=sorted(audio_files, key=lambda key: audio_files[key].name.lower()),
         kept=_load_dataset_review_kept(directory, audio_files),
+        marked={},
     )
 
 
@@ -1877,6 +1905,27 @@ def _resolve_index_audio(index: DatasetReviewIndex, filename: str) -> tuple[str,
 def resolve_dataset_review_audio(dataset_dir: str | Path, filename: str) -> Path:
     index = get_dataset_review_index(dataset_dir)
     return _resolve_index_audio(index, filename)[1]
+
+
+def normalize_dataset_mark_filter(mark_filter: str) -> str:
+    value = str(mark_filter).strip().lower()
+    if value not in DATASET_MARK_FILTERS:
+        raise ValueError("标记筛选参数无效")
+    return value
+
+
+def _dataset_review_is_marked(index: DatasetReviewIndex, key: str) -> bool:
+    if key in index.marked:
+        return index.marked[key]
+    path = index.audio_files[key]
+    marked = False
+    if path.suffix.lower() == ".wav":
+        try:
+            marked = bool(read_wav_metadata(path).get("marked", False))
+        except (OSError, TypeError, ValueError):
+            pass
+    index.marked[key] = marked
+    return marked
 
 
 def dataset_review_redo_config(
@@ -1965,6 +2014,8 @@ def dataset_review_redo_config(
         "denoise": bool(metadata.get("denoise", False)),
         "optimize": bool(metadata.get("optimize_requested", metadata.get("optimize_effective", False))),
         "rotate_seed": metadata.get("seed_strategy") == "sequential",
+        "marked": bool(metadata.get("marked", False)),
+        "marked_at": metadata.get("marked_at"),
     }
 
 
@@ -1988,41 +2039,57 @@ def _dataset_review_item(
         "has_lab": lab_path is not None,
         "size_bytes": stat.st_size,
         "version": stat.st_mtime_ns,
+        "marked": _dataset_review_is_marked(index, key),
         "redo_supported": dataset_review_redo_config(index, key, available_lora_ids) is not None,
     }
 
 
-def _dataset_review_pending(index: DatasetReviewIndex) -> list[str]:
-    return [key for key in index.ordered_keys if key not in index.kept]
+def _dataset_review_pending(index: DatasetReviewIndex, mark_filter: str = "all") -> list[str]:
+    mark_filter = normalize_dataset_mark_filter(mark_filter)
+    pending = [key for key in index.ordered_keys if key not in index.kept]
+    if mark_filter == "marked":
+        return [key for key in pending if _dataset_review_is_marked(index, key)]
+    if mark_filter == "unmarked":
+        return [key for key in pending if not _dataset_review_is_marked(index, key)]
+    return pending
 
 
-def _dataset_review_counts(index: DatasetReviewIndex) -> dict:
+def _dataset_review_counts(index: DatasetReviewIndex, filtered_count: int | None = None) -> dict:
     pending_count = len(index.audio_files) - len(index.kept)
+    filtered_count = pending_count if filtered_count is None else filtered_count
     return {
         "confirmed_count": len(index.kept),
         "pending_count": pending_count,
         "total_count": len(index.audio_files),
+        "filtered_count": filtered_count,
         "window_size": DATASET_REVIEW_PAGE_SIZE,
-        "visible_count": min(pending_count, DATASET_REVIEW_PAGE_SIZE),
+        "visible_count": min(filtered_count, DATASET_REVIEW_PAGE_SIZE),
     }
 
 
-def build_dataset_review_snapshot(dataset_dir: str | Path, refresh: bool = False) -> dict:
+def build_dataset_review_snapshot(
+    dataset_dir: str | Path,
+    refresh: bool = False,
+    mark_filter: str = "all",
+) -> dict:
+    mark_filter = normalize_dataset_mark_filter(mark_filter)
     index = get_dataset_review_index(dataset_dir, refresh=refresh)
-    pending = _dataset_review_pending(index)
+    pending = _dataset_review_pending(index, mark_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     return {
         "directory": str(index.directory),
+        "mark_filter": mark_filter,
         "items": [
             _dataset_review_item(index, key, available_lora_ids)
             for key in pending[:DATASET_REVIEW_PAGE_SIZE]
         ],
-        **_dataset_review_counts(index),
+        **_dataset_review_counts(index, len(pending)),
     }
 
 
-def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str) -> dict:
-    pending = _dataset_review_pending(index)
+def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str, mark_filter: str = "all") -> dict:
+    mark_filter = normalize_dataset_mark_filter(mark_filter)
+    pending = _dataset_review_pending(index, mark_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     replacement = (
         _dataset_review_item(index, pending[DATASET_REVIEW_PAGE_SIZE - 1], available_lora_ids)
@@ -2031,22 +2098,31 @@ def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str) -> d
     )
     return {
         "directory": str(index.directory),
+        "mark_filter": mark_filter,
         "removed_filename": removed_filename,
         "replacement_item": replacement,
-        **_dataset_review_counts(index),
+        **_dataset_review_counts(index, len(pending)),
     }
 
 
-def mark_dataset_review_audio_kept(dataset_dir: str | Path, filename: str) -> dict:
+def mark_dataset_review_audio_kept(
+    dataset_dir: str | Path,
+    filename: str,
+    mark_filter: str = "all",
+) -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
         key, path = _resolve_index_audio(index, filename)
         _store_dataset_review_keep(index.directory, path.name)
         index.kept.add(key)
-        return _dataset_review_delta(index, path.name)
+        return _dataset_review_delta(index, path.name, mark_filter)
 
 
-def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
+def delete_dataset_review_pair(
+    dataset_dir: str | Path,
+    filename: str,
+    mark_filter: str = "all",
+) -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
         key, path = _resolve_index_audio(index, filename)
@@ -2059,7 +2135,8 @@ def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
         index.audio_files.pop(key, None)
         index.ordered_keys.remove(key)
         index.kept.discard(key)
-        return _dataset_review_delta(index, path.name)
+        index.marked.pop(key, None)
+        return _dataset_review_delta(index, path.name, mark_filter)
 
 
 def next_dataset_review_redo_seed(previous_seed: int) -> int:
@@ -2067,7 +2144,12 @@ def next_dataset_review_redo_seed(previous_seed: int) -> int:
     return candidate if candidate != previous_seed else (candidate + 1) % (2**32)
 
 
-async def redo_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
+async def redo_dataset_review_pair(
+    dataset_dir: str | Path,
+    filename: str,
+    mark_filter: str = "all",
+) -> dict:
+    mark_filter = normalize_dataset_mark_filter(mark_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
@@ -2120,8 +2202,11 @@ async def redo_dataset_review_pair(dataset_dir: str | Path, filename: str) -> di
                 "filename": original_path.name,
                 "redo_previous_seed": config["previous_seed"],
                 "redo_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "marked": config["marked"],
             }
         )
+        if config["marked_at"]:
+            regenerated_metadata["marked_at"] = config["marked_at"]
         write_wav_metadata(temporary_path, regenerated_metadata)
         with DATASET_REVIEW_CACHE_LOCK:
             index = get_dataset_review_index(dataset_dir)
@@ -2131,8 +2216,10 @@ async def redo_dataset_review_pair(dataset_dir: str | Path, filename: str) -> di
                 raise RuntimeError("重做期间原音频发生变化，已取消替换")
             temporary_path.replace(current_path)
             replaced = True
+            index.marked[key] = config["marked"]
             item = _dataset_review_item(index, key, available_lora_ids)
-            counts = _dataset_review_counts(index)
+            filtered_count = len(_dataset_review_pending(index, mark_filter))
+            counts = _dataset_review_counts(index, filtered_count)
     finally:
         temporary_path.unlink(missing_ok=True)
         generated_path.unlink(missing_ok=True)
@@ -2141,6 +2228,7 @@ async def redo_dataset_review_pair(dataset_dir: str | Path, filename: str) -> di
 
     return {
         "directory": str(index.directory),
+        "mark_filter": mark_filter,
         "item": item,
         "previous_seed": config["previous_seed"],
         "new_seed": new_seed,
@@ -2155,7 +2243,7 @@ def clear_dataset_review_state(dataset_dir: str | Path) -> None:
         index.kept.clear()
 
 
-def deduplicate_dataset_review_pairs(dataset_dir: str | Path) -> dict:
+def deduplicate_dataset_review_pairs(dataset_dir: str | Path, mark_filter: str = "all") -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir, refresh=True)
         lab_text_cache = {}
@@ -2197,7 +2285,7 @@ def deduplicate_dataset_review_pairs(dataset_dir: str | Path) -> dict:
         refreshed = _scan_dataset_review_index(index.directory)
         DATASET_REVIEW_INDEXES[str(index.directory).lower()] = refreshed
         return {
-            **build_dataset_review_snapshot(refreshed.directory),
+            **build_dataset_review_snapshot(refreshed.directory, mark_filter=mark_filter),
             "deleted_count": len(duplicate_names),
             "duplicate_groups": len(duplicate_texts),
         }
@@ -2209,6 +2297,44 @@ def _validated_output_audio(filename: str) -> Path:
     if safe_name != filename or path.suffix.lower() != ".wav" or not path.is_file():
         raise ValueError("Audio file not found")
     return path
+
+
+def _validated_exported_audio(path_value: str) -> Path:
+    path = Path(path_value).expanduser().resolve()
+    allowed_directories = {directory.resolve() for directory in _read_registered_batch_output_directories()}
+    allowed_directories.update(Path(item["path"]).resolve() for item in list_training_datasets())
+    if path.suffix.lower() != ".wav" or not path.is_file() or path.parent not in allowed_directories:
+        raise ValueError("导出音频不在已登记的保存目录中")
+    return path
+
+
+def set_generated_audio_mark(filename: str, marked: bool = True, exported_path: str = "") -> dict:
+    source_path = _validated_output_audio(filename)
+    targets = [source_path]
+    if exported_path.strip():
+        exported = _validated_exported_audio(exported_path)
+        if exported != source_path:
+            targets.append(exported)
+
+    marked_at = datetime.now().astimezone().isoformat(timespec="seconds") if marked else None
+    with AUDIO_METADATA_LOCK:
+        for path in targets:
+            metadata = read_wav_metadata(path)
+            if metadata.get("schema") != "voxcpm-generation-v1":
+                raise ValueError(f"音频缺少兼容的 VoxCPM 生成元数据: {path.name}")
+            metadata["marked"] = bool(marked)
+            if marked_at:
+                metadata["marked_at"] = marked_at
+            else:
+                metadata.pop("marked_at", None)
+            write_wav_metadata(path, metadata)
+            invalidate_dataset_review_index(path.parent)
+    return {
+        "filename": source_path.name,
+        "marked": bool(marked),
+        "marked_at": marked_at,
+        "updated_paths": [str(path) for path in targets],
+    }
 
 
 def _validate_postprocess_settings(settings: dict) -> None:
