@@ -401,8 +401,8 @@
     .session-count { color: var(--muted); font-size: 12px; font-weight: 400; }
     .clear-button { border: 0; background: transparent; color: var(--teal); font-size: 12px; padding: 5px; }
     .clear-button:disabled { color: #a4adb2; cursor: default; }
-    .dataset-target { display: grid; gap: 7px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
-    .dataset-target label { font-size: 11px; font-weight: 650; }
+    .dataset-target { display: grid; gap: 8px; padding: 13px 16px; border-bottom: 1px solid #b9d7ce; box-shadow: inset 4px 0 0 var(--green); background: #f1f9f6; }
+    .dataset-target label { color: #0f6848; font-size: 12px; font-weight: 750; }
     .dataset-target input { min-width: 0; height: 36px; font-size: 11px; }
     .dataset-target-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .dataset-target-status { min-width: 0; color: var(--green); font-size: 10px; text-align: right; overflow-wrap: anywhere; }
@@ -434,6 +434,12 @@
     .mark-audio:hover, .mark-audio.active { color: #d18b0d; }
     .mark-audio.active { text-decoration: underline; text-underline-offset: 3px; }
     .mark-audio:disabled { cursor: wait; opacity: 0.55; }
+    .perfect-audio { border: 0; background: transparent; color: #147a55; padding: 0; font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .perfect-audio:hover, .perfect-audio.active { color: #0b9a65; }
+    .perfect-audio.active { text-decoration: underline; text-underline-offset: 3px; }
+    .perfect-audio:disabled { cursor: wait; opacity: 0.55; }
+    .mark-audio.saved, .perfect-audio.saved { padding: 2px 5px; border-radius: 4px; background: #dff3eb; color: #0f6848; text-decoration: none; animation: label-saved 700ms ease-out; }
+    @keyframes label-saved { from { box-shadow: 0 0 0 4px rgba(20,122,85,.22); } to { box-shadow: 0 0 0 0 rgba(20,122,85,0); } }
     .move-training { border: 0; background: transparent; color: var(--green); padding: 0; font-size: 12px; font-weight: 700; white-space: nowrap; }
     .move-training:disabled { cursor: wait; opacity: 0.55; }
 
@@ -693,7 +699,7 @@
           <button class="clear-button" id="clearSession" type="button">清空</button>
         </div>
         <div class="dataset-target">
-          <div class="dataset-target-head"><label class="tooltip-trigger" for="trainingDataset" tabindex="0" data-tooltip="选择右侧音频移动到的训练集目录。移动时会从 WAV 元数据读取实际文本并生成同名 .lab；完全相同的音频不会重复加入。">目标训练集</label><span class="dataset-target-status" id="datasetTargetStatus" aria-live="polite"></span></div>
+          <div class="dataset-target-head"><label class="tooltip-trigger" for="trainingDataset" tabindex="0" data-tooltip="选择右侧音频复制到的训练集目录。复制时会从 WAV 元数据读取实际文本并生成同名 .lab；完全相同的音频不会重复加入。">复制的目标训练集文件夹</label><span class="dataset-target-status" id="datasetTargetStatus" aria-live="polite"></span></div>
           <div class="dataset-select-row"><input id="trainingDataset" type="text" readonly placeholder="选择目标训练集文件夹"><button class="dataset-browse" id="datasetBrowse" type="button">选择</button><button class="dataset-add-toggle tooltip-trigger" id="datasetAddToggle" type="button" aria-label="新增训练集" data-tooltip="快速创建一个新的训练集目录并立即选中。">+</button></div>
           <div class="dataset-create-row hidden" id="datasetCreateRow"><input id="datasetName" type="text" maxlength="80" autocomplete="off" placeholder="训练集名称" aria-label="新训练集名称"><button class="dataset-create-confirm" id="datasetCreateConfirm" type="button">创建</button><button class="dataset-create-cancel" id="datasetCreateCancel" type="button" aria-label="取消新增" title="取消">×</button></div>
         </div>
@@ -1233,70 +1239,85 @@
       }
     }
 
-    async function moveSessionItemToTraining(item, moveButton) {
+    async function copySessionItemToTraining(item, copyButton) {
       if (!trainingDataset.value) {
         message.className = "message error";
-        message.textContent = "请先选择目标训练集";
+        message.textContent = "请先选择复制的目标训练集文件夹";
         return;
       }
-      moveButton.disabled = true;
-      moveButton.textContent = "移动中";
+      copyButton.disabled = true;
+      copyButton.textContent = "复制中";
       const data = new FormData();
       data.set("filename", item.filename);
       data.set("dataset_dir", trainingDataset.value);
       try {
-        const response = await fetch("/api/training-datasets/move", { method: "POST", body: data });
+        const response = await fetch("/api/training-datasets/copy", { method: "POST", body: data });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || "移动失败");
-        sessionOutputs = sessionOutputs.filter((entry) => entry.filename !== item.filename);
+        if (!response.ok) throw new Error(result.detail || "复制失败");
+        item.exported_path = result.exported_path;
         saveSessionOutputs();
-        renderSessionOutputs();
-        if (currentOriginalOutput?.filename === item.filename) {
-          currentOriginalOutput = null;
-          audioPlayer.removeAttribute("src");
-          postprocessButton.disabled = true;
-        }
-        if (currentProcessedOutput?.filename === item.filename) resetProcessedOutput();
         message.className = "message";
-        message.textContent = `已移动到训练集 · ${result.filename} + ${result.lab_filename}`;
+        message.textContent = `已复制到训练集 · ${result.filename} + ${result.lab_filename}`;
         await loadTrainingDatasets();
       } catch (error) {
         message.className = "message error";
         message.textContent = error.message;
-        moveButton.disabled = false;
-        moveButton.textContent = "移动到训练集";
+      } finally {
+        copyButton.disabled = false;
+        copyButton.textContent = "复制";
       }
     }
 
-    function updateMarkButton(button, marked) {
-      button.classList.toggle("active", Boolean(marked));
-      button.textContent = marked ? "已标记" : "标记";
-      button.title = marked ? "取消本条音频的元数据标记" : "在本条音频元数据中写入 marked 标记";
-      button.setAttribute("aria-pressed", String(Boolean(marked)));
+    const audioLabelSettings = {
+      marked: { idle: "标记", active: "已标记", description: "标记" },
+      perfect: { idle: "完美", active: "已完美", description: "完美标记" },
+    };
+
+    function updateLabelButton(button, enabled, label) {
+      if (button.classList.contains("saved")) return;
+      const settings = audioLabelSettings[label];
+      button.classList.toggle("active", Boolean(enabled));
+      button.textContent = enabled ? settings.active : settings.idle;
+      button.title = enabled ? `取消本条音频的${settings.description}` : `写入本条音频的${settings.description}`;
+      button.setAttribute("aria-pressed", String(Boolean(enabled)));
     }
 
-    async function markSessionItem(item, markButton) {
-      const nextMarked = !Boolean(item.marked);
-      markButton.disabled = true;
+    function showLabelFeedback(button, enabled, label) {
+      window.clearTimeout(button._labelFeedbackTimer);
+      button.classList.add("saved");
+      button.textContent = enabled ? "已写入" : "已取消";
+      button._labelFeedbackTimer = window.setTimeout(() => {
+        button.classList.remove("saved");
+        updateLabelButton(button, enabled, label);
+      }, 900);
+    }
+
+    async function labelSessionItem(item, labelButton, label) {
+      const nextEnabled = !Boolean(item[label]);
+      const settings = audioLabelSettings[label];
+      labelButton.disabled = true;
       const data = new FormData();
       data.set("filename", item.filename);
-      data.set("marked", String(nextMarked));
+      data.set("label", label);
+      data.set("enabled", String(nextEnabled));
       if (item.exported_path) data.set("exported_path", item.exported_path);
       try {
-        const response = await fetch("/api/audio/mark", { method: "POST", body: data });
+        const response = await fetch("/api/audio/label", { method: "POST", body: data });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || "标记失败");
-        item.marked = result.marked;
-        item.marked_at = result.marked_at;
+        if (!response.ok) throw new Error(result.detail || `${settings.description}失败`);
+        item[label] = result.enabled;
+        item[`${label}_at`] = result[`${label}_at`];
         saveSessionOutputs();
-        updateMarkButton(markButton, item.marked);
+        showLabelFeedback(labelButton, item[label], label);
         message.className = "message";
-        message.textContent = item.marked ? `已标记 ${item.filename}` : `已取消标记 ${item.filename}`;
+        message.textContent = item[label]
+          ? `已写入${settings.description} · ${item.filename}`
+          : `已取消${settings.description} · ${item.filename}`;
       } catch (error) {
         message.className = "message error";
         message.textContent = error.message;
       } finally {
-        markButton.disabled = false;
+        labelButton.disabled = false;
       }
     }
 
@@ -1349,22 +1370,27 @@
 
       const actions = document.createElement("div");
       actions.className = "audio-item-actions";
+      const perfectButton = document.createElement("button");
+      perfectButton.className = "perfect-audio";
+      perfectButton.type = "button";
+      updateLabelButton(perfectButton, item.perfect, "perfect");
+      perfectButton.addEventListener("click", () => labelSessionItem(item, perfectButton, "perfect"));
       const markButton = document.createElement("button");
       markButton.className = "mark-audio";
       markButton.type = "button";
-      updateMarkButton(markButton, item.marked);
-      markButton.addEventListener("click", () => markSessionItem(item, markButton));
+      updateLabelButton(markButton, item.marked, "marked");
+      markButton.addEventListener("click", () => labelSessionItem(item, markButton, "marked"));
       const moveButton = document.createElement("button");
       moveButton.className = "move-training";
       moveButton.type = "button";
-      moveButton.textContent = "移动到训练集";
-      moveButton.addEventListener("click", () => moveSessionItemToTraining(item, moveButton));
+      moveButton.textContent = "复制";
+      moveButton.addEventListener("click", () => copySessionItemToTraining(item, moveButton));
       const download = document.createElement("a");
       download.className = "download";
       download.href = item.audio_url;
       download.download = item.filename;
       download.textContent = "下载 WAV";
-      actions.append(markButton, moveButton, download);
+      actions.append(perfectButton, markButton, moveButton, download);
       row.append(head, meta, player, actions);
       return row;
     }
@@ -1392,8 +1418,10 @@
       for (const item of sessionOutputs) {
         const row = existingRows.get(item.id) || createSessionOutputRow(item);
         if (row !== cursor) sessionList.insertBefore(row, cursor);
+        const perfectButton = row.querySelector(".perfect-audio");
+        if (perfectButton) updateLabelButton(perfectButton, item.perfect, "perfect");
         const markButton = row.querySelector(".mark-audio");
-        if (markButton) updateMarkButton(markButton, item.marked);
+        if (markButton) updateLabelButton(markButton, item.marked, "marked");
         cursor = row.nextElementSibling;
       }
     }

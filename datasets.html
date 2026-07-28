@@ -44,8 +44,10 @@
     .review-options { display: flex; align-items: center; gap: 18px; }
     .review-actions { display: flex; gap: 8px; }
     .toggle-row { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 12px; }
-    .review-filter { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; }
-    .review-filter select { width: 112px; height: 34px; font-size: 12px; }
+    .review-filter { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 12px; }
+    .filter-check { display: inline-flex; align-items: center; gap: 5px; padding: 6px 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); white-space: nowrap; }
+    .filter-check:has(input:checked) { border-color: #8fbcae; background: #f1f9f6; }
+    .filter-check input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); }
     .switch { position: relative; width: 42px; height: 24px; flex: 0 0 auto; }
     .switch input { position: absolute; opacity: 0; }
     .switch span { position: absolute; inset: 0; border-radius: 12px; background: #bdc5c9; transition: background 120ms; }
@@ -63,6 +65,7 @@
     .filename-line { display: flex; min-width: 0; align-items: center; gap: 7px; margin-bottom: 8px; }
     .filename { min-width: 0; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .marked-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #e0a532; border-radius: 3px; background: #fff8df; color: #a86400; font-size: 9px; font-weight: 700; }
+    .perfect-badge { flex: 0 0 auto; padding: 2px 5px; border: 1px solid #65a991; border-radius: 3px; background: #effaf6; color: #147a55; font-size: 9px; font-weight: 700; }
     audio { display: block; width: 100%; min-width: 0; max-width: 100%; height: 36px; }
     .spectrogram { display: block; width: 100%; height: 84px; margin-top: 8px; border: 1px solid #39484e; border-radius: 4px; background: #080d0f; }
     .spectrogram[data-state="queued"], .spectrogram[data-state="loading"] { background: linear-gradient(90deg,#080d0f 0%,#26363c 48%,#080d0f 100%); background-size: 200% 100%; animation: spectrum-loading 1.2s linear infinite; }
@@ -97,7 +100,8 @@
       .dataset-row { grid-template-columns: minmax(0,1fr) 1fr; }
       .dataset-row select { grid-column: 1 / -1; }
       .review-controls { align-items: stretch; flex-direction: column; }
-      .review-options { justify-content: space-between; }
+      .review-options { align-items: flex-start; flex-direction: column; }
+      .review-filter { width: 100%; flex-wrap: wrap; }
       .review-actions { display: grid; grid-template-columns: 1fr 1fr; }
       .review-actions button { width: 100%; padding: 0 8px; }
     }
@@ -121,7 +125,7 @@
         <div class="review-controls">
           <div class="review-options">
             <div class="toggle-row"><span class="tooltip-trigger" tabindex="0" data-tooltip="每次队列更新后自动播放当前最顶部的音频一次。浏览器阻止自动播放时，可先手动播放任意一条。">自动轮播</span><label class="switch"><input id="autoPlay" type="checkbox"><span></span></label></div>
-            <label class="review-filter"><span class="tooltip-trigger" tabindex="0" data-tooltip="按 WAV 元数据中的 marked 标记筛选整个待审核训练集，不只筛选当前显示的 40 条。">标记筛选</span><select id="markFilter"><option value="all">全部</option><option value="marked">已标记</option><option value="unmarked">未标记</option></select></label>
+            <div class="review-filter" role="group" aria-label="音频标签筛选"><span class="tooltip-trigger" tabindex="0" data-tooltip="按 WAV 元数据标签筛选整个待审核训练集。多个选项采用任一匹配；完美音频始终排在当前队列末尾。">筛选</span><label class="filter-check"><input class="label-filter" type="checkbox" value="marked" checked><span>标记</span></label><label class="filter-check"><input class="label-filter" type="checkbox" value="perfect" checked><span>完美</span></label><label class="filter-check"><input class="label-filter" type="checkbox" value="other" checked><span>其他</span></label></div>
           </div>
           <div class="review-actions">
             <button class="secondary tooltip-trigger" id="deduplicateButton" type="button" data-tooltip="按 LAB 去除 UTF-8 BOM 和首尾空白后的全文精确去重。每组保留文件名排序最前的一条，并删除其余真实音频及不再使用的 LAB。">快速去重</button>
@@ -148,7 +152,7 @@
     const deduplicateButton = document.getElementById("deduplicateButton");
     const resetButton = document.getElementById("resetButton");
     const autoPlay = document.getElementById("autoPlay");
-    const markFilter = document.getElementById("markFilter");
+    const labelFilters = [...document.querySelectorAll(".label-filter")];
     const status = document.getElementById("status");
     const directoryState = document.getElementById("directoryState");
     const queue = document.getElementById("queue");
@@ -156,7 +160,7 @@
     const confirmedCount = document.getElementById("confirmedCount");
     const pendingCount = document.getElementById("pendingCount");
     const totalCount = document.getElementById("totalCount");
-    const controls = [datasetSelect, browseButton, refreshButton, deduplicateButton, resetButton, markFilter];
+    const controls = [datasetSelect, browseButton, refreshButton, deduplicateButton, resetButton, ...labelFilters];
     const spectrumQueue = [];
     const spectrumConcurrency = 2;
     let spectrumActive = 0;
@@ -166,7 +170,8 @@
     function setBusy(busy) { controls.forEach((control) => { control.disabled = busy; }); }
     function setStatus(message, error = false) { status.textContent = message; status.classList.toggle("error", error); }
     function selectedDirectory() { return datasetSelect.value || ""; }
-    function selectedMarkFilter() { return markFilter.value || "all"; }
+    function selectedLabelFilter() { return labelFilters.filter((input) => input.checked).map((input) => input.value).join(","); }
+    function allLabelsSelected() { return labelFilters.every((input) => input.checked); }
     function formatSize(bytes) { return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`; }
 
     function fftMagnitude(samples) {
@@ -377,6 +382,12 @@
         badge.textContent = "已标记";
         filenameLine.append(badge);
       }
+      if (item.perfect) {
+        const badge = document.createElement("span");
+        badge.className = "perfect-badge";
+        badge.textContent = "完美";
+        filenameLine.append(badge);
+      }
       const audio = document.createElement("audio");
       audio.controls = true;
       audio.preload = "none";
@@ -409,7 +420,7 @@
       totalCount.textContent = result.total_count;
       const filteredCount = result.filtered_count ?? result.pending_count;
       const visibleCount = result.visible_count ?? Math.min(filteredCount, result.window_size);
-      queueNote.textContent = selectedMarkFilter() === "all"
+      queueNote.textContent = allLabelsSelected()
         ? (result.pending_count > visibleCount ? `显示队首 ${visibleCount} / ${result.pending_count} 条` : `${visibleCount} 条待审核`)
         : `当前筛选 ${visibleCount} / ${filteredCount} 条`;
       const selected = datasetSelect.selectedOptions[0];
@@ -418,7 +429,8 @@
 
     function renderSnapshot(snapshot, shouldPlay = true) {
       currentSnapshot = snapshot;
-      markFilter.value = snapshot.mark_filter || selectedMarkFilter();
+      const activeLabels = new Set(snapshot.label_filter || []);
+      labelFilters.forEach((input) => { input.checked = activeLabels.has(input.value); });
       updateCounts(snapshot);
       directoryState.textContent = snapshot.directory;
       if (spectrumObserver) spectrumObserver.disconnect();
@@ -428,7 +440,7 @@
         const empty = document.createElement("div");
         empty.className = "empty";
         empty.textContent = snapshot.filtered_count === 0 && snapshot.pending_count
-          ? "当前标记筛选下没有待审核音频"
+          ? "当前标签筛选下没有待审核音频"
           : snapshot.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
         queue.append(empty);
         return;
@@ -457,7 +469,7 @@
         const empty = document.createElement("div");
         empty.className = "empty";
         empty.textContent = result.filtered_count === 0 && result.pending_count
-          ? "当前标记筛选下没有待审核音频"
+          ? "当前标签筛选下没有待审核音频"
           : result.total_count ? "当前训练集已经全部确认" : "当前文件夹中没有支持的音频";
         queue.append(empty);
       }
@@ -470,7 +482,7 @@
       setBusy(true);
       setStatus("正在扫描训练集");
       try {
-        const params = new URLSearchParams({ dataset_dir: directory, refresh: String(forceScan), mark_filter: selectedMarkFilter() });
+        const params = new URLSearchParams({ dataset_dir: directory, refresh: String(forceScan), label_filter: selectedLabelFilter() });
         const snapshot = await readJson(await fetch(`/api/dataset-review?${params}`, { cache: "no-store" }), "训练集扫描失败");
         localStorage.setItem("voxcpm-review-dataset", snapshot.directory);
         renderSnapshot(snapshot, shouldPlay);
@@ -486,7 +498,7 @@
       const data = new FormData();
       data.set("dataset_dir", selectedDirectory());
       data.set("filename", filename);
-      data.set("mark_filter", selectedMarkFilter());
+      data.set("label_filter", selectedLabelFilter());
       try {
         const result = await readJson(await fetch(`/api/dataset-review/${action}`, { method: "POST", body: data }), "审核操作失败");
         applyReviewDelta(result);
@@ -502,7 +514,7 @@
       const data = new FormData();
       data.set("dataset_dir", selectedDirectory());
       data.set("filename", filename);
-      data.set("mark_filter", selectedMarkFilter());
+      data.set("label_filter", selectedLabelFilter());
       try {
         const result = await readJson(await fetch("/api/dataset-review/redo", { method: "POST", body: data }), "重做失败");
         const row = [...queue.querySelectorAll(".review-item")].find((item) => item.dataset.filename === filename);
@@ -530,7 +542,7 @@
     async function resetReview() {
       if (!selectedDirectory() || !confirm("重新审核当前训练集的全部音频？此操作不会删除文件。")) return;
       setBusy(true); setStatus("正在清除审核记录");
-      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("mark_filter", selectedMarkFilter());
+      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("label_filter", selectedLabelFilter());
       try {
         const snapshot = await readJson(await fetch("/api/dataset-review/reset", { method: "POST", body: data }), "重新审核失败");
         renderSnapshot(snapshot, true); setStatus("全部音频已重新进入待审核队列");
@@ -541,7 +553,7 @@
     async function deduplicateReview() {
       if (!selectedDirectory() || !confirm("按 LAB 全文精确去重？每组只保留文件名排序最前的一条，其余真实音频与不再使用的 LAB 将永久删除。")) return;
       setBusy(true); setStatus("正在扫描 LAB 并删除重复训练对");
-      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("mark_filter", selectedMarkFilter());
+      const data = new FormData(); data.set("dataset_dir", selectedDirectory()); data.set("label_filter", selectedLabelFilter());
       try {
         const result = await readJson(await fetch("/api/dataset-review/deduplicate", { method: "POST", body: data }), "快速去重失败");
         renderSnapshot(result, true);
@@ -567,10 +579,17 @@
     });
 
     datasetSelect.addEventListener("change", () => refreshReview(true));
-    markFilter.value = localStorage.getItem("voxcpm-review-mark-filter") || "all";
-    markFilter.addEventListener("change", () => {
-      localStorage.setItem("voxcpm-review-mark-filter", selectedMarkFilter());
-      refreshReview(true);
+    const storedLabelFilter = localStorage.getItem("voxcpm-review-label-filter");
+    const legacyMarkFilter = localStorage.getItem("voxcpm-review-mark-filter");
+    const initialLabels = new Set(storedLabelFilter !== null
+      ? storedLabelFilter.split(",").filter(Boolean)
+      : legacyMarkFilter === "marked" ? ["marked"] : legacyMarkFilter === "unmarked" ? ["perfect", "other"] : ["marked", "perfect", "other"]);
+    labelFilters.forEach((input) => {
+      input.checked = initialLabels.has(input.value);
+      input.addEventListener("change", () => {
+        localStorage.setItem("voxcpm-review-label-filter", selectedLabelFilter());
+        refreshReview(true);
+      });
     });
     browseButton.addEventListener("click", browseDataset);
     refreshButton.addEventListener("click", () => refreshReview(true, true));

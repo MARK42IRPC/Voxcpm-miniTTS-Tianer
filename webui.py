@@ -110,6 +110,7 @@ HYBRID_DEVICES = {"hybrid", "hybrid-max"}
 MAX_ORDINARY_INFERENCE_SEGMENTS = 100
 DATASET_REVIEW_PAGE_SIZE = 40
 DATASET_MARK_FILTERS = {"all", "marked", "unmarked"}
+DATASET_LABEL_CATEGORIES = ("marked", "perfect", "other")
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -132,7 +133,9 @@ class DatasetReviewIndex:
     lab_files: dict[str, Path]
     ordered_keys: list[str]
     kept: set[str]
-    marked: dict[str, bool]
+    labels: dict[str, tuple[bool, bool]]
+    label_versions: dict[str, tuple[int, int]]
+    metadata_cache: dict[str, dict | None]
 
 
 DATASET_REVIEW_INDEXES: dict[str, DatasetReviewIndex] = {}
@@ -1288,9 +1291,19 @@ async def browse_training_dataset(initial_path: str = Form("")) -> dict:
 
 
 @app.get("/api/dataset-review")
-def dataset_review(dataset_dir: str, refresh: bool = False, mark_filter: str = "all") -> dict:
+def dataset_review(
+    dataset_dir: str,
+    refresh: bool = False,
+    label_filter: str | None = None,
+    mark_filter: str = "all",
+) -> dict:
     try:
-        return build_dataset_review_snapshot(dataset_dir, refresh=refresh, mark_filter=mark_filter)
+        return build_dataset_review_snapshot(
+            dataset_dir,
+            refresh=refresh,
+            mark_filter=mark_filter,
+            label_filter=label_filter,
+        )
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1316,9 +1329,10 @@ def keep_dataset_review_audio(
     dataset_dir: str = Form(...),
     filename: str = Form(...),
     mark_filter: str = Form("all"),
+    label_filter: str | None = Form(None),
 ) -> dict:
     try:
-        return mark_dataset_review_audio_kept(dataset_dir, filename, mark_filter)
+        return mark_dataset_review_audio_kept(dataset_dir, filename, mark_filter, label_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1328,9 +1342,10 @@ def delete_dataset_review_audio(
     dataset_dir: str = Form(...),
     filename: str = Form(...),
     mark_filter: str = Form("all"),
+    label_filter: str | None = Form(None),
 ) -> dict:
     try:
-        return delete_dataset_review_pair(dataset_dir, filename, mark_filter)
+        return delete_dataset_review_pair(dataset_dir, filename, mark_filter, label_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1340,9 +1355,10 @@ async def redo_dataset_review_audio(
     dataset_dir: str = Form(...),
     filename: str = Form(...),
     mark_filter: str = Form("all"),
+    label_filter: str | None = Form(None),
 ) -> dict:
     try:
-        return await redo_dataset_review_pair(dataset_dir, filename, mark_filter)
+        return await redo_dataset_review_pair(dataset_dir, filename, mark_filter, label_filter)
     except HTTPException:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1350,18 +1366,26 @@ async def redo_dataset_review_audio(
 
 
 @app.post("/api/dataset-review/reset")
-def reset_dataset_review(dataset_dir: str = Form(...), mark_filter: str = Form("all")) -> dict:
+def reset_dataset_review(
+    dataset_dir: str = Form(...),
+    mark_filter: str = Form("all"),
+    label_filter: str | None = Form(None),
+) -> dict:
     try:
         clear_dataset_review_state(dataset_dir)
-        return build_dataset_review_snapshot(dataset_dir, mark_filter=mark_filter)
+        return build_dataset_review_snapshot(dataset_dir, mark_filter=mark_filter, label_filter=label_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset-review/deduplicate")
-def deduplicate_dataset_review(dataset_dir: str = Form(...), mark_filter: str = Form("all")) -> dict:
+def deduplicate_dataset_review(
+    dataset_dir: str = Form(...),
+    mark_filter: str = Form("all"),
+    label_filter: str | None = Form(None),
+) -> dict:
     try:
-        return deduplicate_dataset_review_pairs(dataset_dir, mark_filter)
+        return deduplicate_dataset_review_pairs(dataset_dir, mark_filter, label_filter)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1392,6 +1416,19 @@ async def mark_generated_audio(
 ) -> dict:
     try:
         return await asyncio.to_thread(set_generated_audio_mark, filename, marked, exported_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/audio/label")
+async def label_generated_audio(
+    filename: str = Form(...),
+    label: str = Form(...),
+    enabled: bool = Form(True),
+    exported_path: str = Form(""),
+) -> dict:
+    try:
+        return await asyncio.to_thread(set_generated_audio_label, filename, label, enabled, exported_path)
     except (OSError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1453,6 +1490,16 @@ async def postprocess_generated_audio(
 async def move_generated_audio(filename: str = Form(...), dataset_dir: str = Form(...)) -> dict:
     try:
         return await asyncio.to_thread(move_audio_to_training_dataset, filename, dataset_dir)
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail="本条已经存在于训练集") from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/training-datasets/copy")
+async def copy_generated_audio(filename: str = Form(...), dataset_dir: str = Form(...)) -> dict:
+    try:
+        return await asyncio.to_thread(copy_audio_to_training_dataset, filename, dataset_dir)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail="本条已经存在于训练集") from exc
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1798,6 +1845,11 @@ def _open_dataset_review_database() -> sqlite3.Connection:
         "dataset TEXT NOT NULL, filename TEXT NOT NULL, decision TEXT NOT NULL, updated_at REAL NOT NULL, "
         "PRIMARY KEY (dataset, filename))"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS audio_labels ("
+        "dataset TEXT NOT NULL, filename TEXT NOT NULL, size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, "
+        "marked INTEGER NOT NULL, perfect INTEGER NOT NULL, PRIMARY KEY (dataset, filename))"
+    )
     connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     migration = connection.execute("SELECT value FROM metadata WHERE key = 'legacy_json_v1'").fetchone()
     if migration is None:
@@ -1860,6 +1912,86 @@ def _clear_dataset_review_decisions(directory: Path) -> None:
         connection.execute("DELETE FROM decisions WHERE dataset = ?", (str(directory),))
 
 
+def _load_cached_dataset_labels(
+    directory: Path,
+    audio_files: dict[str, Path],
+) -> tuple[dict[str, tuple[bool, bool]], dict[str, tuple[int, int]]]:
+    directory_key = str(directory)
+    labels: dict[str, tuple[bool, bool]] = {}
+    versions: dict[str, tuple[int, int]] = {}
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        rows = connection.execute(
+            "SELECT filename, size_bytes, mtime_ns, marked, perfect FROM audio_labels WHERE dataset = ?",
+            (directory_key,),
+        ).fetchall()
+        cached = {str(row[0]).lower(): row for row in rows}
+        for key, path in audio_files.items():
+            row = cached.get(key)
+            if row is None:
+                continue
+            stat = path.stat()
+            identity = (stat.st_size, stat.st_mtime_ns)
+            if identity == (int(row[1]), int(row[2])):
+                labels[key] = (bool(row[3]), bool(row[4]))
+                versions[key] = identity
+        stale_filenames = [str(row[0]) for key, row in cached.items() if key not in audio_files]
+        if stale_filenames:
+            connection.executemany(
+                "DELETE FROM audio_labels WHERE dataset = ? AND filename = ?",
+                ((directory_key, filename) for filename in stale_filenames),
+            )
+    return labels, versions
+
+
+def _store_dataset_labels(
+    directory: Path,
+    rows: list[tuple[str, int, int, bool, bool]],
+) -> None:
+    if not rows:
+        return
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        connection.executemany(
+            "INSERT INTO audio_labels(dataset, filename, size_bytes, mtime_ns, marked, perfect) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(dataset, filename) DO UPDATE SET "
+            "size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, "
+            "marked = excluded.marked, perfect = excluded.perfect",
+            (
+                (str(directory), filename, size_bytes, mtime_ns, int(marked), int(perfect))
+                for filename, size_bytes, mtime_ns, marked, perfect in rows
+            ),
+        )
+
+
+def _dataset_review_metadata(index: DatasetReviewIndex, key: str) -> dict | None:
+    if key in index.metadata_cache:
+        return index.metadata_cache[key]
+    path = index.audio_files[key]
+    metadata = None
+    if path.suffix.lower() == ".wav":
+        try:
+            metadata = read_wav_metadata(path)
+        except (OSError, TypeError, ValueError):
+            pass
+    index.metadata_cache[key] = metadata
+    return metadata
+
+
+def _ensure_dataset_review_labels(index: DatasetReviewIndex, keys: list[str]) -> None:
+    updates = []
+    for key in keys:
+        if key in index.labels:
+            continue
+        path = index.audio_files[key]
+        stat = path.stat()
+        identity = (stat.st_size, stat.st_mtime_ns)
+        metadata = _dataset_review_metadata(index, key) or {}
+        labels = (bool(metadata.get("marked", False)), bool(metadata.get("perfect", False)))
+        index.labels[key] = labels
+        index.label_versions[key] = identity
+        updates.append((path.name, identity[0], identity[1], labels[0], labels[1]))
+    _store_dataset_labels(index.directory, updates)
+
+
 def _scan_dataset_review_index(directory: Path) -> DatasetReviewIndex:
     audio_files = {}
     lab_files = {}
@@ -1870,14 +2002,19 @@ def _scan_dataset_review_index(directory: Path) -> DatasetReviewIndex:
             audio_files[path.name.lower()] = path
         elif path.suffix.lower() == ".lab":
             lab_files[path.stem.lower()] = path
-    return DatasetReviewIndex(
+    labels, label_versions = _load_cached_dataset_labels(directory, audio_files)
+    index = DatasetReviewIndex(
         directory=directory,
         audio_files=audio_files,
         lab_files=lab_files,
         ordered_keys=sorted(audio_files, key=lambda key: audio_files[key].name.lower()),
         kept=_load_dataset_review_kept(directory, audio_files),
-        marked={},
+        labels=labels,
+        label_versions=label_versions,
+        metadata_cache={},
     )
+    _ensure_dataset_review_labels(index, index.ordered_keys)
+    return index
 
 
 def get_dataset_review_index(dataset_dir: str | Path, refresh: bool = False) -> DatasetReviewIndex:
@@ -1925,18 +2062,27 @@ def normalize_dataset_mark_filter(mark_filter: str) -> str:
     return value
 
 
-def _dataset_review_is_marked(index: DatasetReviewIndex, key: str) -> bool:
-    if key in index.marked:
-        return index.marked[key]
-    path = index.audio_files[key]
-    marked = False
-    if path.suffix.lower() == ".wav":
-        try:
-            marked = bool(read_wav_metadata(path).get("marked", False))
-        except (OSError, TypeError, ValueError):
-            pass
-    index.marked[key] = marked
-    return marked
+def normalize_dataset_label_filter(
+    label_filter: str | None = None,
+    mark_filter: str = "all",
+) -> tuple[str, ...]:
+    if label_filter is None:
+        legacy = normalize_dataset_mark_filter(mark_filter)
+        if legacy == "marked":
+            return ("marked",)
+        if legacy == "unmarked":
+            return ("perfect", "other")
+        return DATASET_LABEL_CATEGORIES
+    requested = {part.strip().lower() for part in str(label_filter).split(",") if part.strip()}
+    invalid = requested.difference(DATASET_LABEL_CATEGORIES)
+    if invalid:
+        raise ValueError("音频标签筛选参数无效")
+    return tuple(category for category in DATASET_LABEL_CATEGORIES if category in requested)
+
+
+def _dataset_review_labels(index: DatasetReviewIndex, key: str) -> tuple[bool, bool]:
+    _ensure_dataset_review_labels(index, [key])
+    return index.labels[key]
 
 
 def dataset_review_redo_config(
@@ -1949,7 +2095,9 @@ def dataset_review_redo_config(
     if path.suffix.lower() != ".wav" or lab_path is None:
         return None
     try:
-        metadata = read_wav_metadata(path)
+        metadata = _dataset_review_metadata(index, key)
+        if metadata is None:
+            return None
         transcript = lab_path.read_text(encoding="utf-8-sig").strip()
         text = str(metadata["text"]).strip()
         model_key = str(metadata["model_key"])
@@ -2027,6 +2175,8 @@ def dataset_review_redo_config(
         "rotate_seed": metadata.get("seed_strategy") == "sequential",
         "marked": bool(metadata.get("marked", False)),
         "marked_at": metadata.get("marked_at"),
+        "perfect": bool(metadata.get("perfect", False)),
+        "perfect_at": metadata.get("perfect_at"),
     }
 
 
@@ -2044,25 +2194,47 @@ def _dataset_review_item(
         except UnicodeDecodeError:
             text = "[LAB 文本编码无法读取]"
     stat = path.stat()
+    marked, perfect = _dataset_review_labels(index, key)
     return {
         "filename": path.name,
         "text": text,
         "has_lab": lab_path is not None,
         "size_bytes": stat.st_size,
         "version": stat.st_mtime_ns,
-        "marked": _dataset_review_is_marked(index, key),
+        "marked": marked,
+        "perfect": perfect,
         "redo_supported": dataset_review_redo_config(index, key, available_lora_ids) is not None,
     }
 
 
-def _dataset_review_pending(index: DatasetReviewIndex, mark_filter: str = "all") -> list[str]:
-    mark_filter = normalize_dataset_mark_filter(mark_filter)
+def _dataset_review_pending(
+    index: DatasetReviewIndex,
+    mark_filter: str = "all",
+    label_filter: str | None = None,
+) -> list[str]:
+    selected = set(normalize_dataset_label_filter(label_filter, mark_filter))
+    legacy_filter = normalize_dataset_mark_filter(mark_filter) if label_filter is None else None
     pending = [key for key in index.ordered_keys if key not in index.kept]
-    if mark_filter == "marked":
-        return [key for key in pending if _dataset_review_is_marked(index, key)]
-    if mark_filter == "unmarked":
-        return [key for key in pending if not _dataset_review_is_marked(index, key)]
-    return pending
+    _ensure_dataset_review_labels(index, pending)
+    regular = []
+    perfect_tail = []
+    for key in pending:
+        marked, perfect = index.labels[key]
+        if legacy_filter == "marked":
+            matches = marked
+        elif legacy_filter == "unmarked":
+            matches = not marked
+        elif legacy_filter == "all":
+            matches = True
+        else:
+            matches = (
+                (marked and "marked" in selected)
+                or (perfect and "perfect" in selected)
+                or (not marked and not perfect and "other" in selected)
+            )
+        if matches:
+            (perfect_tail if perfect else regular).append(key)
+    return regular + perfect_tail
 
 
 def _dataset_review_counts(index: DatasetReviewIndex, filtered_count: int | None = None) -> dict:
@@ -2082,14 +2254,16 @@ def build_dataset_review_snapshot(
     dataset_dir: str | Path,
     refresh: bool = False,
     mark_filter: str = "all",
+    label_filter: str | None = None,
 ) -> dict:
-    mark_filter = normalize_dataset_mark_filter(mark_filter)
+    selected = normalize_dataset_label_filter(label_filter, mark_filter)
     index = get_dataset_review_index(dataset_dir, refresh=refresh)
-    pending = _dataset_review_pending(index, mark_filter)
+    pending = _dataset_review_pending(index, mark_filter, label_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     return {
         "directory": str(index.directory),
-        "mark_filter": mark_filter,
+        "mark_filter": normalize_dataset_mark_filter(mark_filter),
+        "label_filter": list(selected),
         "items": [
             _dataset_review_item(index, key, available_lora_ids)
             for key in pending[:DATASET_REVIEW_PAGE_SIZE]
@@ -2098,9 +2272,14 @@ def build_dataset_review_snapshot(
     }
 
 
-def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str, mark_filter: str = "all") -> dict:
-    mark_filter = normalize_dataset_mark_filter(mark_filter)
-    pending = _dataset_review_pending(index, mark_filter)
+def _dataset_review_delta(
+    index: DatasetReviewIndex,
+    removed_filename: str,
+    mark_filter: str = "all",
+    label_filter: str | None = None,
+) -> dict:
+    selected = normalize_dataset_label_filter(label_filter, mark_filter)
+    pending = _dataset_review_pending(index, mark_filter, label_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     replacement = (
         _dataset_review_item(index, pending[DATASET_REVIEW_PAGE_SIZE - 1], available_lora_ids)
@@ -2109,7 +2288,8 @@ def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str, mark
     )
     return {
         "directory": str(index.directory),
-        "mark_filter": mark_filter,
+        "mark_filter": normalize_dataset_mark_filter(mark_filter),
+        "label_filter": list(selected),
         "removed_filename": removed_filename,
         "replacement_item": replacement,
         **_dataset_review_counts(index, len(pending)),
@@ -2120,19 +2300,21 @@ def mark_dataset_review_audio_kept(
     dataset_dir: str | Path,
     filename: str,
     mark_filter: str = "all",
+    label_filter: str | None = None,
 ) -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
         key, path = _resolve_index_audio(index, filename)
         _store_dataset_review_keep(index.directory, path.name)
         index.kept.add(key)
-        return _dataset_review_delta(index, path.name, mark_filter)
+        return _dataset_review_delta(index, path.name, mark_filter, label_filter)
 
 
 def delete_dataset_review_pair(
     dataset_dir: str | Path,
     filename: str,
     mark_filter: str = "all",
+    label_filter: str | None = None,
 ) -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
@@ -2146,8 +2328,10 @@ def delete_dataset_review_pair(
         index.audio_files.pop(key, None)
         index.ordered_keys.remove(key)
         index.kept.discard(key)
-        index.marked.pop(key, None)
-        return _dataset_review_delta(index, path.name, mark_filter)
+        index.labels.pop(key, None)
+        index.label_versions.pop(key, None)
+        index.metadata_cache.pop(key, None)
+        return _dataset_review_delta(index, path.name, mark_filter, label_filter)
 
 
 def next_dataset_review_redo_seed(previous_seed: int) -> int:
@@ -2159,8 +2343,9 @@ async def redo_dataset_review_pair(
     dataset_dir: str | Path,
     filename: str,
     mark_filter: str = "all",
+    label_filter: str | None = None,
 ) -> dict:
-    mark_filter = normalize_dataset_mark_filter(mark_filter)
+    selected = normalize_dataset_label_filter(label_filter, mark_filter)
     available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir)
@@ -2214,10 +2399,13 @@ async def redo_dataset_review_pair(
                 "redo_previous_seed": config["previous_seed"],
                 "redo_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "marked": config["marked"],
+                "perfect": config["perfect"],
             }
         )
         if config["marked_at"]:
             regenerated_metadata["marked_at"] = config["marked_at"]
+        if config["perfect_at"]:
+            regenerated_metadata["perfect_at"] = config["perfect_at"]
         write_wav_metadata(temporary_path, regenerated_metadata)
         with DATASET_REVIEW_CACHE_LOCK:
             index = get_dataset_review_index(dataset_dir)
@@ -2227,9 +2415,16 @@ async def redo_dataset_review_pair(
                 raise RuntimeError("重做期间原音频发生变化，已取消替换")
             temporary_path.replace(current_path)
             replaced = True
-            index.marked[key] = config["marked"]
+            index.metadata_cache[key] = regenerated_metadata
+            latest_stat = current_path.stat()
+            index.labels[key] = (config["marked"], config["perfect"])
+            index.label_versions[key] = (latest_stat.st_size, latest_stat.st_mtime_ns)
+            _store_dataset_labels(
+                index.directory,
+                [(current_path.name, latest_stat.st_size, latest_stat.st_mtime_ns, *index.labels[key])],
+            )
             item = _dataset_review_item(index, key, available_lora_ids)
-            filtered_count = len(_dataset_review_pending(index, mark_filter))
+            filtered_count = len(_dataset_review_pending(index, mark_filter, label_filter))
             counts = _dataset_review_counts(index, filtered_count)
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -2239,7 +2434,8 @@ async def redo_dataset_review_pair(
 
     return {
         "directory": str(index.directory),
-        "mark_filter": mark_filter,
+        "mark_filter": normalize_dataset_mark_filter(mark_filter),
+        "label_filter": list(selected),
         "item": item,
         "previous_seed": config["previous_seed"],
         "new_seed": new_seed,
@@ -2254,7 +2450,11 @@ def clear_dataset_review_state(dataset_dir: str | Path) -> None:
         index.kept.clear()
 
 
-def deduplicate_dataset_review_pairs(dataset_dir: str | Path, mark_filter: str = "all") -> dict:
+def deduplicate_dataset_review_pairs(
+    dataset_dir: str | Path,
+    mark_filter: str = "all",
+    label_filter: str | None = None,
+) -> dict:
     with DATASET_REVIEW_CACHE_LOCK:
         index = get_dataset_review_index(dataset_dir, refresh=True)
         lab_text_cache = {}
@@ -2296,7 +2496,11 @@ def deduplicate_dataset_review_pairs(dataset_dir: str | Path, mark_filter: str =
         refreshed = _scan_dataset_review_index(index.directory)
         DATASET_REVIEW_INDEXES[str(index.directory).lower()] = refreshed
         return {
-            **build_dataset_review_snapshot(refreshed.directory, mark_filter=mark_filter),
+            **build_dataset_review_snapshot(
+                refreshed.directory,
+                mark_filter=mark_filter,
+                label_filter=label_filter,
+            ),
             "deleted_count": len(duplicate_names),
             "duplicate_groups": len(duplicate_texts),
         }
@@ -2319,7 +2523,15 @@ def _validated_exported_audio(path_value: str) -> Path:
     return path
 
 
-def set_generated_audio_mark(filename: str, marked: bool = True, exported_path: str = "") -> dict:
+def set_generated_audio_label(
+    filename: str,
+    label: str,
+    enabled: bool = True,
+    exported_path: str = "",
+) -> dict:
+    label = str(label).strip().lower()
+    if label not in {"marked", "perfect"}:
+        raise ValueError("音频标签仅支持 marked 或 perfect")
     source_path = _validated_output_audio(filename)
     targets = [source_path]
     if exported_path.strip():
@@ -2327,25 +2539,32 @@ def set_generated_audio_mark(filename: str, marked: bool = True, exported_path: 
         if exported != source_path:
             targets.append(exported)
 
-    marked_at = datetime.now().astimezone().isoformat(timespec="seconds") if marked else None
+    timestamp_key = f"{label}_at"
+    tagged_at = datetime.now().astimezone().isoformat(timespec="seconds") if enabled else None
     with AUDIO_METADATA_LOCK:
         for path in targets:
             metadata = read_wav_metadata(path)
             if metadata.get("schema") != "voxcpm-generation-v1":
                 raise ValueError(f"音频缺少兼容的 VoxCPM 生成元数据: {path.name}")
-            metadata["marked"] = bool(marked)
-            if marked_at:
-                metadata["marked_at"] = marked_at
+            metadata[label] = bool(enabled)
+            if tagged_at:
+                metadata[timestamp_key] = tagged_at
             else:
-                metadata.pop("marked_at", None)
+                metadata.pop(timestamp_key, None)
             write_wav_metadata(path, metadata)
             invalidate_dataset_review_index(path.parent)
     return {
         "filename": source_path.name,
-        "marked": bool(marked),
-        "marked_at": marked_at,
+        "label": label,
+        "enabled": bool(enabled),
+        label: bool(enabled),
+        timestamp_key: tagged_at,
         "updated_paths": [str(path) for path in targets],
     }
+
+
+def set_generated_audio_mark(filename: str, marked: bool = True, exported_path: str = "") -> dict:
+    return set_generated_audio_label(filename, "marked", marked, exported_path)
 
 
 def _validate_postprocess_settings(settings: dict) -> None:
@@ -2487,7 +2706,7 @@ def postprocess_audio(source_path: Path, settings: dict) -> dict:
     }
 
 
-def move_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
+def _transfer_audio_to_training_dataset(filename: str, dataset_dir: str, copy_source: bool) -> dict:
     source_path = _validated_output_audio(filename)
     allowed_datasets = {str(Path(item["path"]).resolve()).lower(): Path(item["path"]).resolve() for item in list_training_datasets()}
     requested_key = str(Path(dataset_dir).expanduser().resolve()).lower()
@@ -2510,14 +2729,22 @@ def move_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
         destination_path = destination_dir / f"{source_path.stem}-{counter:02d}.wav"
         counter += 1
     lab_path = destination_path.with_suffix(".lab")
-    temporary_lab = destination_dir / f".{lab_path.name}.tmp"
+    temporary_lab = destination_dir / f".{lab_path.name}.{time.time_ns():x}.tmp"
+    temporary_audio = destination_dir / f".{destination_path.name}.{time.time_ns():x}.tmp"
     temporary_lab.write_text(transcript, encoding="utf-8")
     try:
-        shutil.move(str(source_path), str(destination_path))
+        if copy_source:
+            shutil.copy2(source_path, temporary_audio)
+            temporary_audio.replace(destination_path)
+        else:
+            shutil.move(str(source_path), str(destination_path))
         temporary_lab.replace(lab_path)
     except Exception:
         temporary_lab.unlink(missing_ok=True)
-        if destination_path.is_file() and not source_path.exists():
+        temporary_audio.unlink(missing_ok=True)
+        if copy_source:
+            destination_path.unlink(missing_ok=True)
+        elif destination_path.is_file() and not source_path.exists():
             shutil.move(str(destination_path), str(source_path))
         raise
     invalidate_dataset_review_index(destination_dir)
@@ -2525,8 +2752,17 @@ def move_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
         "filename": destination_path.name,
         "lab_filename": lab_path.name,
         "dataset": str(destination_dir),
+        "exported_path": str(destination_path),
         "text": transcript,
     }
+
+
+def move_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
+    return _transfer_audio_to_training_dataset(filename, dataset_dir, copy_source=False)
+
+
+def copy_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
+    return _transfer_audio_to_training_dataset(filename, dataset_dir, copy_source=True)
 
 
 def timestamped_output_path(created_at: datetime) -> Path:

@@ -1027,6 +1027,32 @@ def test_move_audio_creates_lab_and_rejects_duplicate_pcm(monkeypatch, tmp_path)
     assert duplicate.is_file()
 
 
+def test_copy_audio_creates_training_pair_and_preserves_source(monkeypatch, tmp_path):
+    output_root = tmp_path / "outputs"
+    dataset_root = tmp_path / "dataset"
+    output_root.mkdir()
+    dataset_root.mkdir()
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(
+        webui,
+        "list_training_datasets",
+        lambda: [{"name": "test", "path": str(dataset_root), "file_count": 0, "default": True}],
+    )
+    source = output_root / "source.wav"
+    sf.write(source, np.linspace(-0.2, 0.2, 1600, dtype=np.float32), 16000)
+    webui.write_wav_metadata(
+        source,
+        {"created_at": "2026-07-28T18:00:00+08:00", "text": "复制训练文本。"},
+    )
+
+    result = webui.copy_audio_to_training_dataset(source.name, str(dataset_root))
+
+    assert source.is_file()
+    assert (dataset_root / result["filename"]).is_file()
+    assert Path(result["exported_path"]) == dataset_root / result["filename"]
+    assert (dataset_root / result["lab_filename"]).read_text(encoding="utf-8") == "复制训练文本。"
+
+
 def test_create_training_dataset_builds_standard_layout(monkeypatch, tmp_path):
     monkeypatch.setattr(webui, "TRAINING_DATASET_ROOT", tmp_path)
 
@@ -1354,6 +1380,62 @@ def test_dataset_review_filters_all_pending_audio_by_metadata_mark(monkeypatch, 
     assert invalid.status_code == 400
 
 
+def test_dataset_review_label_filters_and_sorts_perfect_audio_last(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    monkeypatch.setitem(webui.MODEL_PATHS, "voxcpm-0.5b", model_dir)
+    create_redo_test_pair(dataset_dir, "a.wav", marked=True)
+    create_redo_test_pair(dataset_dir, "b.wav", perfect=True)
+    create_redo_test_pair(dataset_dir, "c.wav", marked=True, perfect=True)
+    create_redo_test_pair(dataset_dir, "d.wav")
+    client = TestClient(webui.app)
+
+    def filenames(label_filter):
+        response = client.get(
+            "/api/dataset-review",
+            params={"dataset_dir": str(dataset_dir), "label_filter": label_filter},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    all_items = filenames("marked,perfect,other")
+    assert [item["filename"] for item in all_items["items"]] == ["a.wav", "d.wav", "b.wav", "c.wav"]
+    assert all_items["label_filter"] == ["marked", "perfect", "other"]
+    assert [item["filename"] for item in filenames("marked")["items"]] == ["a.wav", "c.wav"]
+    assert [item["filename"] for item in filenames("perfect")["items"]] == ["b.wav", "c.wav"]
+    assert [item["filename"] for item in filenames("other")["items"]] == ["d.wav"]
+    assert [item["filename"] for item in filenames("marked,perfect")["items"]] == ["a.wav", "b.wav", "c.wav"]
+    assert filenames("")["items"] == []
+
+
+def test_dataset_review_label_cache_reuses_metadata_and_invalidates_on_file_change(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    path, metadata = create_redo_test_pair(dataset_dir, "cached.wav", marked=True)
+    original_reader = webui.read_wav_metadata
+    calls = []
+
+    def tracking_reader(audio_path):
+        calls.append(Path(audio_path))
+        return original_reader(audio_path)
+
+    monkeypatch.setattr(webui, "read_wav_metadata", tracking_reader)
+    first = webui.get_dataset_review_index(dataset_dir, refresh=True)
+    assert first.labels["cached.wav"] == (True, False)
+    assert calls == [path]
+
+    webui.DATASET_REVIEW_INDEXES.clear()
+    second = webui.get_dataset_review_index(dataset_dir, refresh=True)
+    assert second.labels["cached.wav"] == (True, False)
+    assert calls == [path]
+
+    webui.write_wav_metadata(path, {**metadata, "marked": True, "perfect": True})
+    webui.DATASET_REVIEW_INDEXES.clear()
+    changed = webui.get_dataset_review_index(dataset_dir, refresh=True)
+    assert changed.labels["cached.wav"] == (True, True)
+    assert calls == [path, path]
+
+
 def test_generated_audio_mark_updates_cache_and_registered_export(monkeypatch, tmp_path):
     output_root = tmp_path / "outputs"
     export_root = tmp_path / "export"
@@ -1402,6 +1484,49 @@ def test_generated_audio_mark_updates_cache_and_registered_export(monkeypatch, t
         assert "marked_at" not in latest
 
 
+def test_generated_audio_perfect_label_updates_cache_and_registered_export(monkeypatch, tmp_path):
+    output_root = tmp_path / "outputs"
+    export_root = tmp_path / "export"
+    output_root.mkdir()
+    export_root.mkdir()
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui, "BATCH_OUTPUT_DIRECTORY_REGISTRY", tmp_path / "batch-output-directories.json")
+    webui.register_batch_output_directory(export_root)
+    metadata = {
+        "schema": "voxcpm-generation-v1",
+        "created_at": "2026-07-28T18:00:00+08:00",
+        "text": "完美标记测试。",
+    }
+    paths = (output_root / "sample.wav", export_root / "sample.wav")
+    for path in paths:
+        sf.write(path, np.full(800, 0.1, dtype=np.float32), 16000)
+        webui.write_wav_metadata(path, metadata)
+
+    client = TestClient(webui.app)
+    tagged_response = client.post(
+        "/api/audio/label",
+        data={"filename": "sample.wav", "label": "perfect", "enabled": "true", "exported_path": str(paths[1])},
+    )
+    tagged = tagged_response.json()
+    assert tagged_response.status_code == 200
+    assert tagged["perfect"] is True
+    assert tagged["perfect_at"]
+    for path in paths:
+        latest = webui.read_wav_metadata(path)
+        assert latest["perfect"] is True
+        assert latest["perfect_at"] == tagged["perfect_at"]
+
+    cleared_response = client.post(
+        "/api/audio/label",
+        data={"filename": "sample.wav", "label": "perfect", "enabled": "false", "exported_path": str(paths[1])},
+    )
+    assert cleared_response.status_code == 200
+    for path in paths:
+        latest = webui.read_wav_metadata(path)
+        assert latest["perfect"] is False
+        assert "perfect_at" not in latest
+
+
 def test_web_session_output_updates_reuse_existing_audio_nodes():
     source = webui.WEB_PAGE.read_text(encoding="utf-8")
     render = source[source.index("function renderSessionOutputs()") : source.index("function addSessionOutputs")]
@@ -1421,6 +1546,12 @@ def test_web_session_output_updates_reuse_existing_audio_nodes():
     assert ".audio-item.playing" in source
     assert "setSessionRowPlaying(row, true)" in source
     assert 'row.setAttribute("aria-current", "true")' in source
+    session_row = source[source.index("function createSessionOutputRow") : source.index("function renderSessionOutputs")]
+    assert session_row.index('perfectButton.className = "perfect-audio"') < session_row.index('markButton.className = "mark-audio"')
+    assert 'actions.append(perfectButton, markButton, moveButton, download)' in source
+    assert 'showLabelFeedback(labelButton, item[label], label)' in source
+    assert '复制的目标训练集文件夹' in source
+    assert 'fetch("/api/training-datasets/copy"' in source
 
 
 def test_wav_metadata_reader_uses_latest_appended_metadata(tmp_path):
@@ -1452,6 +1583,8 @@ def test_dataset_review_redo_changes_only_seed_and_atomically_replaces_audio(mon
         optimize_requested=True,
         marked=True,
         marked_at="2026-07-28T18:02:00+08:00",
+        perfect=True,
+        perfect_at="2026-07-28T18:03:00+08:00",
     )
     captured = {}
 
@@ -1531,6 +1664,8 @@ def test_dataset_review_redo_changes_only_seed_and_atomically_replaces_audio(mon
     assert replaced_metadata["redo_previous_seed"] == 42
     assert replaced_metadata["marked"] is True
     assert replaced_metadata["marked_at"] == "2026-07-28T18:02:00+08:00"
+    assert replaced_metadata["perfect"] is True
+    assert replaced_metadata["perfect_at"] == "2026-07-28T18:03:00+08:00"
     assert not (output_root / "generated.wav").exists()
     assert webui.inference_job.snapshot()["status"] == "idle"
 
