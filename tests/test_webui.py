@@ -977,8 +977,10 @@ def configure_dataset_review_test(monkeypatch, tmp_path):
     dataset_dir.mkdir(parents=True)
     monkeypatch.setattr(webui, "TRAINING_DATASET_REGISTRY", tmp_path / "training-datasets.json")
     monkeypatch.setattr(webui, "DATASET_REVIEW_STATE", tmp_path / "dataset-review-state.json")
+    monkeypatch.setattr(webui, "DATASET_REVIEW_DATABASE", tmp_path / "dataset-review.sqlite3")
     monkeypatch.setattr(webui, "DEFAULT_TRAINING_DATASET", tmp_path / "missing")
     monkeypatch.setattr(webui, "TRAINING_DATASET_ROOT", tmp_path / "audio-root")
+    webui.DATASET_REVIEW_INDEXES.clear()
     webui.register_training_dataset(dataset_dir)
     return dataset_dir
 
@@ -995,17 +997,33 @@ def test_dataset_review_keep_persists_and_updates_statistics(monkeypatch, tmp_pa
         "/api/dataset-review/keep",
         data={"dataset_dir": str(dataset_dir), "filename": "first.wav"},
     )
-    refreshed = client.get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
-
     assert initial.status_code == 200
     assert initial.json()["total_count"] == 2
     assert [item["filename"] for item in initial.json()["items"]] == ["first.wav", "second.wav"]
     assert kept.json()["confirmed_count"] == 1
     assert kept.json()["pending_count"] == 1
+    assert kept.json()["removed_filename"] == "first.wav"
+    assert kept.json()["replacement_item"] is None
+    webui.invalidate_dataset_review_index(dataset_dir)
+    refreshed = client.get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
     assert [item["filename"] for item in refreshed.json()["items"]] == ["second.wav"]
-    assert json.loads(webui.DATASET_REVIEW_STATE.read_text(encoding="utf-8"))[str(dataset_dir.resolve())] == [
-        "first.wav"
-    ]
+    with webui.sqlite3.connect(webui.DATASET_REVIEW_DATABASE) as connection:
+        assert connection.execute("SELECT filename FROM decisions").fetchall() == [("first.wav",)]
+
+
+def test_dataset_review_migrates_legacy_json_state(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    sf.write(dataset_dir / "sample.wav", np.zeros(800, dtype=np.float32), 16000)
+    webui.DATASET_REVIEW_STATE.write_text(
+        json.dumps({str(dataset_dir.resolve()): ["sample.wav"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    response = TestClient(webui.app).get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
+
+    assert response.status_code == 200
+    assert response.json()["confirmed_count"] == 1
+    assert response.json()["pending_count"] == 0
 
 
 def test_dataset_review_delete_removes_audio_and_matching_lab(monkeypatch, tmp_path):
@@ -1059,6 +1077,62 @@ def test_dataset_review_reset_returns_kept_audio_to_queue(monkeypatch, tmp_path)
     assert response.json()["confirmed_count"] == 0
     assert response.json()["pending_count"] == 1
     assert response.json()["items"][0]["filename"] == "sample.wav"
+
+
+def test_dataset_review_action_uses_cache_and_returns_one_replacement(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    monkeypatch.setattr(webui, "DATASET_REVIEW_PAGE_SIZE", 2)
+    for name in ("a.wav", "b.wav", "c.wav"):
+        sf.write(dataset_dir / name, np.zeros(800, dtype=np.float32), 16000)
+        (dataset_dir / Path(name).with_suffix(".lab")).write_text(name, encoding="utf-8")
+    client = TestClient(webui.app)
+    initial = client.get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
+    monkeypatch.setattr(
+        webui,
+        "_scan_dataset_review_index",
+        lambda directory: pytest.fail("incremental action must not rescan the dataset"),
+    )
+
+    response = client.post(
+        "/api/dataset-review/keep",
+        data={"dataset_dir": str(dataset_dir), "filename": "a.wav"},
+    )
+
+    assert initial.status_code == 200
+    assert [item["filename"] for item in initial.json()["items"]] == ["a.wav", "b.wav"]
+    assert response.status_code == 200
+    assert response.json()["replacement_item"]["filename"] == "c.wav"
+    assert response.json()["visible_count"] == 2
+
+
+def test_dataset_review_deduplicate_keeps_first_equal_lab_pair(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    samples = {
+        "a.wav": "重复文本。",
+        "b.wav": "\ufeff重复文本。  \n",
+        "c.wav": "唯一文本。",
+        "missing.wav": None,
+    }
+    for name, text in samples.items():
+        sf.write(dataset_dir / name, np.zeros(800, dtype=np.float32), 16000)
+        if text is not None:
+            (dataset_dir / Path(name).with_suffix(".lab")).write_text(text, encoding="utf-8")
+
+    response = TestClient(webui.app).post(
+        "/api/dataset-review/deduplicate",
+        data={"dataset_dir": str(dataset_dir)},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+    assert response.json()["duplicate_groups"] == 1
+    assert response.json()["total_count"] == 3
+    assert (dataset_dir / "a.wav").is_file()
+    assert (dataset_dir / "a.lab").is_file()
+    assert not (dataset_dir / "b.wav").exists()
+    assert not (dataset_dir / "b.lab").exists()
+    assert (dataset_dir / "c.wav").is_file()
+    assert (dataset_dir / "missing.wav").is_file()
 
 
 def test_batch_output_directory_registry_persists_last_selection(monkeypatch, tmp_path):

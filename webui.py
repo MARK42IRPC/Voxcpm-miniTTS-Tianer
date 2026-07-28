@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import struct
 import sys
@@ -17,6 +18,7 @@ import threading
 import time
 import zipfile
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +95,8 @@ TRAINING_DATASET_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / "
 TRAINING_DATASET_REGISTRY_LOCK = threading.RLock()
 DATASET_REVIEW_STATE = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "dataset-review-state.json"
 DATASET_REVIEW_STATE_LOCK = threading.RLock()
+DATASET_REVIEW_DATABASE = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "dataset-review.sqlite3"
+DATASET_REVIEW_CACHE_LOCK = threading.RLock()
 BATCH_OUTPUT_DIRECTORY_REGISTRY = Path(os.environ.get("VOXCPM_CACHE_DIR", str(ROOT / ".cache"))) / "batch-output-directories.json"
 BATCH_OUTPUT_DIRECTORY_REGISTRY_LOCK = threading.RLock()
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -103,7 +107,7 @@ VOXCPM2_MIN_GPU_MEMORY = 7 * 1024**3
 HYBRID_MAX_GENERATION_LENGTH = 1024
 HYBRID_DEVICES = {"hybrid", "hybrid-max"}
 MAX_ORDINARY_INFERENCE_SEGMENTS = 100
-DATASET_REVIEW_PAGE_SIZE = 200
+DATASET_REVIEW_PAGE_SIZE = 40
 LORA_2B_MIN_GPU_MEMORY = 8 * 1024**3
 
 
@@ -117,6 +121,18 @@ class ModelConfig:
 
 class BatchOutputError(RuntimeError):
     pass
+
+
+@dataclass
+class DatasetReviewIndex:
+    directory: Path
+    audio_files: dict[str, Path]
+    lab_files: dict[str, Path]
+    ordered_keys: list[str]
+    kept: set[str]
+
+
+DATASET_REVIEW_INDEXES: dict[str, DatasetReviewIndex] = {}
 
 
 class InferenceJobRuntime:
@@ -1251,9 +1267,9 @@ async def browse_training_dataset(initial_path: str = Form("")) -> dict:
 
 
 @app.get("/api/dataset-review")
-def dataset_review(dataset_dir: str) -> dict:
+def dataset_review(dataset_dir: str, refresh: bool = False) -> dict:
     try:
-        return build_dataset_review_snapshot(dataset_dir)
+        return build_dataset_review_snapshot(dataset_dir, refresh=refresh)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1277,8 +1293,7 @@ def dataset_review_audio(dataset_dir: str, filename: str) -> FileResponse:
 @app.post("/api/dataset-review/keep")
 def keep_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
     try:
-        mark_dataset_review_audio_kept(dataset_dir, filename)
-        return build_dataset_review_snapshot(dataset_dir)
+        return mark_dataset_review_audio_kept(dataset_dir, filename)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1286,8 +1301,7 @@ def keep_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form
 @app.post("/api/dataset-review/delete")
 def delete_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
     try:
-        delete_dataset_review_pair(dataset_dir, filename)
-        return build_dataset_review_snapshot(dataset_dir)
+        return delete_dataset_review_pair(dataset_dir, filename)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1297,6 +1311,14 @@ def reset_dataset_review(dataset_dir: str = Form(...)) -> dict:
     try:
         clear_dataset_review_state(dataset_dir)
         return build_dataset_review_snapshot(dataset_dir)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/dataset-review/deduplicate")
+def deduplicate_dataset_review(dataset_dir: str = Form(...)) -> dict:
+    try:
+        return deduplicate_dataset_review_pairs(dataset_dir)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1660,7 +1682,7 @@ def resolve_registered_batch_output_directory(directory: str) -> Path:
         raise ValueError("批量保存目录未通过文件夹选择器登记") from exc
 
 
-def list_training_datasets() -> list[dict]:
+def discover_training_dataset_directories() -> set[Path]:
     candidates = {DEFAULT_TRAINING_DATASET.resolve()}
     candidates.update(_read_registered_training_datasets())
     audio_root = TRAINING_DATASET_ROOT
@@ -1668,12 +1690,18 @@ def list_training_datasets() -> list[dict]:
         candidates.update(path.resolve() for path in audio_root.glob("*/train/wavs") if path.is_dir())
     for manifest in LORA_ROOT.glob("*/train.jsonl"):
         try:
-            first_line = next(line for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip())
+            with manifest.open(encoding="utf-8") as source:
+                first_line = next(line for line in source if line.strip())
             audio_path = Path(json.loads(first_line)["audio"]).resolve()
             if audio_path.parent.is_dir():
                 candidates.add(audio_path.parent)
         except (StopIteration, KeyError, OSError, json.JSONDecodeError):
             continue
+    return {path for path in candidates if path.is_dir()}
+
+
+def list_training_datasets() -> list[dict]:
+    candidates = discover_training_dataset_directories()
 
     datasets = []
     for path in sorted(candidates, key=lambda item: str(item).lower()):
@@ -1693,77 +1721,144 @@ def list_training_datasets() -> list[dict]:
 
 def resolve_registered_training_dataset(directory: str | Path) -> Path:
     requested = Path(directory).expanduser().resolve()
-    registered = {item["path"].lower(): Path(item["path"]) for item in list_training_datasets()}
+    registered = {str(path).lower(): path for path in discover_training_dataset_directories()}
     try:
         return registered[str(requested).lower()]
     except KeyError as exc:
         raise ValueError("训练集目录未通过文件夹选择器登记") from exc
 
 
-def _read_dataset_review_state() -> dict[str, list[str]]:
-    with DATASET_REVIEW_STATE_LOCK:
-        if not DATASET_REVIEW_STATE.is_file():
-            return {}
-        try:
-            value = json.loads(DATASET_REVIEW_STATE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-    if not isinstance(value, dict):
-        return {}
-    return {
-        str(directory): [str(filename) for filename in filenames if isinstance(filename, str)]
-        for directory, filenames in value.items()
-        if isinstance(filenames, list)
-    }
+def _open_dataset_review_database() -> sqlite3.Connection:
+    DATASET_REVIEW_DATABASE.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATASET_REVIEW_DATABASE, timeout=10)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS decisions ("
+        "dataset TEXT NOT NULL, filename TEXT NOT NULL, decision TEXT NOT NULL, updated_at REAL NOT NULL, "
+        "PRIMARY KEY (dataset, filename))"
+    )
+    connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    migration = connection.execute("SELECT value FROM metadata WHERE key = 'legacy_json_v1'").fetchone()
+    if migration is None:
+        legacy_state = {}
+        if DATASET_REVIEW_STATE.is_file():
+            try:
+                value = json.loads(DATASET_REVIEW_STATE.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    legacy_state = value
+            except (OSError, json.JSONDecodeError):
+                pass
+        now = time.time()
+        for directory, filenames in legacy_state.items():
+            if not isinstance(filenames, list):
+                continue
+            connection.executemany(
+                "INSERT OR IGNORE INTO decisions(dataset, filename, decision, updated_at) VALUES (?, ?, 'keep', ?)",
+                ((str(directory), str(filename), now) for filename in filenames if isinstance(filename, str)),
+            )
+        connection.execute("INSERT INTO metadata(key, value) VALUES ('legacy_json_v1', 'done')")
+        connection.commit()
+    return connection
 
 
-def _write_dataset_review_state(state: dict[str, list[str]]) -> None:
-    with DATASET_REVIEW_STATE_LOCK:
-        DATASET_REVIEW_STATE.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = DATASET_REVIEW_STATE.with_suffix(".tmp")
-        temporary_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary_path.replace(DATASET_REVIEW_STATE)
+def _load_dataset_review_kept(directory: Path, audio_files: dict[str, Path]) -> set[str]:
+    directory_key = str(directory)
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        rows = connection.execute(
+            "SELECT filename FROM decisions WHERE dataset = ? AND decision = 'keep'",
+            (directory_key,),
+        ).fetchall()
+        kept = {filename.lower() for (filename,) in rows if filename.lower() in audio_files}
+        stale = [(directory_key, filename) for (filename,) in rows if filename.lower() not in audio_files]
+        if stale:
+            connection.executemany("DELETE FROM decisions WHERE dataset = ? AND filename = ?", stale)
+    return kept
 
 
-def _dataset_audio_files(dataset_dir: Path) -> list[Path]:
-    return sorted(
-        (
-            path
-            for path in dataset_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in ALLOWED_AUDIO_SUFFIXES
-        ),
-        key=lambda path: path.name.lower(),
+def _store_dataset_review_keep(directory: Path, filename: str) -> None:
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        connection.execute(
+            "INSERT INTO decisions(dataset, filename, decision, updated_at) VALUES (?, ?, 'keep', ?) "
+            "ON CONFLICT(dataset, filename) DO UPDATE SET decision = 'keep', updated_at = excluded.updated_at",
+            (str(directory), filename, time.time()),
+        )
+
+
+def _remove_dataset_review_decisions(directory: Path, filenames: list[str]) -> None:
+    if not filenames:
+        return
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        connection.executemany(
+            "DELETE FROM decisions WHERE dataset = ? AND filename = ?",
+            ((str(directory), filename) for filename in filenames),
+        )
+
+
+def _clear_dataset_review_decisions(directory: Path) -> None:
+    with DATASET_REVIEW_STATE_LOCK, closing(_open_dataset_review_database()) as connection, connection:
+        connection.execute("DELETE FROM decisions WHERE dataset = ?", (str(directory),))
+
+
+def _scan_dataset_review_index(directory: Path) -> DatasetReviewIndex:
+    audio_files = {}
+    lab_files = {}
+    for path in directory.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in ALLOWED_AUDIO_SUFFIXES:
+            audio_files[path.name.lower()] = path
+        elif path.suffix.lower() == ".lab":
+            lab_files[path.stem.lower()] = path
+    return DatasetReviewIndex(
+        directory=directory,
+        audio_files=audio_files,
+        lab_files=lab_files,
+        ordered_keys=sorted(audio_files, key=lambda key: audio_files[key].name.lower()),
+        kept=_load_dataset_review_kept(directory, audio_files),
     )
 
 
-def _prune_dataset_review_state(dataset_dir: Path, audio_files: list[Path]) -> set[str]:
-    directory_key = str(dataset_dir)
-    existing = {path.name.lower(): path.name for path in audio_files}
-    with DATASET_REVIEW_STATE_LOCK:
-        state = _read_dataset_review_state()
-        kept = {existing[name.lower()] for name in state.get(directory_key, []) if name.lower() in existing}
-        normalized = sorted(kept, key=str.lower)
-        if state.get(directory_key, []) != normalized:
-            if normalized:
-                state[directory_key] = normalized
-            else:
-                state.pop(directory_key, None)
-            _write_dataset_review_state(state)
-    return {name.lower() for name in kept}
+def get_dataset_review_index(dataset_dir: str | Path, refresh: bool = False) -> DatasetReviewIndex:
+    requested = Path(dataset_dir).expanduser().resolve()
+    cache_key = str(requested).lower()
+    with DATASET_REVIEW_CACHE_LOCK:
+        if not refresh and cache_key in DATASET_REVIEW_INDEXES:
+            return DATASET_REVIEW_INDEXES[cache_key]
+        directory = resolve_registered_training_dataset(requested)
+        cache_key = str(directory).lower()
+        if refresh or cache_key not in DATASET_REVIEW_INDEXES:
+            DATASET_REVIEW_INDEXES[cache_key] = _scan_dataset_review_index(directory)
+        return DATASET_REVIEW_INDEXES[cache_key]
 
 
-def resolve_dataset_review_audio(dataset_dir: str | Path, filename: str) -> Path:
-    directory = resolve_registered_training_dataset(dataset_dir)
+def invalidate_dataset_review_index(dataset_dir: str | Path) -> None:
+    try:
+        directory = Path(dataset_dir).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return
+    with DATASET_REVIEW_CACHE_LOCK:
+        DATASET_REVIEW_INDEXES.pop(str(directory).lower(), None)
+
+
+def _resolve_index_audio(index: DatasetReviewIndex, filename: str) -> tuple[str, Path]:
     safe_name = Path(filename).name
     if safe_name != filename or Path(safe_name).suffix.lower() not in ALLOWED_AUDIO_SUFFIXES:
         raise ValueError("音频文件名无效")
-    path = (directory / safe_name).resolve()
-    if path.parent != directory or not path.is_file():
+    key = safe_name.lower()
+    path = index.audio_files.get(key)
+    if path is None or path.resolve().parent != index.directory or not path.is_file():
         raise ValueError("训练集音频不存在")
-    return path
+    return key, path
 
 
-def _dataset_review_item(path: Path, lab_path: Path | None) -> dict:
+def resolve_dataset_review_audio(dataset_dir: str | Path, filename: str) -> Path:
+    index = get_dataset_review_index(dataset_dir)
+    return _resolve_index_audio(index, filename)[1]
+
+
+def _dataset_review_item(index: DatasetReviewIndex, key: str) -> dict:
+    path = index.audio_files[key]
+    lab_path = index.lab_files.get(path.stem.lower())
     text = ""
     if lab_path is not None:
         try:
@@ -1778,70 +1873,124 @@ def _dataset_review_item(path: Path, lab_path: Path | None) -> dict:
     }
 
 
-def build_dataset_review_snapshot(dataset_dir: str | Path) -> dict:
-    directory = resolve_registered_training_dataset(dataset_dir)
-    audio_files = _dataset_audio_files(directory)
-    lab_files = {
-        path.stem.lower(): path
-        for path in directory.iterdir()
-        if path.is_file() and path.suffix.lower() == ".lab"
-    }
-    kept = _prune_dataset_review_state(directory, audio_files)
-    pending = [path for path in audio_files if path.name.lower() not in kept]
+def _dataset_review_pending(index: DatasetReviewIndex) -> list[str]:
+    return [key for key in index.ordered_keys if key not in index.kept]
+
+
+def _dataset_review_counts(index: DatasetReviewIndex) -> dict:
+    pending_count = len(index.audio_files) - len(index.kept)
     return {
-        "directory": str(directory),
-        "items": [
-            _dataset_review_item(path, lab_files.get(path.stem.lower()))
-            for path in pending[:DATASET_REVIEW_PAGE_SIZE]
-        ],
-        "confirmed_count": len(audio_files) - len(pending),
-        "pending_count": len(pending),
-        "total_count": len(audio_files),
+        "confirmed_count": len(index.kept),
+        "pending_count": pending_count,
+        "total_count": len(index.audio_files),
         "window_size": DATASET_REVIEW_PAGE_SIZE,
+        "visible_count": min(pending_count, DATASET_REVIEW_PAGE_SIZE),
     }
 
 
-def mark_dataset_review_audio_kept(dataset_dir: str | Path, filename: str) -> None:
-    path = resolve_dataset_review_audio(dataset_dir, filename)
-    directory_key = str(path.parent)
-    with DATASET_REVIEW_STATE_LOCK:
-        state = _read_dataset_review_state()
-        kept = {name.lower(): name for name in state.get(directory_key, [])}
-        kept[path.name.lower()] = path.name
-        state[directory_key] = sorted(kept.values(), key=str.lower)
-        _write_dataset_review_state(state)
+def build_dataset_review_snapshot(dataset_dir: str | Path, refresh: bool = False) -> dict:
+    index = get_dataset_review_index(dataset_dir, refresh=refresh)
+    pending = _dataset_review_pending(index)
+    return {
+        "directory": str(index.directory),
+        "items": [_dataset_review_item(index, key) for key in pending[:DATASET_REVIEW_PAGE_SIZE]],
+        **_dataset_review_counts(index),
+    }
 
 
-def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> None:
-    path = resolve_dataset_review_audio(dataset_dir, filename)
-    directory = path.parent
-    lab_files = [
-        candidate
-        for candidate in directory.iterdir()
-        if candidate.is_file()
-        and candidate.suffix.lower() == ".lab"
-        and candidate.stem.lower() == path.stem.lower()
-    ]
-    path.unlink()
-    for lab_path in lab_files:
-        lab_path.unlink()
-    directory_key = str(directory)
-    with DATASET_REVIEW_STATE_LOCK:
-        state = _read_dataset_review_state()
-        remaining = [name for name in state.get(directory_key, []) if name.lower() != path.name.lower()]
-        if remaining:
-            state[directory_key] = remaining
-        else:
-            state.pop(directory_key, None)
-        _write_dataset_review_state(state)
+def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str) -> dict:
+    pending = _dataset_review_pending(index)
+    replacement = (
+        _dataset_review_item(index, pending[DATASET_REVIEW_PAGE_SIZE - 1])
+        if len(pending) >= DATASET_REVIEW_PAGE_SIZE
+        else None
+    )
+    return {
+        "directory": str(index.directory),
+        "removed_filename": removed_filename,
+        "replacement_item": replacement,
+        **_dataset_review_counts(index),
+    }
+
+
+def mark_dataset_review_audio_kept(dataset_dir: str | Path, filename: str) -> dict:
+    with DATASET_REVIEW_CACHE_LOCK:
+        index = get_dataset_review_index(dataset_dir)
+        key, path = _resolve_index_audio(index, filename)
+        _store_dataset_review_keep(index.directory, path.name)
+        index.kept.add(key)
+        return _dataset_review_delta(index, path.name)
+
+
+def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
+    with DATASET_REVIEW_CACHE_LOCK:
+        index = get_dataset_review_index(dataset_dir)
+        key, path = _resolve_index_audio(index, filename)
+        lab_path = index.lab_files.get(path.stem.lower())
+        path.unlink()
+        if lab_path is not None and lab_path.is_file():
+            lab_path.unlink()
+            index.lab_files.pop(path.stem.lower(), None)
+        _remove_dataset_review_decisions(index.directory, [path.name])
+        index.audio_files.pop(key, None)
+        index.ordered_keys.remove(key)
+        index.kept.discard(key)
+        return _dataset_review_delta(index, path.name)
 
 
 def clear_dataset_review_state(dataset_dir: str | Path) -> None:
-    directory = resolve_registered_training_dataset(dataset_dir)
-    with DATASET_REVIEW_STATE_LOCK:
-        state = _read_dataset_review_state()
-        state.pop(str(directory), None)
-        _write_dataset_review_state(state)
+    with DATASET_REVIEW_CACHE_LOCK:
+        index = get_dataset_review_index(dataset_dir)
+        _clear_dataset_review_decisions(index.directory)
+        index.kept.clear()
+
+
+def deduplicate_dataset_review_pairs(dataset_dir: str | Path) -> dict:
+    with DATASET_REVIEW_CACHE_LOCK:
+        index = get_dataset_review_index(dataset_dir, refresh=True)
+        lab_text_cache = {}
+        first_by_text = {}
+        duplicate_keys = []
+        duplicate_texts = set()
+        for key in index.ordered_keys:
+            path = index.audio_files[key]
+            lab_path = index.lab_files.get(path.stem.lower())
+            if lab_path is None:
+                continue
+            if lab_path not in lab_text_cache:
+                try:
+                    lab_text_cache[lab_path] = lab_path.read_text(encoding="utf-8-sig").strip()
+                except (OSError, UnicodeDecodeError):
+                    lab_text_cache[lab_path] = None
+            text_value = lab_text_cache[lab_path]
+            if text_value is None:
+                continue
+            if text_value in first_by_text:
+                duplicate_keys.append(key)
+                duplicate_texts.add(text_value)
+            else:
+                first_by_text[text_value] = key
+
+        duplicate_names = [index.audio_files[key].name for key in duplicate_keys]
+        affected_stems = {index.audio_files[key].stem.lower() for key in duplicate_keys}
+        for key in duplicate_keys:
+            index.audio_files[key].unlink()
+        duplicate_set = set(duplicate_keys)
+        remaining_stems = {
+            path.stem.lower() for key, path in index.audio_files.items() if key not in duplicate_set
+        }
+        for stem in affected_stems - remaining_stems:
+            lab_path = index.lab_files.get(stem)
+            if lab_path is not None and lab_path.is_file():
+                lab_path.unlink()
+        _remove_dataset_review_decisions(index.directory, duplicate_names)
+        refreshed = _scan_dataset_review_index(index.directory)
+        DATASET_REVIEW_INDEXES[str(index.directory).lower()] = refreshed
+        return {
+            **build_dataset_review_snapshot(refreshed.directory),
+            "deleted_count": len(duplicate_names),
+            "duplicate_groups": len(duplicate_texts),
+        }
 
 
 def _validated_output_audio(filename: str) -> Path:
@@ -2024,6 +2173,7 @@ def move_audio_to_training_dataset(filename: str, dataset_dir: str) -> dict:
         if destination_path.is_file() and not source_path.exists():
             shutil.move(str(destination_path), str(source_path))
         raise
+    invalidate_dataset_review_index(destination_dir)
     return {
         "filename": destination_path.name,
         "lab_filename": lab_path.name,
