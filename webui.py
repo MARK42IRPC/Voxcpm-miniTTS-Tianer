@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -223,6 +224,12 @@ class InferenceJobRuntime:
                 self._state["status"] = "cancelled"
             else:
                 self._state["status"] = "completed"
+
+    def clear_completed(self, job_id: str | None) -> None:
+        with self._lock:
+            if not self._state["running"] and self._state["job_id"] == job_id:
+                self._cancel_event = None
+                self._state = self._idle_state()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1306,6 +1313,16 @@ def delete_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Fo
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/dataset-review/redo")
+async def redo_dataset_review_audio(dataset_dir: str = Form(...), filename: str = Form(...)) -> dict:
+    try:
+        return await redo_dataset_review_pair(dataset_dir, filename)
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/dataset-review/reset")
 def reset_dataset_review(dataset_dir: str = Form(...)) -> dict:
     try:
@@ -1469,6 +1486,7 @@ def write_wav_metadata(path: Path, metadata: dict) -> None:
 
 
 def read_wav_metadata(path: Path) -> dict:
+    latest_metadata = None
     with path.open("rb") as wav_file:
         header = wav_file.read(12)
         if len(header) != 12 or header[:4] != b"RIFF" or header[8:] != b"WAVE":
@@ -1477,10 +1495,13 @@ def read_wav_metadata(path: Path) -> dict:
             if len(chunk_header) != 8:
                 break
             chunk_id, chunk_size = struct.unpack("<4sI", chunk_header)
+            if chunk_id != b"LIST":
+                wav_file.seek(chunk_size + (chunk_size % 2), os.SEEK_CUR)
+                continue
             chunk_data = wav_file.read(chunk_size)
             if chunk_size % 2:
                 wav_file.read(1)
-            if chunk_id != b"LIST" or not chunk_data.startswith(b"INFO"):
+            if not chunk_data.startswith(b"INFO"):
                 continue
             offset = 4
             while offset + 8 <= len(chunk_data):
@@ -1490,9 +1511,11 @@ def read_wav_metadata(path: Path) -> dict:
                 offset += field_size + (field_size % 2)
                 if field_id == b"ICMT":
                     try:
-                        return json.loads(field_data.rstrip(b"\0").decode("utf-8"))
+                        latest_metadata = json.loads(field_data.rstrip(b"\0").decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                         raise ValueError(f"Invalid VoxCPM metadata in {path.name}") from exc
+    if latest_metadata is not None:
+        return latest_metadata
     raise ValueError(f"VoxCPM generation metadata not found: {path.name}")
 
 
@@ -1856,7 +1879,100 @@ def resolve_dataset_review_audio(dataset_dir: str | Path, filename: str) -> Path
     return _resolve_index_audio(index, filename)[1]
 
 
-def _dataset_review_item(index: DatasetReviewIndex, key: str) -> dict:
+def dataset_review_redo_config(
+    index: DatasetReviewIndex,
+    key: str,
+    available_lora_ids: set[str] | None = None,
+) -> dict | None:
+    path = index.audio_files[key]
+    lab_path = index.lab_files.get(path.stem.lower())
+    if path.suffix.lower() != ".wav" or lab_path is None:
+        return None
+    try:
+        metadata = read_wav_metadata(path)
+        transcript = lab_path.read_text(encoding="utf-8-sig").strip()
+        text = str(metadata["text"]).strip()
+        model_key = str(metadata["model_key"])
+        mode = str(metadata["mode"])
+        batch_mode = str(metadata.get("batch_mode", "ordinary"))
+        split_mode = str(metadata.get("split_mode", "sentences"))
+        split_value = int(metadata.get("split_value") or 1)
+        control = str(metadata.get("control", ""))
+        prompt_text = str(metadata.get("prompt_text", ""))
+        cfg_value = float(metadata["cfg_value"])
+        inference_timesteps = int(metadata["inference_timesteps"])
+        min_len = int(metadata["min_len"])
+        max_len = int(metadata["max_len"])
+        previous_seed = int(metadata["requested_seed"])
+        device = str(metadata["device"])
+        lora_id = str(metadata.get("lora_id") or "")
+        lora_strength = float(metadata.get("lora_strength") or 1.0)
+    except (KeyError, OSError, TypeError, ValueError, UnicodeDecodeError):
+        return None
+    if metadata.get("schema") != "voxcpm-generation-v1" or mode != "design" or not text or text != transcript:
+        return None
+    if not 0 <= previous_seed < 2**32 or device not in {"cuda", "cpu", *HYBRID_DEVICES}:
+        return None
+    if model_key not in MODEL_PATHS or not MODEL_PATHS[model_key].is_dir():
+        return None
+    if lora_id and available_lora_ids is not None and lora_id not in available_lora_ids:
+        return None
+    if device in {"cuda", *HYBRID_DEVICES} and not torch.cuda.is_available():
+        return None
+    if device in HYBRID_DEVICES and model_key != "voxcpm2":
+        return None
+    if device == "cuda" and model_key == "voxcpm2" and torch.cuda.get_device_properties(0).total_memory < VOXCPM2_MIN_GPU_MEMORY:
+        return None
+    if device == "hybrid-max" and max_len > HYBRID_MAX_GENERATION_LENGTH:
+        return None
+    try:
+        validate_request(
+            model_key,
+            mode,
+            text,
+            control,
+            prompt_text,
+            batch_mode,
+            split_mode,
+            split_value,
+            cfg_value,
+            inference_timesteps,
+            min_len,
+            max_len,
+        )
+    except HTTPException:
+        return None
+    if not math.isfinite(lora_strength) or not 0.0 <= lora_strength <= 2.0:
+        return None
+    return {
+        "text": text,
+        "model_key": model_key,
+        "lora_id": lora_id,
+        "lora_strength": lora_strength,
+        "mode": mode,
+        "control": control,
+        "prompt_text": prompt_text,
+        "batch_mode": batch_mode,
+        "split_mode": split_mode,
+        "split_value": split_value,
+        "device": device,
+        "cfg_value": cfg_value,
+        "inference_timesteps": inference_timesteps,
+        "min_len": min_len,
+        "max_len": max_len,
+        "previous_seed": previous_seed,
+        "normalize": bool(metadata.get("normalize", False)),
+        "denoise": bool(metadata.get("denoise", False)),
+        "optimize": bool(metadata.get("optimize_requested", metadata.get("optimize_effective", False))),
+        "rotate_seed": metadata.get("seed_strategy") == "sequential",
+    }
+
+
+def _dataset_review_item(
+    index: DatasetReviewIndex,
+    key: str,
+    available_lora_ids: set[str] | None = None,
+) -> dict:
     path = index.audio_files[key]
     lab_path = index.lab_files.get(path.stem.lower())
     text = ""
@@ -1865,11 +1981,14 @@ def _dataset_review_item(index: DatasetReviewIndex, key: str) -> dict:
             text = lab_path.read_text(encoding="utf-8-sig").strip()
         except UnicodeDecodeError:
             text = "[LAB 文本编码无法读取]"
+    stat = path.stat()
     return {
         "filename": path.name,
         "text": text,
         "has_lab": lab_path is not None,
-        "size_bytes": path.stat().st_size,
+        "size_bytes": stat.st_size,
+        "version": stat.st_mtime_ns,
+        "redo_supported": dataset_review_redo_config(index, key, available_lora_ids) is not None,
     }
 
 
@@ -1891,17 +2010,22 @@ def _dataset_review_counts(index: DatasetReviewIndex) -> dict:
 def build_dataset_review_snapshot(dataset_dir: str | Path, refresh: bool = False) -> dict:
     index = get_dataset_review_index(dataset_dir, refresh=refresh)
     pending = _dataset_review_pending(index)
+    available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     return {
         "directory": str(index.directory),
-        "items": [_dataset_review_item(index, key) for key in pending[:DATASET_REVIEW_PAGE_SIZE]],
+        "items": [
+            _dataset_review_item(index, key, available_lora_ids)
+            for key in pending[:DATASET_REVIEW_PAGE_SIZE]
+        ],
         **_dataset_review_counts(index),
     }
 
 
 def _dataset_review_delta(index: DatasetReviewIndex, removed_filename: str) -> dict:
     pending = _dataset_review_pending(index)
+    available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
     replacement = (
-        _dataset_review_item(index, pending[DATASET_REVIEW_PAGE_SIZE - 1])
+        _dataset_review_item(index, pending[DATASET_REVIEW_PAGE_SIZE - 1], available_lora_ids)
         if len(pending) >= DATASET_REVIEW_PAGE_SIZE
         else None
     )
@@ -1936,6 +2060,92 @@ def delete_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
         index.ordered_keys.remove(key)
         index.kept.discard(key)
         return _dataset_review_delta(index, path.name)
+
+
+def next_dataset_review_redo_seed(previous_seed: int) -> int:
+    candidate = secrets.randbelow(2**32)
+    return candidate if candidate != previous_seed else (candidate + 1) % (2**32)
+
+
+async def redo_dataset_review_pair(dataset_dir: str | Path, filename: str) -> dict:
+    available_lora_ids = {item["id"] for item in list_lora_checkpoints()}
+    with DATASET_REVIEW_CACHE_LOCK:
+        index = get_dataset_review_index(dataset_dir)
+        key, original_path = _resolve_index_audio(index, filename)
+        config = dataset_review_redo_config(index, key, available_lora_ids)
+        if config is None:
+            raise ValueError("该音频缺少可完整复现的声音设计元数据")
+        original_stat = original_path.stat()
+        original_identity = (original_stat.st_size, original_stat.st_mtime_ns)
+
+    new_seed = next_dataset_review_redo_seed(config["previous_seed"])
+    result = await generate(
+        text=config["text"],
+        model_key=config["model_key"],
+        lora_id=config["lora_id"],
+        lora_strength=config["lora_strength"],
+        mode=config["mode"],
+        control=config["control"],
+        prompt_text=config["prompt_text"],
+        batch_mode=config["batch_mode"],
+        split_mode=config["split_mode"],
+        split_value=config["split_value"],
+        batch_output_dir="",
+        create_training_pairs=False,
+        rotate_seed=config["rotate_seed"],
+        device=config["device"],
+        cfg_value=config["cfg_value"],
+        inference_timesteps=config["inference_timesteps"],
+        min_len=config["min_len"],
+        max_len=config["max_len"],
+        seed=new_seed,
+        normalize=config["normalize"],
+        denoise=config["denoise"],
+        optimize=config["optimize"],
+        reference_audio=None,
+    )
+    job_id = result.get("job_id")
+    outputs = result.get("outputs", [])
+    if result.get("cancelled") or len(outputs) != 1:
+        raise RuntimeError("重做任务未生成完整的单条音频，原文件保持不变")
+
+    generated_path = _validated_output_audio(outputs[0]["filename"])
+    temporary_path = original_path.with_name(f".{original_path.name}.redo-{time.time_ns():x}.tmp")
+    replaced = False
+    try:
+        shutil.copy2(generated_path, temporary_path)
+        regenerated_metadata = read_wav_metadata(temporary_path)
+        regenerated_metadata.update(
+            {
+                "filename": original_path.name,
+                "redo_previous_seed": config["previous_seed"],
+                "redo_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+        write_wav_metadata(temporary_path, regenerated_metadata)
+        with DATASET_REVIEW_CACHE_LOCK:
+            index = get_dataset_review_index(dataset_dir)
+            current_key, current_path = _resolve_index_audio(index, filename)
+            current_stat = current_path.stat()
+            if current_key != key or (current_stat.st_size, current_stat.st_mtime_ns) != original_identity:
+                raise RuntimeError("重做期间原音频发生变化，已取消替换")
+            temporary_path.replace(current_path)
+            replaced = True
+            item = _dataset_review_item(index, key, available_lora_ids)
+            counts = _dataset_review_counts(index)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+        generated_path.unlink(missing_ok=True)
+        if replaced:
+            inference_job.clear_completed(job_id)
+
+    return {
+        "directory": str(index.directory),
+        "item": item,
+        "previous_seed": config["previous_seed"],
+        "new_seed": new_seed,
+        **counts,
+    }
 
 
 def clear_dataset_review_state(dataset_dir: str | Path) -> None:
@@ -2802,6 +3012,7 @@ async def generate(
         "seed_strategy": "sequential" if rotate_seed_effective else "fixed",
         "rotate_seed": rotate_seed_effective,
         "cancelled": cancelled,
+        "job_id": inference_job.snapshot()["job_id"],
     }
     if outputs:
         response = {**outputs[0], **response}

@@ -1098,6 +1098,42 @@ def configure_dataset_review_test(monkeypatch, tmp_path):
     return dataset_dir
 
 
+def create_redo_test_pair(dataset_dir, name="sample.wav", text="重做测试。", **overrides):
+    audio_path = dataset_dir / name
+    sf.write(audio_path, np.full(800, 0.1, dtype=np.float32), 16000)
+    audio_path.with_suffix(".lab").write_text(text, encoding="utf-8")
+    metadata = {
+        "schema": "voxcpm-generation-v1",
+        "created_at": "2026-07-28T18:00:00+08:00",
+        "filename": name,
+        "source_text": text,
+        "text": text,
+        "batch_mode": "ordinary",
+        "split_mode": "sentences",
+        "split_value": 1,
+        "model_key": "voxcpm-0.5b",
+        "lora_id": None,
+        "lora_strength": None,
+        "mode": "design",
+        "control": "",
+        "prompt_text": "",
+        "device": "cpu",
+        "cfg_value": 2.0,
+        "inference_timesteps": 10,
+        "min_len": 2,
+        "max_len": 4096,
+        "requested_seed": 42,
+        "seed_strategy": "fixed",
+        "normalize": False,
+        "denoise": False,
+        "optimize_requested": False,
+        "optimize_effective": False,
+    }
+    metadata.update(overrides)
+    webui.write_wav_metadata(audio_path, metadata)
+    return audio_path, metadata
+
+
 def test_dataset_review_keep_persists_and_updates_statistics(monkeypatch, tmp_path):
     dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
     for name, text in (("first.wav", "第一条。"), ("second.wav", "第二条。")):
@@ -1246,6 +1282,133 @@ def test_dataset_review_deduplicate_keeps_first_equal_lab_pair(monkeypatch, tmp_
     assert not (dataset_dir / "b.lab").exists()
     assert (dataset_dir / "c.wav").is_file()
     assert (dataset_dir / "missing.wav").is_file()
+
+
+def test_dataset_review_only_marks_fully_reproducible_metadata_for_redo(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    monkeypatch.setitem(webui.MODEL_PATHS, "voxcpm-0.5b", model_dir)
+    create_redo_test_pair(dataset_dir, "supported.wav")
+    create_redo_test_pair(dataset_dir, "reference.wav", mode="reference")
+    create_redo_test_pair(dataset_dir, "mismatch.wav", text="元数据文本。")
+    (dataset_dir / "mismatch.lab").write_text("不同的 LAB。", encoding="utf-8")
+
+    response = TestClient(webui.app).get("/api/dataset-review", params={"dataset_dir": str(dataset_dir)})
+
+    assert response.status_code == 200
+    items = {item["filename"]: item for item in response.json()["items"]}
+    assert items["supported.wav"]["redo_supported"] is True
+    assert items["reference.wav"]["redo_supported"] is False
+    assert items["mismatch.wav"]["redo_supported"] is False
+
+
+def test_wav_metadata_reader_uses_latest_appended_metadata(tmp_path):
+    path = tmp_path / "metadata.wav"
+    sf.write(path, np.zeros(1600, dtype=np.float32), 16000)
+    webui.write_wav_metadata(path, {"created_at": "2026-07-28T18:00:00+08:00", "value": "old"})
+    webui.write_wav_metadata(path, {"created_at": "2026-07-28T18:01:00+08:00", "value": "new"})
+
+    assert webui.read_wav_metadata(path)["value"] == "new"
+
+
+def test_dataset_review_redo_changes_only_seed_and_atomically_replaces_audio(monkeypatch, tmp_path):
+    dataset_dir = configure_dataset_review_test(monkeypatch, tmp_path)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    output_root = tmp_path / "outputs"
+    output_root.mkdir()
+    monkeypatch.setitem(webui.MODEL_PATHS, "voxcpm-0.5b", model_dir)
+    monkeypatch.setattr(webui, "OUTPUT_ROOT", output_root)
+    monkeypatch.setattr(webui, "inference_job", webui.InferenceJobRuntime())
+    monkeypatch.setattr(webui, "next_dataset_review_redo_seed", lambda previous: 314159)
+    original_path, original_metadata = create_redo_test_pair(
+        dataset_dir,
+        cfg_value=2.5,
+        inference_timesteps=12,
+        min_len=3,
+        max_len=2048,
+        normalize=True,
+        optimize_requested=True,
+    )
+    captured = {}
+
+    async def fake_generate(**kwargs):
+        captured.update(kwargs)
+        webui.inference_job.start(
+            batch_mode=kwargs["batch_mode"],
+            model=kwargs["model_key"],
+            lora_name=None,
+            device=kwargs["device"],
+            total_tasks=1,
+            total_segments=1,
+        )
+        generated_path = output_root / "generated.wav"
+        sf.write(generated_path, np.full(1600, 0.75, dtype=np.float32), 16000)
+        regenerated_metadata = {
+            **original_metadata,
+            "created_at": "2026-07-28T18:05:00+08:00",
+            "filename": generated_path.name,
+            "requested_seed": kwargs["seed"],
+            "effective_seeds": [kwargs["seed"]],
+        }
+        webui.write_wav_metadata(generated_path, regenerated_metadata)
+        webui.inference_job.record_segment()
+        webui.inference_job.record_output({"filename": generated_path.name})
+        webui.inference_job.finish()
+        return {
+            "outputs": [{"filename": generated_path.name}],
+            "cancelled": False,
+            "job_id": webui.inference_job.snapshot()["job_id"],
+        }
+
+    monkeypatch.setattr(webui, "generate", fake_generate)
+    response = TestClient(webui.app).post(
+        "/api/dataset-review/redo",
+        data={"dataset_dir": str(dataset_dir), "filename": original_path.name},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["previous_seed"] == 42
+    assert response.json()["new_seed"] == 314159
+    assert response.json()["item"]["filename"] == original_path.name
+    assert response.json()["item"]["redo_supported"] is True
+    assert captured == {
+        "text": "重做测试。",
+        "model_key": "voxcpm-0.5b",
+        "lora_id": "",
+        "lora_strength": 1.0,
+        "mode": "design",
+        "control": "",
+        "prompt_text": "",
+        "batch_mode": "ordinary",
+        "split_mode": "sentences",
+        "split_value": 1,
+        "batch_output_dir": "",
+        "create_training_pairs": False,
+        "rotate_seed": False,
+        "device": "cpu",
+        "cfg_value": 2.5,
+        "inference_timesteps": 12,
+        "min_len": 3,
+        "max_len": 2048,
+        "seed": 314159,
+        "normalize": True,
+        "denoise": False,
+        "optimize": True,
+        "reference_audio": None,
+    }
+    replaced_audio, sample_rate = sf.read(original_path, dtype="float32")
+    assert sample_rate == 16000
+    assert replaced_audio.shape[0] == 1600
+    assert float(replaced_audio.mean()) == pytest.approx(0.75, abs=1e-3)
+    assert original_path.with_suffix(".lab").read_text(encoding="utf-8") == "重做测试。"
+    replaced_metadata = webui.read_wav_metadata(original_path)
+    assert replaced_metadata["filename"] == original_path.name
+    assert replaced_metadata["requested_seed"] == 314159
+    assert replaced_metadata["redo_previous_seed"] == 42
+    assert not (output_root / "generated.wav").exists()
+    assert webui.inference_job.snapshot()["status"] == "idle"
 
 
 def test_batch_output_directory_registry_persists_last_selection(monkeypatch, tmp_path):

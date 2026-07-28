@@ -10,7 +10,7 @@
       --canvas: #f4f6f7; --surface: #fff; --surface-muted: #eef1f2;
       --ink: #171a1c; --muted: #657078; --line: #d9dfe2;
       --green: #147a55; --green-hover: #0f6848; --teal: #147684;
-      --red: #b43b3b; --red-hover: #963030; --shadow: 0 12px 30px rgba(25,35,40,.08);
+      --red: #b43b3b; --red-hover: #963030; --amber: #9a6814; --shadow: 0 12px 30px rgba(25,35,40,.08);
     }
     * { box-sizing: border-box; }
     html { overflow-x: hidden; }
@@ -64,6 +64,8 @@
     .item-actions { display: flex; gap: 8px; }
     .keep { min-width: 72px; border: 0; background: var(--green); color: #fff; }
     .keep:hover { background: var(--green-hover); }
+    .redo { min-width: 72px; border: 1px solid #d7b878; background: #fffdf8; color: var(--amber); }
+    .redo:hover { border-color: var(--amber); background: #fff8e8; }
     .delete { min-width: 72px; border: 0; background: var(--red); color: #fff; }
     .delete:hover { background: var(--red-hover); }
     .empty { padding: 48px 16px; color: var(--muted); font-size: 13px; text-align: center; border: 1px dashed var(--line); border-radius: 7px; }
@@ -185,8 +187,10 @@
       button.type = "button";
       button.className = className;
       button.textContent = label;
-      button.title = action === "delete" ? "删除真实音频及同名 LAB，不可撤销" : "确认保留并移出待审核队列";
-      button.addEventListener("click", () => reviewAction(action, item.filename));
+      button.title = action === "delete"
+        ? "删除真实音频及同名 LAB，不可撤销"
+        : action === "redo" ? "保持兼容元数据参数不变，仅更换随机种子重新生成并替换本条音频" : "确认保留并移出待审核队列";
+      button.addEventListener("click", () => action === "redo" ? redoAction(item.filename) : reviewAction(action, item.filename));
       return button;
     }
 
@@ -204,6 +208,7 @@
       audio.controls = true;
       audio.preload = "none";
       const params = new URLSearchParams({ dataset_dir: directory, filename: item.filename });
+      params.set("v", String(item.version || ""));
       audio.src = `/api/dataset-review/audio?${params}`;
       audioColumn.append(name, audio);
       const transcript = document.createElement("div");
@@ -211,7 +216,9 @@
       transcript.textContent = item.has_lab ? (item.text || "[LAB 内容为空]") : "缺少同名 LAB 文本";
       const actions = document.createElement("div");
       actions.className = "item-actions";
-      actions.append(makeActionButton("保留", "keep", item, "keep"), makeActionButton("删除", "delete", item, "delete"));
+      actions.append(makeActionButton("保留", "keep", item, "keep"));
+      if (item.redo_supported) actions.append(makeActionButton("重做", "redo", item, "redo"));
+      actions.append(makeActionButton("删除", "delete", item, "delete"));
       row.append(audioColumn, transcript, actions);
       return row;
     }
@@ -292,6 +299,25 @@
         applyReviewDelta(result);
         setStatus(action === "delete" ? "音频及同名 LAB 已从磁盘删除" : "已确认保留");
       } catch (error) { setStatus(error.message, true); await refreshReview(false); }
+      finally { setBusy(false); queue.querySelectorAll("button").forEach((button) => { button.disabled = false; }); }
+    }
+
+    async function redoAction(filename) {
+      setBusy(true);
+      queue.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+      setStatus(`正在按原配置重做 ${filename}`);
+      const data = new FormData();
+      data.set("dataset_dir", selectedDirectory());
+      data.set("filename", filename);
+      try {
+        const result = await readJson(await fetch("/api/dataset-review/redo", { method: "POST", body: data }), "重做失败");
+        const row = [...queue.querySelectorAll(".review-item")].find((item) => item.dataset.filename === filename);
+        const replacement = createReviewRow(result.item, result.directory);
+        if (row) row.replaceWith(replacement);
+        updateCounts(result);
+        setStatus(`重做完成 · Seed ${result.previous_seed} → ${result.new_seed}`);
+        if (autoPlay.checked && queue.firstElementChild === replacement) setTimeout(playTopAudio, 0);
+      } catch (error) { setStatus(error.message, true); }
       finally { setBusy(false); queue.querySelectorAll("button").forEach((button) => { button.disabled = false; }); }
     }
 
