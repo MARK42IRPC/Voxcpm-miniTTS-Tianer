@@ -1418,6 +1418,9 @@ def test_web_session_output_updates_reuse_existing_audio_nodes():
     assert "playingItem && !limited.some" in source
     assert "function syncInferenceParams(status)" in source
     assert "syncedInferenceJobId === status.job_id" in source
+    assert ".audio-item.playing" in source
+    assert "setSessionRowPlaying(row, true)" in source
+    assert 'row.setAttribute("aria-current", "true")' in source
 
 
 def test_wav_metadata_reader_uses_latest_appended_metadata(tmp_path):

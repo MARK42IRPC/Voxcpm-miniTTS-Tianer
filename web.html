@@ -420,7 +420,8 @@
     .dataset-create-confirm:disabled { cursor: wait; opacity: 0.55; }
     .session-list { min-height: 180px; overflow-y: auto; padding: 10px; }
     .session-empty { padding: 32px 12px; color: var(--muted); font-size: 13px; text-align: center; }
-    .audio-item { padding: 12px 6px; border-bottom: 1px solid var(--line); }
+    .audio-item { padding: 12px 6px; border-bottom: 1px solid var(--line); transition: background-color 120ms,box-shadow 120ms; }
+    .audio-item.playing { background: #effaf7; box-shadow: inset 0 0 0 1px #9bcfbe,inset 4px 0 0 #42a585; }
     .audio-item:last-child { border-bottom: 0; }
     .audio-item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
     .audio-item-text { min-width: 0; margin: 0; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
@@ -1114,6 +1115,20 @@
       });
     }
 
+    function setSessionRowPlaying(row, playing) {
+      if (playing) {
+        sessionList.querySelectorAll(".audio-item.playing").forEach((item) => {
+          if (item !== row) {
+            item.classList.remove("playing");
+            item.removeAttribute("aria-current");
+          }
+        });
+      }
+      row.classList.toggle("playing", playing);
+      if (playing) row.setAttribute("aria-current", "true");
+      else row.removeAttribute("aria-current");
+    }
+
     function setPostprocessGroupEnabled(key, enabled) {
       const group = postprocessEnableGroups[key];
       if (!group) return;
@@ -1319,9 +1334,18 @@
       player.controls = true;
       player.preload = "none";
       player.src = item.audio_url;
-      player.addEventListener("play", () => pauseOtherPlayers(player));
-      player.addEventListener("pause", () => setTimeout(settleSessionOutputLimit, 0));
-      player.addEventListener("ended", () => setTimeout(settleSessionOutputLimit, 0));
+      player.addEventListener("play", () => {
+        pauseOtherPlayers(player);
+        setSessionRowPlaying(row, true);
+      });
+      player.addEventListener("pause", () => {
+        setSessionRowPlaying(row, false);
+        setTimeout(settleSessionOutputLimit, 0);
+      });
+      player.addEventListener("ended", () => {
+        setSessionRowPlaying(row, false);
+        setTimeout(settleSessionOutputLimit, 0);
+      });
 
       const actions = document.createElement("div");
       actions.className = "audio-item-actions";
