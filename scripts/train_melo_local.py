@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,34 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 MELO_ROOT = ROOT / "third_party" / "MeloTTS"
 MELO_PACKAGE = MELO_ROOT / "melo"
+
+
+def cleanup_training_cache(job_dir: Path) -> list[str]:
+    job_root = job_dir.resolve()
+    removed = []
+    audio_dir = (job_dir / "audio").resolve()
+    if audio_dir.parent != job_root:
+        raise ValueError(f"Refusing to remove training cache outside job directory: {audio_dir}")
+    try:
+        if audio_dir.is_dir():
+            shutil.rmtree(audio_dir)
+            removed.append("audio")
+            print("[Melo] Released training cache: audio", flush=True)
+        event_count = 0
+        for event_path in job_dir.rglob("events.out.tfevents.*"):
+            if not event_path.is_file():
+                continue
+            resolved = event_path.resolve()
+            if job_root not in resolved.parents:
+                raise ValueError(f"Refusing to remove TensorBoard event outside job directory: {resolved}")
+            event_path.unlink()
+            event_count += 1
+        if event_count:
+            removed.append(f"tensorboard-events:{event_count}")
+            print(f"[Melo] Released TensorBoard event files: {event_count}", flush=True)
+    except OSError as exc:
+        print(f"[Melo] Training cache cleanup failed: {exc}", flush=True)
+    return removed
 
 
 def _load_job(path: Path) -> dict:
@@ -233,9 +262,14 @@ def main() -> None:
         preprocess(job_path)
         return
 
-    preprocess_command = [sys.executable, "-X", "utf8", __file__, str(job_path), "--preprocess-only"]
-    subprocess.run(preprocess_command, cwd=ROOT, check=True)
-    train(job_path)
+    job = _load_job(job_path)
+    job_dir = Path(job["job_dir"])
+    try:
+        preprocess_command = [sys.executable, "-X", "utf8", __file__, str(job_path), "--preprocess-only"]
+        subprocess.run(preprocess_command, cwd=ROOT, check=True)
+        train(job_path)
+    finally:
+        cleanup_training_cache(job_dir)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from voxcpm.web import piper_web
-from scripts import train_piper_plus_local
+from scripts import train_melo_local, train_piper_plus_local
 
 
 def test_safe_piper_job_name():
@@ -95,6 +96,152 @@ def test_piper_plus_training_command_uses_upstream_v113_argument_names(tmp_path)
         "python", tmp_path / "input", tmp_path / "dataset", max_workers=1
     )
     assert preprocess[preprocess.index("--max-workers") + 1] == "1"
+
+
+def test_piper_plus_script_cleanup_preserves_config_and_checkpoint(tmp_path):
+    job_dir = tmp_path / "plus-job"
+    input_dir = job_dir / "ljspeech-input" / "wavs"
+    dataset_dir = job_dir / "dataset"
+    checkpoint = job_dir / "lightning_logs" / "version_0" / "checkpoints" / "epoch=1.ckpt"
+    input_dir.mkdir(parents=True)
+    dataset_dir.mkdir()
+    checkpoint.parent.mkdir(parents=True)
+    (input_dir / "sample.wav").write_bytes(b"audio")
+    (dataset_dir / "sample.pt").write_bytes(b"features")
+    (dataset_dir / "config.json").write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    checkpoint.write_bytes(b"checkpoint")
+
+    removed = train_piper_plus_local.cleanup_training_cache(job_dir)
+
+    assert removed == ["ljspeech-input", "dataset"]
+    assert not (job_dir / "ljspeech-input").exists()
+    assert not dataset_dir.exists()
+    assert json.loads((job_dir / "config.json").read_text(encoding="utf-8"))["audio"]["sample_rate"] == 22050
+    assert checkpoint.read_bytes() == b"checkpoint"
+    assert piper_web._find_piper_plus_config(checkpoint) == job_dir / "config.json"
+
+
+def test_piper_plus_main_releases_cache_when_training_fails(monkeypatch, tmp_path):
+    job_dir = tmp_path / "plus-job"
+    input_dir = job_dir / "ljspeech-input"
+    dataset_dir = job_dir / "dataset"
+    input_dir.mkdir(parents=True)
+    dataset_dir.mkdir()
+    (input_dir / "temporary.wav").write_bytes(b"audio")
+    (dataset_dir / "dataset.jsonl").write_text("{}\n", encoding="utf-8")
+    (dataset_dir / "config.json").write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+    job = {
+        "job_name": "failure-test",
+        "job_dir": str(job_dir),
+        "model_dir": str(tmp_path / "models"),
+        "source_root": str(tmp_path),
+        "records": [],
+        "base_checkpoint": str(tmp_path / "base.ckpt"),
+        "resume_mode": "multispeaker",
+        "num_epochs": 1,
+        "batch_size": 1,
+        "save_every_epochs": 1,
+        "learning_rate": 0.00002,
+        "validation_split": 0.05,
+        "num_workers": 1,
+    }
+    job_path = job_dir / "job.json"
+    job_path.write_text(json.dumps(job), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["train_piper_plus_local.py", str(job_path)])
+    monkeypatch.setattr(train_piper_plus_local.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(
+        train_piper_plus_local,
+        "run",
+        lambda command, cwd: (_ for _ in ()).throw(RuntimeError("training failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        train_piper_plus_local.main()
+
+    assert not input_dir.exists()
+    assert not dataset_dir.exists()
+    assert (job_dir / "config.json").is_file()
+
+
+def test_melo_script_cleanup_removes_features_and_events_only(tmp_path):
+    job_dir = tmp_path / "melo-job"
+    audio_dir = job_dir / "audio"
+    checkpoint_dir = job_dir / "checkpoints"
+    eval_dir = checkpoint_dir / "eval"
+    audio_dir.mkdir(parents=True)
+    eval_dir.mkdir(parents=True)
+    (audio_dir / "sample.spec.pt").write_bytes(b"features")
+    (checkpoint_dir / "G_10.pth").write_bytes(b"checkpoint")
+    (checkpoint_dir / "events.out.tfevents.train").write_bytes(b"events")
+    (eval_dir / "events.out.tfevents.eval").write_bytes(b"events")
+
+    removed = train_melo_local.cleanup_training_cache(job_dir)
+
+    assert removed == ["audio", "tensorboard-events:2"]
+    assert not audio_dir.exists()
+    assert not list(job_dir.rglob("events.out.tfevents.*"))
+    assert (checkpoint_dir / "G_10.pth").read_bytes() == b"checkpoint"
+
+
+def test_melo_main_releases_cache_when_preprocess_fails(monkeypatch, tmp_path):
+    job_dir = tmp_path / "melo-job"
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True)
+    (audio_dir / "partial.bert.pt").write_bytes(b"cache")
+    job_path = job_dir / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "job_name": "failure-test",
+                "job_dir": str(job_dir),
+                "dataset_dir": str(tmp_path / "source"),
+                "base_checkpoint": str(tmp_path / "base.pth"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["train_melo_local.py", str(job_path)])
+    monkeypatch.setattr(
+        train_melo_local.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, args[0])),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        train_melo_local.main()
+
+    assert not audio_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("engine", "cache_names"),
+    [
+        ("piper", ("cache",)),
+        ("sherpa_onnx", ("audio",)),
+        ("piper_plus", ("ljspeech-input", "dataset")),
+    ],
+)
+def test_web_runtime_cleanup_releases_only_ephemeral_training_data(tmp_path, engine, cache_names):
+    job_dir = tmp_path / engine
+    checkpoint_dir = job_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint = checkpoint_dir / "model.ckpt"
+    checkpoint.write_bytes(b"checkpoint")
+    (checkpoint_dir / "events.out.tfevents.test").write_bytes(b"events")
+    for name in cache_names:
+        cache_dir = job_dir / name
+        cache_dir.mkdir()
+        (cache_dir / "cache.bin").write_bytes(b"cache")
+    if engine == "piper_plus":
+        (job_dir / "dataset" / "config.json").write_text('{"audio":{"sample_rate":22050}}', encoding="utf-8")
+
+    removed = piper_web.cleanup_student_training_cache(job_dir, engine)
+
+    assert set(removed) == {*cache_names, "tensorboard-events:1"}
+    assert all(not (job_dir / name).exists() for name in cache_names)
+    assert checkpoint.read_bytes() == b"checkpoint"
+    if engine == "piper_plus":
+        assert (job_dir / "config.json").is_file()
 
 
 def test_piper_plus_artifacts_are_discovered_as_student_models(monkeypatch, tmp_path):

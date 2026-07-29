@@ -64,6 +64,11 @@ DEFAULT_TRAINING_DATASET = Path(r"D:\音频素材\爱弥斯语音训练集\train
 DEFAULT_PIPER_CHECKPOINT_DIR = "pretrained-zh_CN-huayan-medium"
 STUDENT_MANIFEST_NAME = "voxcpm-model.json"
 STUDENT_EXPORT_PRECISIONS = ("fp32", "fp16", "int8")
+TRAINING_CACHE_DIRECTORIES = {
+    "piper": ("cache",),
+    "sherpa_onnx": ("audio",),
+    "piper_plus": ("ljspeech-input", "dataset"),
+}
 ONNX_CONVERSION_LOCK = threading.Lock()
 
 
@@ -109,6 +114,48 @@ for directory in (
     OPTIMIZER_DOWNLOAD_ROOT,
 ):
     directory.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_student_training_cache(job_dir: Path, engine: str) -> list[str]:
+    names = TRAINING_CACHE_DIRECTORIES.get(engine)
+    if names is None:
+        raise ValueError(f"Unknown student training engine: {engine}")
+    job_root = job_dir.resolve()
+    removed = []
+    for name in names:
+        if engine == "piper_plus" and name == "dataset":
+            source_config = job_dir / "dataset" / "config.json"
+            preserved_config = job_dir / "config.json"
+            if source_config.is_file():
+                shutil.copy2(source_config, preserved_config)
+        target = (job_dir / name).resolve()
+        if target.parent != job_root:
+            raise ValueError(f"Refusing to remove training cache outside job directory: {target}")
+        if target.is_dir():
+            shutil.rmtree(target)
+            removed.append(name)
+
+    event_count = 0
+    for event_path in job_dir.rglob("events.out.tfevents.*"):
+        if not event_path.is_file():
+            continue
+        resolved = event_path.resolve()
+        if job_root not in resolved.parents:
+            raise ValueError(f"Refusing to remove TensorBoard event outside job directory: {resolved}")
+        event_path.unlink()
+        event_count += 1
+    if event_count:
+        removed.append(f"tensorboard-events:{event_count}")
+    return removed
+
+
+def _report_training_cache_cleanup(runtime, job_dir: Path, engine: str) -> None:
+    try:
+        removed = cleanup_student_training_cache(job_dir, engine)
+        if removed:
+            runtime._append(f"Released training cache: {', '.join(removed)}")
+    except (OSError, ValueError) as exc:
+        runtime._append(f"Training cache cleanup failed: {exc}")
 
 
 def prepare_piper_espeak_data() -> Path:
@@ -1441,7 +1488,7 @@ def preview_piper_plus_checkpoint(
 ) -> dict:
     config_path = _find_piper_plus_config(checkpoint_path)
     if config_path is None:
-        raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+        raise ValueError("Piper Plus 检查点目录缺少 config.json")
     model_cache = STUDENT_PREVIEW_CACHE_ROOT / artifact["id"]
     model_path = model_cache / "model.fp16.onnx"
     signature_path = model_cache / "source.json"
@@ -1531,9 +1578,9 @@ class PiperTrainingRuntime:
             self._job_dir = job_dir
             self._auto_export = None
             process = self._process
-        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+        threading.Thread(target=self._read_process, args=(process, job_dir, job_name), daemon=True).start()
 
-    def _read_process(self, process: subprocess.Popen) -> None:
+    def _read_process(self, process: subprocess.Popen, job_dir: Path, job_name: str) -> None:
         assert process.stdout is not None
         for line in process.stdout:
             self._append(line)
@@ -1544,14 +1591,14 @@ class PiperTrainingRuntime:
             self._finished_at = time.time()
             self._status = "stopped" if stopping else "completed" if returncode == 0 else "failed"
 
-        if returncode == 0 and self._job_dir is not None and self._job_name is not None:
-            checkpoint = _latest_checkpoint(self._job_dir)
-            config_path = self._job_dir / "voice.json"
+        if returncode == 0:
+            checkpoint = _latest_checkpoint(job_dir)
+            config_path = job_dir / "voice.json"
             if checkpoint and config_path.is_file():
                 self._append(f"Exporting latest checkpoint: {checkpoint.name}")
                 with self._lock:
                     self._status = "exporting"
-                output_path = PIPER_MODELS_ROOT / self._job_name / f"{self._job_name}-latest.onnx"
+                output_path = PIPER_MODELS_ROOT / job_name / f"{job_name}-latest.onnx"
                 try:
                     export_piper_checkpoint(checkpoint, output_path, config_path)
                     self._auto_export = str(output_path)
@@ -1561,13 +1608,14 @@ class PiperTrainingRuntime:
                 finally:
                     with self._lock:
                         self._status = "completed"
+        _report_training_cache_cleanup(self, job_dir, "piper")
 
     def stop(self) -> bool:
         with self._lock:
             if self._process is None or self._process.poll() is not None:
                 return False
             self._status = "stopping"
-            self._logs.append("Stopping Piper training; saved checkpoints will be kept.")
+            self._logs.append("Stopping Piper training; saved checkpoints will be kept and cache will be released.")
             self._process.terminate()
             return True
 
@@ -1642,9 +1690,9 @@ class MeloTrainingRuntime:
             self._job_name = job_name
             self._job_dir = job_dir
             process = self._process
-        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+        threading.Thread(target=self._read_process, args=(process, job_dir), daemon=True).start()
 
-    def _read_process(self, process: subprocess.Popen) -> None:
+    def _read_process(self, process: subprocess.Popen, job_dir: Path) -> None:
         assert process.stdout is not None
         for line in process.stdout:
             self._append(line)
@@ -1654,6 +1702,7 @@ class MeloTrainingRuntime:
             self._returncode = returncode
             self._finished_at = time.time()
             self._status = "stopped" if stopping else "completed" if returncode == 0 else "failed"
+        _report_training_cache_cleanup(self, job_dir, "sherpa_onnx")
 
     def stop(self) -> bool:
         with self._lock:
@@ -1661,7 +1710,7 @@ class MeloTrainingRuntime:
                 return False
             process = self._process
             self._status = "stopping"
-            self._logs.append("Stopping MeloTTS training; saved checkpoints and input cache will be kept.")
+            self._logs.append("Stopping MeloTTS training; saved checkpoints will be kept and cache will be released.")
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -1699,6 +1748,7 @@ class PiperPlusTrainingRuntime:
         self._finished_at: float | None = None
         self._returncode: int | None = None
         self._job_name: str | None = None
+        self._job_dir: Path | None = None
         self._auto_export: str | None = None
 
     @property
@@ -1735,11 +1785,12 @@ class PiperPlusTrainingRuntime:
             self._finished_at = None
             self._returncode = None
             self._job_name = job_name
+            self._job_dir = job_config.parent
             self._auto_export = None
             process = self._process
-        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+        threading.Thread(target=self._read_process, args=(process, job_config.parent), daemon=True).start()
 
-    def _read_process(self, process: subprocess.Popen) -> None:
+    def _read_process(self, process: subprocess.Popen, job_dir: Path) -> None:
         assert process.stdout is not None
         for line in process.stdout:
             with self._lock:
@@ -1754,6 +1805,7 @@ class PiperPlusTrainingRuntime:
             self._returncode = returncode
             self._finished_at = time.time()
             self._status = "stopped" if stopping else "completed" if returncode == 0 else "failed"
+        _report_training_cache_cleanup(self, job_dir, "piper_plus")
 
     def stop(self) -> bool:
         with self._lock:
@@ -1761,7 +1813,7 @@ class PiperPlusTrainingRuntime:
                 return False
             process = self._process
             self._status = "stopping"
-            self._logs.append("Stopping Piper Plus training; prepared data and checkpoints will be kept.")
+            self._logs.append("Stopping Piper Plus training; checkpoints will be kept and prepared data will be released.")
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
         else:
@@ -2909,7 +2961,7 @@ async def export_piper_artifact(artifact_id: str) -> dict:
         if artifact["kind"] == "piper_plus_checkpoint":
             config_path = _find_piper_plus_config(checkpoint_path)
             if config_path is None:
-                raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+                raise ValueError("Piper Plus 检查点目录缺少 config.json")
             job_name = safe_piper_job_name(checkpoint_path.relative_to(PIPER_PLUS_RUNS_ROOT).parts[0])
             output_dir = PIPER_PLUS_MODELS_ROOT / f"{job_name}-{safe_piper_job_name(checkpoint_path.stem)}-fp16"
             output_path = output_dir / "model.fp16.onnx"
@@ -2991,7 +3043,7 @@ async def export_student_artifact(artifact_id: str, precision: str = Form("int8"
         elif artifact["kind"] == "piper_plus_checkpoint":
             config_path = _find_piper_plus_config(source_path)
             if config_path is None:
-                raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+                raise ValueError("Piper Plus 检查点目录缺少 config.json")
             job_name = safe_piper_job_name(source_path.relative_to(PIPER_PLUS_RUNS_ROOT).parts[0])
             output_dir = PIPER_PLUS_MODELS_ROOT / safe_piper_job_name(
                 f"{job_name}-{source_path.stem}-{precision}"

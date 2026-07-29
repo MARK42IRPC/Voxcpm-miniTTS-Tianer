@@ -13,6 +13,34 @@ from pathlib import Path
 STUDENT_MANIFEST_NAME = "voxcpm-model.json"
 
 
+def _remove_job_directory(job_dir: Path, name: str) -> bool:
+    job_root = job_dir.resolve()
+    target = (job_dir / name).resolve()
+    if target.parent != job_root:
+        raise ValueError(f"Refusing to remove training cache outside job directory: {target}")
+    if not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    print(f"[Piper Plus] Released training cache: {name}", flush=True)
+    return True
+
+
+def cleanup_training_cache(job_dir: Path, *names: str) -> list[str]:
+    removed = []
+    for name in names or ("ljspeech-input", "dataset"):
+        try:
+            if name == "dataset":
+                source_config = job_dir / "dataset" / "config.json"
+                preserved_config = job_dir / "config.json"
+                if source_config.is_file():
+                    shutil.copy2(source_config, preserved_config)
+            if _remove_job_directory(job_dir, name):
+                removed.append(name)
+        except OSError as exc:
+            print(f"[Piper Plus] Training cache cleanup failed for {name}: {exc}", flush=True)
+    return removed
+
+
 def stage_ljspeech_input(records: list[dict], input_dir: Path) -> None:
     wav_dir = input_dir / "wavs"
     wav_dir.mkdir(parents=True, exist_ok=True)
@@ -169,14 +197,17 @@ def main() -> None:
     job_dir = Path(job["job_dir"])
     input_dir = job_dir / "ljspeech-input"
     dataset_dir = job_dir / "dataset"
-    stage_ljspeech_input(job["records"], input_dir)
 
     python = sys.executable
-    if not (dataset_dir / "dataset.jsonl").is_file():
-        run(build_preprocess_command(python, input_dir, dataset_dir, int(job.get("num_workers", 1))), job_dir)
-
-    run(build_training_command(python, dataset_dir, job_dir, job), job_dir)
-    export_student_model(python, job_dir, dataset_dir, job)
+    try:
+        if not (dataset_dir / "dataset.jsonl").is_file():
+            stage_ljspeech_input(job["records"], input_dir)
+            run(build_preprocess_command(python, input_dir, dataset_dir, int(job.get("num_workers", 1))), job_dir)
+        cleanup_training_cache(job_dir, "ljspeech-input")
+        run(build_training_command(python, dataset_dir, job_dir, job), job_dir)
+        export_student_model(python, job_dir, dataset_dir, job)
+    finally:
+        cleanup_training_cache(job_dir)
 
 
 if __name__ == "__main__":
