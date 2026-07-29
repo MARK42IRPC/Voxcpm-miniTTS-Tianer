@@ -87,6 +87,15 @@ def synthesize_student(job: dict, text: str, output_path: Path) -> None:
     if job["model_engine"] == "sherpa_onnx":
         manifest = json.loads(Path(job["manifest_path"]).read_text(encoding="utf-8"))
         piper_web.sherpa_voice_runtime.synthesize(model_path, manifest, text, output_path, settings)
+    elif job["model_engine"] == "melo_onnx_native":
+        manifest = json.loads(Path(job["manifest_path"]).read_text(encoding="utf-8"))
+        piper_web.melo_native_voice_runtime.synthesize(
+            model_path,
+            manifest,
+            text,
+            output_path,
+            {**settings, "noise_scale": 0.6, "noise_w_scale": 0.8, "sdp_ratio": manifest.get("sdp_ratio", 0.2)},
+        )
     elif job["model_engine"] == "piper":
         piper_web.piper_voice_runtime.synthesize(
             model_path,

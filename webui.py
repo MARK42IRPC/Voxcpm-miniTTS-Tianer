@@ -52,7 +52,12 @@ from safetensors import safe_open
 
 from voxcpm import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
-from piper_web import configure_piper_callbacks, router as piper_router, student_training_running
+from piper_web import (
+    configure_piper_callbacks,
+    release_native_melo_frontend,
+    router as piper_router,
+    student_training_running,
+)
 
 
 def configure_torch_cpu_threads() -> int:
@@ -310,6 +315,7 @@ class ModelRuntime:
         lora_checkpoint: dict | None = None,
         lora_strength: float = 1.0,
     ) -> VoxCPM:
+        release_native_melo_frontend()
         identity = (config.model_key, config.device, config.optimize)
         denoiser_device = "gpu" if config.device == "hybrid" else "cpu"
         if self._model is not None and self._identity == identity:

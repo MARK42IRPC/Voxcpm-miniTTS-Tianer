@@ -9,6 +9,7 @@ from .symbols import language_tone_start_map
 from .tone_sandhi import ToneSandhi
 from .english import g2p as g2p_en
 from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
 
 punctuation = ["!", "?", "…", ",", ".", "'", "-"]
 current_file_path = os.path.dirname(__file__)
@@ -97,7 +98,9 @@ def _get_initials_finals(word):
     return initials, finals
 
 model_id = 'bert-base-multilingual-uncased'
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer = AutoTokenizer.from_pretrained(
+    snapshot_download(repo_id=model_id, local_files_only=True)
+)
 def _g2p(segments):
     phones_list = []
     tones_list = []

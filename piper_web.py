@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse
 
 
 ROOT = Path(__file__).resolve().parent
+VOXCPM_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm"))
 DISTILL_PAGE = ROOT / "distill.html"
 EXPORT_PAGE = ROOT / "export.html"
 OPTIMIZER_PAGE = ROOT / "optimizer.html"
@@ -42,12 +43,11 @@ MELO_BASE_ROOT = PIPER_ROOT / "melo-bases"
 MELO_BASE_DIR = MELO_BASE_ROOT / "MeloTTS-Chinese"
 MELO_BASE_CHECKPOINT = MELO_BASE_DIR / "checkpoint.pth"
 MELO_SOURCE_ROOT = ROOT / "third_party" / "MeloTTS"
-MELO_RESOURCE_TEMPLATE = PIPER_MODELS_ROOT / "vits-melo-tts-zh_en-int8"
-MELO_EXPORT_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "melo-exports"
-STUDENT_PREVIEW_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "student-previews"
+MELO_EXPORT_CACHE_ROOT = VOXCPM_CACHE_ROOT / "melo-exports"
+STUDENT_PREVIEW_CACHE_ROOT = VOXCPM_CACHE_ROOT / "student-previews"
 ONNX_TEMP_ROOT = Path(os.environ.get("VOXCPM_ONNX_TEMP_DIR", r"C:\tmp\voxcpm-onnx" if os.name == "nt" else "/tmp/voxcpm-onnx"))
-PIPER_ESPEAK_DATA = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "piper-espeak-data"
-PIPER_RESOURCE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "piper-resources"
+PIPER_ESPEAK_DATA = VOXCPM_CACHE_ROOT / "piper-espeak-data"
+PIPER_RESOURCE_ROOT = VOXCPM_CACHE_ROOT / "piper-resources"
 PIPER_BERT_TOKENIZER = PIPER_RESOURCE_ROOT / "bert-base-chinese"
 SHERPA_RUNTIME_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "sherpa-models"
 DEFAULT_TRAINING_DATASET = Path(r"D:\音频素材\爱弥斯语音训练集\train\wavs")
@@ -55,6 +55,14 @@ DEFAULT_PIPER_CHECKPOINT_DIR = "pretrained-zh_CN-huayan-medium"
 STUDENT_MANIFEST_NAME = "voxcpm-model.json"
 STUDENT_EXPORT_PRECISIONS = ("fp32", "fp16", "int8")
 ONNX_CONVERSION_LOCK = threading.Lock()
+
+# Native Melo ONNX keeps the original BERT frontend.  Set this before the
+# frontend imports transformers so a standalone piper_web process uses the
+# same local cache as the main WebUI.
+os.environ.setdefault("HF_HOME", str(VOXCPM_CACHE_ROOT / "hf-cache"))
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 for directory in (
     PIPER_MODELS_ROOT,
@@ -407,7 +415,7 @@ def list_piper_artifacts() -> list[dict]:
                 "previewable": (kind == "onnx" and (config_path is not None or manifest is not None)) or (kind == "melo_checkpoint" and config_path is not None),
                 "downloadable": kind in ("checkpoint", "melo_checkpoint") or (kind == "onnx" and (config_path is not None or manifest is not None)),
                 "engine": engine,
-                "architecture": "melotts" if engine == "sherpa_onnx" else "piper",
+                "architecture": "melotts" if engine in ("sherpa_onnx", "melo_onnx_native") else "piper",
                 "engine_label": "MeloTTS" if kind == "melo_checkpoint" else manifest.get("engine_label", "Piper") if manifest else "Piper",
                 "precision": precision,
                 "export_precisions": _artifact_export_precisions(kind, precision),
@@ -600,6 +608,137 @@ class SherpaVoiceRuntime:
             sf.write(output_path, np.clip(samples, -1.0, 1.0), int(generated.sample_rate), subtype="PCM_16")
 
 
+class NativeMeloVoiceRuntime:
+    """MeloTTS-native ONNX runtime that preserves the original text frontend."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._session = None
+        self._identity: tuple | None = None
+        self._hps = None
+        self._symbol_to_id: dict[str, int] | None = None
+        self._language = "ZH_MIX_EN"
+        self._sample_rate = 44100
+
+    def release(self, release_frontend: bool = True) -> None:
+        with self._lock:
+            had_session = self._session is not None
+            self._session = None
+            self._identity = None
+            self._hps = None
+            self._symbol_to_id = None
+        if release_frontend and (had_session or self._frontend_is_cached()):
+            self._release_frontend_models()
+
+    @staticmethod
+    def _frontend_is_cached() -> bool:
+        import sys
+
+        for module_name in ("melo.text.chinese_bert", "melo.text.japanese_bert"):
+            module = sys.modules.get(module_name)
+            models = getattr(module, "models", None) if module is not None else None
+            if isinstance(models, dict) and models:
+                return True
+        return False
+
+    @staticmethod
+    def _release_frontend_models() -> None:
+        """Drop optional BERT weights when another GPU workload needs room."""
+        import sys
+
+        for module_name in ("melo.text.chinese_bert", "melo.text.japanese_bert"):
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            for name in ("models", "tokenizers"):
+                cache = getattr(module, name, None)
+                if isinstance(cache, dict):
+                    cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _load(self, model_path: Path, manifest: dict):
+        import sys
+
+        if str(MELO_SOURCE_ROOT) not in sys.path:
+            sys.path.insert(0, str(MELO_SOURCE_ROOT))
+        import onnxruntime as ort
+        from melo.utils import get_hparams_from_file
+
+        config_relative = manifest.get("config", "config.json")
+        config_path = _manifest_resource(model_path, config_relative)
+        identity = (
+            str(model_path.resolve()),
+            model_path.stat().st_mtime_ns,
+            str(config_path.resolve()),
+            config_path.stat().st_mtime_ns,
+        )
+        with self._lock:
+            if self._session is None or self._identity != identity:
+                self._session = ort.InferenceSession(
+                    str(model_path),
+                    providers=["CPUExecutionProvider"],
+                )
+                self._hps = get_hparams_from_file(str(config_path))
+                symbols = list(self._hps.symbols)
+                self._symbol_to_id = {symbol: index for index, symbol in enumerate(symbols)}
+                self._language = str(manifest.get("frontend_language", "ZH_MIX_EN"))
+                self._sample_rate = int(manifest.get("sample_rate") or self._hps.data.sampling_rate)
+                self._identity = identity
+            return self._session, self._hps, self._symbol_to_id, self._language, self._sample_rate
+
+    def synthesize(self, model_path: Path, manifest: dict, text: str, output_path: Path, settings: dict) -> None:
+        import sys
+
+        if str(MELO_SOURCE_ROOT) not in sys.path:
+            sys.path.insert(0, str(MELO_SOURCE_ROOT))
+        from melo.split_utils import split_sentence
+        from melo.utils import get_text_for_tts_infer
+
+        session, hps, symbol_to_id, language, sample_rate = self._load(model_path, manifest)
+        pieces = split_sentence(text, language_str=language)
+        if not pieces:
+            raise ValueError("MeloTTS 文本前端没有生成可推理的句子")
+        speed = 1 / max(0.2, float(settings.get("length_scale", 1.0)))
+        noise_scale = float(settings.get("noise_scale", 0.6))
+        noise_scale_w = float(settings.get("noise_w_scale", 0.8))
+        sdp_ratio = float(settings.get("sdp_ratio", manifest.get("sdp_ratio", 0.2)))
+        speaker_id = int(manifest.get("speaker_id", 1))
+        frontend_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        audio_segments = []
+        with self._lock:
+            for piece in pieces:
+                if language in ("EN", "ZH_MIX_EN"):
+                    piece = re.sub(r"([a-z])([A-Z])", r"\1 \2", piece)
+                bert, ja_bert, phones, tones, language_ids = get_text_for_tts_infer(
+                    piece,
+                    language,
+                    hps,
+                    frontend_device,
+                    symbol_to_id,
+                )
+                inputs = {
+                    "x": phones.unsqueeze(0).numpy().astype(np.int64),
+                    "x_lengths": np.asarray([phones.numel()], dtype=np.int64),
+                    "tones": tones.unsqueeze(0).numpy().astype(np.int64),
+                    "language": language_ids.unsqueeze(0).numpy().astype(np.int64),
+                    "bert": bert.unsqueeze(0).numpy().astype(np.float32),
+                    "ja_bert": ja_bert.unsqueeze(0).numpy().astype(np.float32),
+                    "sid": np.asarray([speaker_id], dtype=np.int64),
+                    "noise_scale": np.asarray([noise_scale], dtype=np.float32),
+                    "length_scale": np.asarray([float(1 / speed)], dtype=np.float32),
+                    "noise_scale_w": np.asarray([noise_scale_w], dtype=np.float32),
+                    "sdp_ratio": np.asarray([sdp_ratio], dtype=np.float32),
+                }
+                audio = np.asarray(session.run(["y"], inputs)[0], dtype=np.float32)[0, 0]
+                audio_segments.append(audio)
+                audio_segments.append(np.zeros(int(sample_rate * 0.05 / speed), dtype=np.float32))
+        samples = np.concatenate(audio_segments).astype(np.float32)
+        samples *= float(settings.get("volume", 1.0))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, np.clip(samples, -1.0, 1.0), sample_rate, subtype="PCM_16")
+
+
 def _latest_checkpoint(job_dir: Path) -> Path | None:
     checkpoints = [path for path in job_dir.rglob("*.ckpt") if path.is_file()]
     return max(checkpoints, key=lambda path: path.stat().st_mtime_ns) if checkpoints else None
@@ -787,13 +926,16 @@ def export_melo_checkpoint(
     precision = str(precision).strip().lower()
     if precision not in STUDENT_EXPORT_PRECISIONS:
         raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
-    if not (MELO_RESOURCE_TEMPLATE / "tokens.txt").is_file():
-        raise RuntimeError("MeloTTS 部署资源模板缺失，请先保留内置双语 INT8 模型")
+    try:
+        melo_config = json.loads(config_path.read_text(encoding="utf-8"))
+        sample_rate = int(melo_config["data"]["sampling_rate"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("MeloTTS 检查点缺少有效的采样率配置") from exc
     python_path = ROOT / ".venv" / "Scripts" / "python.exe"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"model.{precision}.onnx"
     cache_key = hashlib.sha256(
-        f"{checkpoint_path.resolve()}:{checkpoint_path.stat().st_mtime_ns}:{precision}".encode("utf-8")
+        f"{checkpoint_path.resolve()}:{checkpoint_path.stat().st_mtime_ns}:{config_path.stat().st_mtime_ns}:{precision}:native-v1".encode("utf-8")
     ).hexdigest()[:16]
     runtime_dir = MELO_EXPORT_CACHE_ROOT / cache_key
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -811,6 +953,8 @@ def export_melo_checkpoint(
         str(runtime_output),
         "--precision",
         precision,
+        "--runtime",
+        "native",
     ]
     completed = subprocess.run(
         command,
@@ -826,43 +970,31 @@ def export_melo_checkpoint(
     shutil.copy2(runtime_output, output_path)
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
-    bundle_files = [
-        output_path.name,
-        "tokens.txt",
-        "lexicon.txt",
-        "dict",
-        "phone.fst",
-        "date.fst",
-        "number.fst",
-        "new_heteronym.fst",
-        "LICENSE",
-        "README.md",
-        STUDENT_MANIFEST_NAME,
-    ]
-    for name in bundle_files[1:-1]:
-        source = MELO_RESOURCE_TEMPLATE / name
-        destination = output_dir / name
-        if source.is_dir():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
-        elif source.is_file():
-            shutil.copy2(source, destination)
-        else:
-            raise RuntimeError(f"MeloTTS 部署资源缺失: {name}")
+    bundled_config = output_dir / "config.json"
+    shutil.copy2(config_path, bundled_config)
+    bundle_files = [output_path.name, bundled_config.name]
+    license_path = MELO_SOURCE_ROOT / "LICENSE"
+    if license_path.is_file():
+        shutil.copy2(license_path, output_dir / license_path.name)
+        bundle_files.append(license_path.name)
+    bundle_files.append(STUDENT_MANIFEST_NAME)
     manifest = {
-        "engine": "sherpa_onnx",
-        "engine_label": "MeloTTS",
-        "display_name": f"{output_dir.name} · {precision.upper()}",
+        "engine": "melo_onnx_native",
+        "engine_label": "MeloTTS Native ONNX",
+        "display_name": f"{output_dir.name} · Native · {precision.upper()}",
         "model": output_path.name,
-        "tokens": "tokens.txt",
-        "lexicon": "lexicon.txt",
-        "dict_dir": "dict",
-        "rule_fsts": ["phone.fst", "date.fst", "number.fst", "new_heteronym.fst"],
-        "sample_rate": 44100,
+        "config": bundled_config.name,
+        "frontend_language": "ZH_MIX_EN",
+        "sample_rate": sample_rate,
         "quality": f"{precision}-finetuned",
         "precision": precision,
         "language": "zh_CN+en_US",
         "license": "MIT",
         "speaker_id": 1,
+        "noise_scale": 0.6,
+        "noise_scale_w": 0.8,
+        "sdp_ratio": 0.2,
+        "runtime_requirement": "VoxCPM embedded MeloTTS frontend",
         "source_checkpoint": str(checkpoint_path.relative_to(PIPER_ROOT)),
         "bundle_files": bundle_files,
     }
@@ -1341,6 +1473,7 @@ class OptimizerHeadTrainingRuntime:
 
 piper_voice_runtime = PiperVoiceRuntime()
 sherpa_voice_runtime = SherpaVoiceRuntime()
+melo_native_voice_runtime = NativeMeloVoiceRuntime()
 piper_training = PiperTrainingRuntime()
 melo_training = MeloTrainingRuntime()
 optimizer_head_training = OptimizerHeadTrainingRuntime()
@@ -1358,6 +1491,11 @@ def configure_piper_callbacks(release_inference: Callable[[], None], other_train
     global _release_inference, _other_training_running
     _release_inference = release_inference
     _other_training_running = other_training_running
+
+
+def release_native_melo_frontend() -> None:
+    """Free the native Melo BERT frontend before loading a large VoxCPM model."""
+    melo_native_voice_runtime.release()
 
 
 router = APIRouter()
@@ -1432,7 +1570,7 @@ def optimizer_status() -> dict:
     artifacts = [
         item
         for item in list_piper_artifacts()
-        if item["kind"] == "onnx" and item["previewable"] and item["engine"] in ("piper", "sherpa_onnx")
+        if item["kind"] == "onnx" and item["previewable"] and item["engine"] in ("piper", "sherpa_onnx", "melo_onnx_native")
     ]
     return {
         **optimizer_head_training.snapshot(),
@@ -1506,12 +1644,12 @@ async def start_optimizer_training(
 
     try:
         artifact, model_path = resolve_piper_artifact(model_id, "onnx")
-        if artifact["engine"] not in ("piper", "sherpa_onnx") or not artifact["previewable"]:
+        if artifact["engine"] not in ("piper", "sherpa_onnx", "melo_onnx_native") or not artifact["previewable"]:
             raise ValueError("该 ONNX 缺少批量合成所需的运行配置")
         dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
         if batch_size > dataset["file_count"]:
             raise ValueError("批大小不能超过训练对数量")
-        manifest_path = model_path.parent / STUDENT_MANIFEST_NAME if artifact["engine"] == "sherpa_onnx" else None
+        manifest_path = model_path.parent / STUDENT_MANIFEST_NAME if artifact["engine"] in ("sherpa_onnx", "melo_onnx_native") else None
         config_path = _find_voice_config(model_path) if artifact["engine"] == "piper" else None
         if manifest_path is not None and not manifest_path.is_file():
             raise ValueError("MeloTTS ONNX 缺少学生模型清单")
@@ -1560,6 +1698,7 @@ async def start_optimizer_training(
     await asyncio.to_thread(_release_inference)
     piper_voice_runtime.release()
     sherpa_voice_runtime.release()
+    melo_native_voice_runtime.release()
     try:
         optimizer_head_training.start(config_path_out, job_name, job_dir)
     except (OSError, RuntimeError) as exc:
@@ -1714,6 +1853,9 @@ async def piper_preview(
         config_path = _find_voice_config(model_path) if manifest is None else None
         if manifest is None and config_path is None:
             raise ValueError("模型缺少运行配置")
+        if artifact.get("engine") == "melo_onnx_native":
+            if student_training_running() or _other_training_running():
+                raise ValueError("训练运行时不能试听原生 Melo ONNX")
         settings = {
             "length_scale": length_scale,
             "noise_scale": noise_scale,
@@ -1721,8 +1863,22 @@ async def piper_preview(
             "volume": volume,
             "speaker_id": None,
         }
+        cache_settings = settings
+        if artifact.get("engine") == "melo_onnx_native":
+            cache_settings = {
+                **settings,
+                "noise_scale": 0.6 if math.isclose(noise_scale, 0.667) else noise_scale,
+                "noise_w_scale": 0.8 if math.isclose(noise_w_scale, 0.8) else noise_w_scale,
+                "sdp_ratio": float(manifest.get("sdp_ratio", 0.2)),
+            }
         cache_key = json.dumps(
-            {"model": artifact["id"], "mtime": model_path.stat().st_mtime_ns, "text": clean_text, **settings},
+            {
+                "model": artifact["id"],
+                "mtime": model_path.stat().st_mtime_ns,
+                "manifest_mtime": (model_path.parent / STUDENT_MANIFEST_NAME).stat().st_mtime_ns if manifest else None,
+                "text": clean_text,
+                **cache_settings,
+            },
             ensure_ascii=True,
             sort_keys=True,
         )
@@ -1746,6 +1902,20 @@ async def piper_preview(
                         clean_text,
                         output_path,
                         settings,
+                    )
+                elif artifact.get("engine") == "melo_onnx_native":
+                    if manifest is None:
+                        raise ValueError("原生 Melo ONNX 缺少模型清单")
+                    await asyncio.to_thread(_release_inference)
+                    piper_voice_runtime.release()
+                    sherpa_voice_runtime.release()
+                    await asyncio.to_thread(
+                        melo_native_voice_runtime.synthesize,
+                        model_path,
+                        manifest,
+                        clean_text,
+                        output_path,
+                        cache_settings,
                     )
                 else:
                     await asyncio.to_thread(
@@ -1808,6 +1978,7 @@ async def melo_checkpoint_preview(
             await asyncio.to_thread(_release_inference)
             piper_voice_runtime.release()
             sherpa_voice_runtime.release()
+            melo_native_voice_runtime.release()
             await asyncio.to_thread(
                 preview_melo_checkpoint,
                 checkpoint_path,
@@ -1956,6 +2127,7 @@ async def start_piper_training(
     await asyncio.to_thread(_release_inference)
     piper_voice_runtime.release()
     sherpa_voice_runtime.release()
+    melo_native_voice_runtime.release()
     try:
         piper_training.start(config_path, job_name, job_dir)
     except (OSError, RuntimeError) as exc:
@@ -2053,6 +2225,7 @@ async def start_melo_training(
     await asyncio.to_thread(_release_inference)
     piper_voice_runtime.release()
     sherpa_voice_runtime.release()
+    melo_native_voice_runtime.release()
     try:
         melo_training.start(job_config_path, job_name, job_dir)
     except (OSError, RuntimeError) as exc:
@@ -2086,7 +2259,7 @@ async def export_piper_artifact(artifact_id: str) -> dict:
             if config_path is None:
                 raise ValueError("MeloTTS 检查点缺少完整 config.json")
             job_name = checkpoint_path.parent.parent.name
-            export_name = safe_piper_job_name(f"{job_name}-{checkpoint_path.stem}")
+            export_name = safe_piper_job_name(f"{job_name}-{checkpoint_path.stem}-native-int8")
             output_dir = PIPER_MODELS_ROOT / export_name
             await asyncio.to_thread(export_melo_checkpoint, checkpoint_path, output_dir, config_path)
             exported = next(
@@ -2134,7 +2307,7 @@ async def export_student_artifact(artifact_id: str, precision: str = Form("int8"
                 raise ValueError("MeloTTS 检查点缺少完整 config.json")
             job_name = source_path.parent.parent.name
             output_dir = PIPER_MODELS_ROOT / safe_piper_job_name(
-                f"{job_name}-{source_path.stem}-{precision}"
+                f"{job_name}-{source_path.stem}-native-{precision}"
             )
             output_path = await asyncio.to_thread(
                 export_melo_checkpoint,
@@ -2211,6 +2384,7 @@ def delete_piper_artifact(artifact_id: str) -> dict:
                 config_path.unlink()
         piper_voice_runtime.release()
         sherpa_voice_runtime.release()
+        melo_native_voice_runtime.release()
         return {"deleted": artifact}
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

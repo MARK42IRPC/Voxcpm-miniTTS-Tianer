@@ -160,6 +160,127 @@ def test_sherpa_student_manifest_and_bundle(monkeypatch, tmp_path):
         piper_web._manifest_resource(model_path, "../outside.txt")
 
 
+def test_native_melo_student_manifest_and_bundle(monkeypatch, tmp_path):
+    models = tmp_path / "models"
+    runs = tmp_path / "runs"
+    downloads = tmp_path / "downloads"
+    outputs = tmp_path / "outputs"
+    for directory in (models, runs, downloads, outputs):
+        directory.mkdir()
+    model_dir = models / "native-melo"
+    model_dir.mkdir()
+    model_path = model_dir / "model.fp32.onnx"
+    model_path.write_bytes(b"fake-native-melo-onnx")
+    (model_dir / "config.json").write_text(
+        json.dumps({"train": {}, "model": {}, "data": {}, "symbols": ["_"]}),
+        encoding="utf-8",
+    )
+    (model_dir / piper_web.STUDENT_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "engine": "melo_onnx_native",
+                "engine_label": "MeloTTS Native ONNX",
+                "display_name": "原生质量模型",
+                "model": model_path.name,
+                "config": "config.json",
+                "sample_rate": 44100,
+                "quality": "fp32-finetuned",
+                "precision": "fp32",
+                "language": "zh_CN+en_US",
+                "bundle_files": [model_path.name, "config.json", piper_web.STUDENT_MANIFEST_NAME],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(piper_web, "PIPER_ROOT", tmp_path)
+    monkeypatch.setattr(piper_web, "PIPER_MODELS_ROOT", models)
+    monkeypatch.setattr(piper_web, "PIPER_RUNS_ROOT", runs)
+    monkeypatch.setattr(piper_web, "PIPER_DOWNLOAD_ROOT", downloads)
+    monkeypatch.setattr(piper_web, "PIPER_OUTPUT_ROOT", outputs)
+
+    app = FastAPI()
+    app.include_router(piper_web.router)
+    client = TestClient(app)
+    artifact = piper_web.list_piper_artifacts()[0]
+
+    assert artifact["engine"] == "melo_onnx_native"
+    assert artifact["architecture"] == "melotts"
+    assert artifact["engine_label"] == "MeloTTS Native ONNX"
+    download = client.get(f"/api/piper/download/{artifact['id']}")
+    assert download.status_code == 200
+    with zipfile.ZipFile(next(downloads.glob("*.zip"))) as archive:
+        assert set(archive.namelist()) == {"model.fp32.onnx", "config.json", piper_web.STUDENT_MANIFEST_NAME}
+
+
+def test_native_melo_preview_uses_quality_defaults(monkeypatch, tmp_path):
+    models = tmp_path / "models"
+    runs = tmp_path / "runs"
+    outputs = tmp_path / "outputs"
+    for directory in (models, runs, outputs):
+        directory.mkdir()
+    model_dir = models / "native-melo"
+    model_dir.mkdir()
+    model_path = model_dir / "model.fp32.onnx"
+    model_path.write_bytes(b"fake-native-melo-onnx")
+    (model_dir / "config.json").write_text(
+        json.dumps({"train": {}, "model": {}, "data": {}, "symbols": ["_"]}),
+        encoding="utf-8",
+    )
+    (model_dir / piper_web.STUDENT_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "engine": "melo_onnx_native",
+                "engine_label": "MeloTTS Native ONNX",
+                "model": model_path.name,
+                "config": "config.json",
+                "sample_rate": 44100,
+                "precision": "fp32",
+                "sdp_ratio": 0.2,
+                "bundle_files": [model_path.name, "config.json", piper_web.STUDENT_MANIFEST_NAME],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def synthesize(model, manifest, text, output, settings):
+        captured.update(model=model, manifest=manifest, text=text, settings=settings)
+        sf.write(output, np.zeros(4410, dtype=np.float32), 44100)
+
+    released = []
+    monkeypatch.setattr(piper_web, "PIPER_ROOT", tmp_path)
+    monkeypatch.setattr(piper_web, "PIPER_MODELS_ROOT", models)
+    monkeypatch.setattr(piper_web, "PIPER_RUNS_ROOT", runs)
+    monkeypatch.setattr(piper_web, "PIPER_OUTPUT_ROOT", outputs)
+    monkeypatch.setattr(piper_web, "_release_inference", lambda: released.append(True))
+    monkeypatch.setattr(piper_web.melo_native_voice_runtime, "synthesize", synthesize)
+    app = FastAPI()
+    app.include_router(piper_web.router)
+    artifact = piper_web.list_piper_artifacts()[0]
+
+    response = TestClient(app).post(
+        "/api/piper/preview",
+        data={"model_id": artifact["id"], "text": "原生质量试听。"},
+    )
+
+    assert response.status_code == 200
+    assert captured["model"] == model_path
+    assert captured["text"] == "原生质量试听。"
+    assert captured["settings"]["noise_scale"] == 0.6
+    assert captured["settings"]["noise_w_scale"] == 0.8
+    assert captured["settings"]["sdp_ratio"] == 0.2
+    assert released == [True]
+
+
+def test_native_melo_export_keeps_frontend_and_duration_inputs():
+    source = (piper_web.ROOT / "scripts" / "export_melo_onnx.py").read_text(encoding="utf-8")
+
+    for input_name in ("language", "bert", "ja_bert", "sdp_ratio"):
+        assert f'"{input_name}"' in source
+    assert "sdp_ratio=sdp_ratio" in source
+    assert 'parser.add_argument("--runtime", choices=("native", "sherpa"), default="native")' in source
+
+
 def test_melo_checkpoint_is_classified_separately(monkeypatch, tmp_path):
     models = tmp_path / "models"
     runs = tmp_path / "runs"

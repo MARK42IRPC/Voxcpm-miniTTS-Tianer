@@ -1,6 +1,7 @@
 import torch
 import sys
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+from huggingface_hub import snapshot_download
 
 
 # model_id = 'hfl/chinese-roberta-wwm-ext-large'
@@ -12,10 +13,11 @@ models = {}
 
 def get_bert_feature(text, word2ph, device=None, model_id='hfl/chinese-roberta-wwm-ext-large'):
     if model_id not in models:
+        local_model_path = snapshot_download(repo_id=model_id, local_files_only=True)
         models[model_id] = AutoModelForMaskedLM.from_pretrained(
-            model_id
+            local_model_path,
         ).to(device)
-        tokenizers[model_id] = AutoTokenizer.from_pretrained(model_id)
+        tokenizers[model_id] = AutoTokenizer.from_pretrained(local_model_path)
     model = models[model_id]
     tokenizer = tokenizers[model_id]
 

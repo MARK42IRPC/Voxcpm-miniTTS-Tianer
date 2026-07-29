@@ -57,6 +57,42 @@ class SherpaMeloWrapper(torch.nn.Module):
         )[0]
 
 
+class NativeMeloWrapper(torch.nn.Module):
+    """Keep MeloTTS frontend features and stochastic duration control as graph inputs."""
+
+    def __init__(self, model: SynthesizerTrn) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        x,
+        x_lengths,
+        tones,
+        language,
+        bert,
+        ja_bert,
+        sid,
+        noise_scale,
+        length_scale,
+        noise_scale_w,
+        sdp_ratio,
+    ):
+        return self.model.infer(
+            x=x,
+            x_lengths=x_lengths,
+            sid=sid,
+            tone=tones,
+            language=language,
+            bert=bert,
+            ja_bert=ja_bert,
+            noise_scale=noise_scale,
+            noise_scale_w=noise_scale_w,
+            length_scale=length_scale,
+            sdp_ratio=sdp_ratio,
+        )[0]
+
+
 def _metadata(model_path: Path, values: dict[str, Any]) -> None:
     model = onnx.load(model_path)
     while model.metadata_props:
@@ -93,6 +129,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--precision", choices=("fp32", "fp16", "int8"), default="fp32")
+    parser.add_argument("--runtime", choices=("native", "sherpa"), default="native")
     parser.add_argument("--int8", action="store_true")
     args = parser.parse_args()
     precision = "int8" if args.int8 else args.precision
@@ -111,7 +148,7 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     model.dec.remove_weight_norm()
-    wrapper = SherpaMeloWrapper(model)
+    wrapper = NativeMeloWrapper(model) if args.runtime == "native" else SherpaMeloWrapper(model)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fp32_path = args.output.with_name(f"{args.output.stem}.fp32.onnx") if precision != "fp32" else args.output
@@ -120,26 +157,52 @@ def main() -> None:
     x = torch.randint(0, 10, (1, 60), dtype=torch.int64)
     x_lengths = torch.tensor([60], dtype=torch.int64)
     tones = torch.zeros_like(x)
+    language = torch.zeros_like(x)
+    bert = torch.zeros((1, 1024, x.shape[1]), dtype=torch.float32)
+    ja_bert = torch.zeros((1, 768, x.shape[1]), dtype=torch.float32)
     sid = torch.tensor([1], dtype=torch.int64)
     scale = torch.tensor([1.0], dtype=torch.float32)
+    sdp_ratio = torch.tensor([0.2], dtype=torch.float32)
+    native_inputs = (x, x_lengths, tones, language, bert, ja_bert, sid, scale, scale, scale, sdp_ratio)
+    sherpa_inputs = (x, x_lengths, tones, sid, scale, scale, scale)
+    export_inputs = native_inputs if args.runtime == "native" else sherpa_inputs
+    if args.runtime == "native":
+        input_names = [
+            "x", "x_lengths", "tones", "language", "bert", "ja_bert", "sid",
+            "noise_scale", "length_scale", "noise_scale_w", "sdp_ratio",
+        ]
+        dynamic_axes = {
+            "x": {0: "N", 1: "L"},
+            "x_lengths": {0: "N"},
+            "tones": {0: "N", 1: "L"},
+            "language": {0: "N", 1: "L"},
+            "bert": {0: "N", 2: "L"},
+            "ja_bert": {0: "N", 2: "L"},
+            "sid": {0: "N"},
+            "y": {0: "N", 1: "S", 2: "T"},
+        }
+    else:
+        input_names = ["x", "x_lengths", "tones", "sid", "noise_scale", "length_scale", "noise_scale_w"]
+        dynamic_axes = {
+            "x": {0: "N", 1: "L"},
+            "x_lengths": {0: "N"},
+            "tones": {0: "N", 1: "L"},
+            "y": {0: "N", 1: "S", 2: "T"},
+        }
     try:
         torch.onnx.export(
             wrapper,
-            (x, x_lengths, tones, sid, scale, scale, scale),
+            export_inputs,
             str(fp32_path),
             opset_version=18,
             dynamo=False,
-            input_names=["x", "x_lengths", "tones", "sid", "noise_scale", "length_scale", "noise_scale_w"],
+            input_names=input_names,
             output_names=["y"],
-            dynamic_axes={
-                "x": {0: "N", 1: "L"},
-                "x_lengths": {0: "N"},
-                "tones": {0: "N", 1: "L"},
-                "y": {0: "N", 1: "S", 2: "T"},
-            },
+            dynamic_axes=dynamic_axes,
         )
         metadata = {
-            "model_type": "melo-vits",
+            "model_type": "melo-vits-native" if args.runtime == "native" else "melo-vits",
+            "engine": "melo_onnx_native" if args.runtime == "native" else "sherpa_onnx",
             "comment": "melo fine-tuned by VoxCPM distiller",
             "version": 2,
             "language": "Chinese + English",
@@ -157,6 +220,7 @@ def main() -> None:
             "description": "MeloTTS fine-tuned by VoxCPM distiller",
             "onnx.infer": "onnxruntime.quant" if precision == "int8" else "onnxruntime",
             "precision": precision,
+            "sdp_ratio": 0.2,
         }
         _metadata(fp32_path, metadata)
         if precision == "int8":

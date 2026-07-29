@@ -9,6 +9,7 @@ from .english_utils.abbreviations import expand_abbreviations
 from .english_utils.time_norm import expand_time_english
 from .english_utils.number_norm import normalize_numbers
 from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
 
 
 def distribute_phone(n_phone, n_word):
@@ -192,7 +193,11 @@ def text_normalize(text):
     return text
 
 model_id = 'bert-base-uncased'
-tokenizer = AutoTokenizer.from_pretrained(model_id)
+# Resolve the cache snapshot first. Passing its directory makes recent
+# Transformers versions treat the tokenizer as local and skip metadata probes.
+tokenizer = AutoTokenizer.from_pretrained(
+    snapshot_download(repo_id=model_id, local_files_only=True)
+)
 def g2p_old(text):
     tokenized = tokenizer.tokenize(text)
     # import pdb; pdb.set_trace()

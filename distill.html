@@ -497,7 +497,7 @@
         } else if (item.kind === "melo_checkpoint") {
           const preview = document.createElement("button"); preview.type = "button"; preview.className = "text-action"; preview.textContent = "试听检查点"; preview.onclick = () => previewMeloCheckpoint(item, preview);
           const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "作为起点"; use.onclick = () => { saveEngineSettings(); currentEngine = "sherpa_onnx"; loadEngineSettings(); checkpointValues.sherpa_onnx = item.id; rebuildSelectors(statusData); baseCheckpoint.value = item.id; };
-          const exportButton = document.createElement("button"); exportButton.type = "button"; exportButton.className = "text-action"; exportButton.textContent = "导出 INT8"; exportButton.onclick = () => exportCheckpoint(item, exportButton);
+          const exportButton = document.createElement("button"); exportButton.type = "button"; exportButton.className = "text-action"; exportButton.textContent = "导出原生 INT8"; exportButton.onclick = () => exportCheckpoint(item, exportButton);
           const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 PTH";
           actions.append(preview, use, exportButton, download);
         } else {
