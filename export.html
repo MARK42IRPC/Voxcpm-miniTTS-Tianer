@@ -94,14 +94,14 @@
     .tooltip-trigger::after { content:"?"; display:inline-grid; place-items:center; width:15px; height:15px; flex:0 0 15px; border:1px solid var(--line-strong); border-radius:50%; color:var(--muted); font-size:9px; }
     .property-tooltip { position:fixed; z-index:1000; width:max-content; max-width:min(320px,calc(100vw - 24px)); padding:8px 10px; border:1px solid #3e484d; border-radius:5px; background:#20272a; color:#fff; box-shadow:0 8px 20px rgba(20,28,32,.18); font-size:12px; line-height:1.55; pointer-events:none; opacity:0; transform:translateY(2px); transition:opacity 100ms,transform 100ms; }
     .property-tooltip.visible { opacity:1; transform:translateY(0); }
-    @media (max-width:900px) { .topbar { height:auto; min-height:64px; align-items:stretch; flex-direction:column; padding:10px 14px; } .brand,.runtime { display:none; } .nav { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); } .nav a { min-width:0; padding:7px 2px; overflow:hidden; font-size:11px; text-align:center; text-overflow:ellipsis; white-space:nowrap; } main { padding:12px; } .command-grid { grid-template-columns:minmax(0,1fr); } .export-pane { border-top:1px solid var(--line); border-left:0; } .parameter-grid { grid-template-columns:1fr 1fr; } .filters { grid-template-columns:1fr 1fr; } }
+    @media (max-width:900px) { .topbar { height:auto; min-height:64px; align-items:stretch; flex-direction:column; padding:10px 14px; } .brand,.runtime { display:none; } .nav { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); } .nav a { min-width:0; padding:7px 2px; overflow:hidden; font-size:11px; text-align:center; text-overflow:ellipsis; white-space:nowrap; } main { padding:12px; } .command-grid { grid-template-columns:minmax(0,1fr); } .export-pane { border-top:1px solid var(--line); border-left:0; } .parameter-grid { grid-template-columns:1fr 1fr; } .filters { grid-template-columns:1fr 1fr; } }
     @media (max-width:560px) { .preview-pane,.export-pane { padding:16px; } .section-head { align-items:flex-start; flex-direction:column; gap:6px; } .selected-summary { max-width:100%; text-align:left; } .parameter-grid,.filters { grid-template-columns:minmax(0,1fr); } .filter-types { flex-wrap:wrap; } .preview-actions,.export-actions { display:grid; grid-template-columns:1fr; } .primary,.secondary,.download-action { width:100%; } .preview-result { grid-template-columns:1fr; } .preview-meta { white-space:normal; } .card-grid { grid-template-columns:minmax(0,1fr); } }
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 学生模型导出</strong></div>
-    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a href="/distill">蒸馏</a><a class="active" href="/export">导出</a></nav>
+    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a href="/distill">蒸馏</a><a href="/optimizer">优化头</a><a class="active" href="/export">导出</a></nav>
     <div class="runtime"><span class="status-dot" id="statusDot"></span><span id="runtimeState">正在扫描学生模型</span></div>
   </header>
   <main>

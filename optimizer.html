@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoxCPM 优化头训练</title>
+  <style>
+    :root { --bg:#f4f6f6; --surface:#fff; --surface-muted:#edf1f1; --line:#d8e0e0; --line-strong:#bcc9c9; --ink:#172121; --muted:#647171; --teal:#14795f; --teal-soft:#e6f4ef; --cyan-soft:#e9f6f8; --red:#b44040; --amber:#9a6811; --shadow:0 8px 28px rgba(25,42,42,.07); }
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:320px; background:var(--bg); color:var(--ink); font:13px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif; letter-spacing:0; }
+    button,input,select { font:inherit; letter-spacing:0; }
+    .topbar { position:sticky; z-index:10; top:0; display:flex; align-items:center; justify-content:space-between; min-height:64px; padding:0 22px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.96); }
+    .brand { display:flex; align-items:center; gap:10px; min-width:220px; }
+    .brand img { width:28px; height:28px; object-fit:contain; }
+    .brand strong { font-size:14px; }
+    .nav { display:flex; align-items:center; gap:4px; padding:3px; border-radius:6px; background:var(--surface-muted); }
+    .nav a { padding:7px 10px; border-radius:4px; color:var(--muted); font-size:12px; text-decoration:none; white-space:nowrap; }
+    .nav a.active { background:var(--surface); color:var(--ink); box-shadow:0 1px 4px rgba(20,28,32,.12); }
+    .runtime { min-width:220px; color:var(--muted); font-size:11px; text-align:right; }
+    main { width:min(1420px,100%); margin:0 auto; padding:20px; }
+    .workspace { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(330px,.75fr); gap:14px; align-items:start; }
+    .panel { min-width:0; border:1px solid var(--line); border-radius:6px; background:var(--surface); box-shadow:var(--shadow); }
+    .panel-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:17px 18px 13px; border-bottom:1px solid var(--line); }
+    h1,h2 { margin:0; font-size:15px; line-height:1.3; }
+    .state-badge { flex:0 0 auto; padding:4px 8px; border-radius:4px; background:var(--surface-muted); color:var(--muted); font-size:11px; font-weight:700; }
+    .state-badge.running { background:var(--teal-soft); color:var(--teal); }
+    .state-badge.failed { background:#fbeaea; color:var(--red); }
+    .form-body { padding:17px 18px 19px; }
+    .field { min-width:0; margin-bottom:14px; }
+    label,.field-title { display:block; margin-bottom:6px; color:var(--ink); font-size:12px; font-weight:700; }
+    input,select { width:100%; height:40px; border:1px solid var(--line-strong); border-radius:5px; outline:none; background:var(--surface); color:var(--ink); padding:0 11px; }
+    input:focus,select:focus { border-color:var(--teal); box-shadow:0 0 0 2px rgba(20,121,95,.12); }
+    input:disabled,select:disabled { background:#f1f3f3; color:#8b9696; }
+    .tooltip-trigger::after { content:"?"; display:inline-flex; align-items:center; justify-content:center; width:14px; height:14px; margin-left:5px; border:1px solid var(--line-strong); border-radius:50%; color:var(--muted); font-size:9px; font-weight:400; vertical-align:1px; }
+    .tooltip-trigger { position:relative; }
+    .tooltip-trigger:hover::before,.tooltip-trigger:focus::before { content:attr(data-tooltip); position:absolute; z-index:30; left:0; bottom:calc(100% + 8px); width:min(310px,80vw); padding:8px 10px; border:1px solid var(--line); border-radius:5px; background:#172121; color:#fff; font-size:11px; font-weight:400; line-height:1.45; box-shadow:0 6px 18px rgba(0,0,0,.18); }
+    .model-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:8px; }
+    .summary-cell { min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:5px; background:var(--surface-muted); }
+    .summary-cell span { display:block; color:var(--muted); font-size:10px; }
+    .summary-cell strong { display:block; margin-top:2px; overflow:hidden; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+    .dataset-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:7px; }
+    .parameter-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    .pipeline { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:3px 0 16px; }
+    .pipeline-step { position:relative; min-height:58px; padding:10px 11px 9px 36px; border:1px solid var(--line); border-radius:5px; background:#fafbfb; }
+    .pipeline-step b { position:absolute; left:10px; top:10px; display:flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:50%; background:var(--surface-muted); color:var(--teal); font-size:10px; }
+    .pipeline-step strong { display:block; font-size:11px; }
+    .pipeline-step span { display:block; margin-top:2px; color:var(--muted); font-size:10px; }
+    .actions { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
+    button,.download { display:inline-flex; align-items:center; justify-content:center; height:40px; padding:0 14px; border-radius:5px; cursor:pointer; font-weight:700; text-decoration:none; white-space:nowrap; }
+    button:disabled { cursor:not-allowed; opacity:.48; }
+    .primary { border:1px solid var(--teal); background:var(--teal); color:#fff; }
+    .secondary { border:1px solid var(--line-strong); background:var(--surface); color:var(--teal); }
+    .danger { border:1px solid #d8b7b7; background:#fff; color:var(--red); }
+    .status-body { padding:17px 18px 19px; }
+    .progress-track { height:8px; overflow:hidden; border-radius:4px; background:var(--surface-muted); }
+    .progress-fill { width:0; height:100%; border-radius:4px; background:var(--teal); transition:width .25s ease; }
+    .progress-row { display:flex; justify-content:space-between; gap:12px; margin:7px 0 15px; color:var(--muted); font-size:11px; }
+    .status-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:14px; }
+    .status-stat { padding:9px 10px; border:1px solid var(--line); border-radius:5px; }
+    .status-stat span { display:block; color:var(--muted); font-size:10px; }
+    .status-stat strong { display:block; margin-top:2px; font-size:12px; }
+    .message { min-height:38px; margin-bottom:12px; padding:9px 10px; border-left:3px solid var(--teal); background:var(--cyan-soft); color:#31585b; font-size:11px; }
+    .message.error { border-color:var(--red); background:#fbeeee; color:#833c3c; }
+    pre { height:310px; margin:0; overflow:auto; border:1px solid #263434; border-radius:5px; background:#111919; color:#d8e6e2; padding:10px; font:10px/1.55 Consolas,monospace; white-space:pre-wrap; word-break:break-word; }
+    .outputs { margin-top:14px; }
+    .outputs-body { padding:15px 18px 18px; }
+    .head-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:9px; }
+    .head-card { min-width:0; border:1px solid var(--line); border-radius:5px; padding:12px; background:#fafbfb; }
+    .head-top { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .head-top strong { min-width:0; overflow:hidden; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+    .precision { flex:0 0 auto; padding:2px 6px; border-radius:3px; background:var(--teal-soft); color:var(--teal); font-size:9px; font-weight:700; }
+    .head-meta { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin:10px 0; color:var(--muted); font-size:10px; }
+    .head-source { min-height:31px; overflow:hidden; color:var(--muted); font-size:10px; word-break:break-all; }
+    .download { width:100%; margin-top:10px; border:1px solid var(--line-strong); background:var(--surface); color:var(--teal); font-size:11px; }
+    .empty { padding:24px; color:var(--muted); text-align:center; }
+    @media (max-width:980px) { .topbar { align-items:stretch; flex-direction:column; gap:8px; padding:10px 14px; } .brand,.runtime { display:none; } .nav { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); } .nav a { min-width:0; overflow:hidden; padding:7px 2px; font-size:10px; text-align:center; text-overflow:ellipsis; } main { padding:12px; } .workspace { grid-template-columns:1fr; } .parameter-grid { grid-template-columns:1fr 1fr; } pre { height:220px; } }
+    @media (max-width:560px) { .form-body,.status-body,.outputs-body { padding:14px; } .parameter-grid,.model-summary,.pipeline { grid-template-columns:1fr 1fr; } .dataset-row { grid-template-columns:1fr 1fr; } .dataset-row input { grid-column:1/-1; } .actions { grid-template-columns:1fr; } .pipeline-step:last-child { grid-column:1/-1; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 优化头训练</strong></div>
+    <nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a href="/distill">蒸馏</a><a class="active" href="/optimizer">优化头</a><a href="/export">导出</a></nav>
+    <div class="runtime" id="runtimeText">正在读取运行环境</div>
+  </header>
+
+  <main>
+    <div class="workspace">
+      <section class="panel">
+        <div class="panel-head"><h1>混合频谱优化训练</h1><span class="state-badge" id="datasetState">未检查训练集</span></div>
+        <form class="form-body" id="trainingForm">
+          <div class="field">
+            <label class="tooltip-trigger" for="modelId" tabindex="0" data-tooltip="学生 ONNX 会先按训练集 LAB 文本批量合成临时音频。必须保留对应的 Piper 配置或 MeloTTS 学生模型清单。">需要优化的 ONNX 模型</label>
+            <select id="modelId" name="model_id"><option value="">正在读取学生模型</option></select>
+            <div class="model-summary">
+              <div class="summary-cell"><span>架构</span><strong id="modelArchitecture">-</strong></div>
+              <div class="summary-cell"><span>当前精度</span><strong id="modelPrecision">-</strong></div>
+              <div class="summary-cell"><span>采样率</span><strong id="modelRate">-</strong></div>
+              <div class="summary-cell"><span>模型大小</span><strong id="modelSize">-</strong></div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="文件夹内每个 WAV 必须有同名 LAB。WAV 是干净目标，LAB 用于驱动所选 ONNX 生成对应学生音频。">对齐训练集</label>
+            <div class="dataset-row"><input id="datasetDir" name="dataset_dir" type="text" readonly placeholder="选择包含 WAV 和同名 LAB 的文件夹"><button class="secondary" id="browseDataset" type="button">选择文件夹</button><button class="secondary" id="inspectDataset" type="button">检查</button></div>
+            <div class="model-summary">
+              <div class="summary-cell"><span>训练对</span><strong id="datasetCount">-</strong></div>
+              <div class="summary-cell"><span>总时长</span><strong id="datasetMinutes">-</strong></div>
+              <div class="summary-cell"><span>采样率</span><strong id="datasetRates">-</strong></div>
+              <div class="summary-cell"><span>时长范围</span><strong id="datasetRange">-</strong></div>
+            </div>
+          </div>
+
+          <div class="field"><label class="tooltip-trigger" for="architecture" tabindex="0" data-tooltip="Tiny-CRN 使用频谱掩码与有界残差共同修复沙音，保留学生音频相位以减少音色漂移。">优化头架构</label><select id="architecture" name="architecture"><option value="tiny_crn_hybrid">Tiny-CRN 混合频谱优化</option></select></div>
+
+          <div class="pipeline" aria-label="训练流程">
+            <div class="pipeline-step"><b>1</b><strong>学生音频</strong><span>LAB 批量合成并缓存</span></div>
+            <div class="pipeline-step"><b>2</b><strong>频谱对齐</strong><span>Mel-DTW 单调时间映射</span></div>
+            <div class="pipeline-step"><b>3</b><strong>优化训练</strong><span>验证集择优并导出 ONNX</span></div>
+          </div>
+
+          <div class="parameter-grid">
+            <div class="field"><label class="tooltip-trigger" for="outputName" tabindex="0" data-tooltip="优化头任务目录和导出包名称。空白时按当前时间自动生成。">任务名称</label><input id="outputName" name="output_name" placeholder="自动命名"></div>
+            <div class="field"><label class="tooltip-trigger" for="epochs" tabindex="0" data-tooltip="对齐缓存生成完成后的优化头训练轮数。每轮都会计算验证损失并保留最佳权重。">训练轮数</label><input id="epochs" name="epochs" type="number" min="1" max="500" value="30"></div>
+            <div class="field"><label class="tooltip-trigger" for="batchSize" tabindex="0" data-tooltip="每步同时训练的频谱片段数。4GB 显存默认使用 4，显存有余量可提高。">批大小</label><input id="batchSize" name="batch_size" type="number" min="1" max="32" value="4"></div>
+            <div class="field"><label class="tooltip-trigger" for="learningRate" tabindex="0" data-tooltip="优化头从恒等映射开始训练，默认 0.0003。过高可能过度削弱齿音和气声。">学习率</label><input id="learningRate" name="learning_rate" type="number" min="0.000001" max="0.01" step="0.000001" value="0.0003"></div>
+            <div class="field"><label class="tooltip-trigger" for="trainingPrecision" tabindex="0" data-tooltip="训练计算精度。FP32 最稳定；FP16 更省显存；BF16 需要显卡支持。">训练精度</label><select id="trainingPrecision" name="training_precision"><option value="fp32">FP32</option><option value="fp16">FP16</option><option value="bf16">BF16</option></select></div>
+            <div class="field"><label class="tooltip-trigger" for="exportPrecision" tabindex="0" data-tooltip="最终部署头精度。INT8 会使用真实对齐频谱进行静态校准，FP32 模型始终保留在任务目录。">导出精度</label><select id="exportPrecision" name="export_precision"><option value="fp32">FP32</option><option value="fp16">FP16</option><option value="int8">INT8</option></select></div>
+            <div class="field"><label class="tooltip-trigger" for="validationSplit" tabindex="0" data-tooltip="按音频文件随机抽取验证集，不按文件名或时间顺序截取。默认 10%。">验证集比例</label><input id="validationSplit" name="validation_split" type="number" min="0.05" max="0.3" step="0.01" value="0.1"></div>
+            <div class="field"><label class="tooltip-trigger" for="chunkFrames" tabindex="0" data-tooltip="每个训练片段包含的频谱帧数。默认约 1.1-2.2 秒，视学生模型采样率而定。">频谱片段</label><input id="chunkFrames" name="chunk_frames" type="number" min="64" max="512" step="32" value="192"></div>
+          </div>
+          <div class="actions"><button class="primary" id="startButton" type="submit" disabled>生成对齐集并训练</button><button class="danger" id="stopButton" type="button" disabled>中止任务</button></div>
+        </form>
+      </section>
+
+      <aside class="panel">
+        <div class="panel-head"><h2>任务状态</h2><span class="state-badge" id="taskBadge">未运行</span></div>
+        <div class="status-body">
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <div class="progress-row"><span id="phaseText">等待任务</span><span id="progressText">0%</span></div>
+          <div class="status-grid">
+            <div class="status-stat"><span>当前任务</span><strong id="jobName">-</strong></div>
+            <div class="status-stat"><span>累计耗时</span><strong id="elapsed">00:00</strong></div>
+            <div class="status-stat"><span>阶段进度</span><strong id="stageProgress">0 / 0</strong></div>
+            <div class="status-stat"><span>优化头</span><strong>1,784,018 参数</strong></div>
+          </div>
+          <div class="message" id="message">请选择模型与对齐训练集</div>
+          <pre id="logs">等待任务日志</pre>
+        </div>
+      </aside>
+    </div>
+
+    <section class="panel outputs">
+      <div class="panel-head"><h2>已训练优化头</h2><span class="state-badge" id="headCount">0 个</span></div>
+      <div class="outputs-body"><div class="head-grid" id="headGrid"><div class="empty">暂无优化头</div></div></div>
+    </section>
+  </main>
+
+  <script>
+    const controls = {
+      modelId: document.getElementById("modelId"), datasetDir: document.getElementById("datasetDir"), architecture: document.getElementById("architecture"),
+      outputName: document.getElementById("outputName"), epochs: document.getElementById("epochs"), batchSize: document.getElementById("batchSize"),
+      learningRate: document.getElementById("learningRate"), trainingPrecision: document.getElementById("trainingPrecision"), exportPrecision: document.getElementById("exportPrecision"),
+      validationSplit: document.getElementById("validationSplit"), chunkFrames: document.getElementById("chunkFrames")
+    };
+    const trainingForm = document.getElementById("trainingForm");
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const message = document.getElementById("message");
+    const logs = document.getElementById("logs");
+    let statusData = null;
+    let datasetReady = false;
+    let refreshBusy = false;
+    let attachedStartedAt = 0;
+    let lastLogText = "";
+
+    function selectedModel() { return (statusData?.models || []).find((item) => item.id === controls.modelId.value); }
+    function setMessage(text, error = false) { message.textContent = text; message.className = error ? "message error" : "message"; }
+    function formatElapsed(seconds) { const value = Math.max(0, Math.floor(Number(seconds) || 0)); const h = Math.floor(value / 3600); const m = Math.floor((value % 3600) / 60); const s = value % 60; return h ? `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}` : `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`; }
+    function phaseLabel(phase) { return ({ idle:"等待任务", prepare:"准备训练对", synthesize:"批量生成学生音频", align:"对齐频谱时间轴", train:"训练优化头", validate:"验证最佳权重", export:"导出 ONNX", complete:"任务完成" })[phase] || phase || "等待任务"; }
+
+    function renderModelSummary() {
+      const item = selectedModel();
+      document.getElementById("modelArchitecture").textContent = item?.engine_label || "-";
+      document.getElementById("modelPrecision").textContent = item?.precision?.toUpperCase() || "-";
+      document.getElementById("modelRate").textContent = item?.sample_rate ? `${item.sample_rate} Hz` : "-";
+      document.getElementById("modelSize").textContent = item ? `${Number(item.size_mb).toFixed(1)} MB` : "-";
+      applyControlState();
+    }
+
+    function rebuildModels(models) {
+      const previous = controls.modelId.value;
+      controls.modelId.replaceChildren();
+      if (!models.length) controls.modelId.add(new Option("没有可用的学生 ONNX", ""));
+      models.forEach((item) => controls.modelId.add(new Option(`${item.name} · ${item.engine_label} · ${item.precision.toUpperCase()}`, item.id)));
+      controls.modelId.value = models.some((item) => item.id === previous) ? previous : models[0]?.id || "";
+      renderModelSummary();
+    }
+
+    function applyControlState() {
+      if (!statusData) return;
+      const running = Boolean(statusData.running);
+      const blocked = Boolean(statusData.blocked_by_student_training || statusData.blocked_by_lora_training);
+      Object.values(controls).forEach((control) => { control.disabled = running; });
+      document.getElementById("browseDataset").disabled = running;
+      document.getElementById("inspectDataset").disabled = running;
+      startButton.disabled = running || blocked || !datasetReady || !controls.modelId.value || !statusData.cuda_available;
+      stopButton.disabled = !running;
+    }
+
+    function attachRequest(data) {
+      if (!data.running || !data.request_config || attachedStartedAt === data.started_at) return;
+      attachedStartedAt = data.started_at;
+      const config = data.request_config;
+      for (const [key, value] of Object.entries(config)) {
+        if (key === "dataset_dir") controls.datasetDir.value = value || "";
+        else if (key === "model_id" && data.models.some((item) => item.id === value)) controls.modelId.value = value;
+        else if ({ architecture:"architecture", epochs:"epochs", batch_size:"batchSize", learning_rate:"learningRate", training_precision:"trainingPrecision", export_precision:"exportPrecision", validation_split:"validationSplit", chunk_frames:"chunkFrames" }[key]) {
+          controls[{ architecture:"architecture", epochs:"epochs", batch_size:"batchSize", learning_rate:"learningRate", training_precision:"trainingPrecision", export_precision:"exportPrecision", validation_split:"validationSplit", chunk_frames:"chunkFrames" }[key]].value = value;
+        }
+      }
+      datasetReady = true;
+      renderModelSummary();
+    }
+
+    function renderHeads(heads) {
+      document.getElementById("headCount").textContent = `${heads.length} 个`;
+      const grid = document.getElementById("headGrid");
+      grid.replaceChildren();
+      if (!heads.length) { const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "暂无优化头"; grid.append(empty); return; }
+      heads.forEach((head) => {
+        const card = document.createElement("article"); card.className = "head-card";
+        const top = document.createElement("div"); top.className = "head-top";
+        const name = document.createElement("strong"); name.textContent = head.name; name.title = head.name;
+        const precision = document.createElement("span"); precision.className = "precision"; precision.textContent = head.precision.toUpperCase(); top.append(name, precision);
+        const meta = document.createElement("div"); meta.className = "head-meta";
+        meta.innerHTML = `<span>${Number(head.size_mb).toFixed(2)} MB</span><span>${Number(head.parameter_count || 0).toLocaleString()} 参数</span><span>最佳轮 ${head.best_epoch ?? "-"}</span><span>Loss ${head.validation_loss == null ? "-" : Number(head.validation_loss).toFixed(4)}</span>`;
+        const source = document.createElement("div"); source.className = "head-source"; source.textContent = `源模型：${head.source_model?.name || "未知"}`;
+        const download = document.createElement("a"); download.className = "download"; download.href = `/api/optimizer/download/${head.id}`; download.textContent = "下载优化头包";
+        card.append(top, meta, source, download); grid.append(card);
+      });
+    }
+
+    function renderStatus(data, rebuild = false) {
+      const previousIds = (statusData?.models || []).map((item) => item.id).join(",");
+      const nextIds = data.models.map((item) => item.id).join(",");
+      statusData = data;
+      if (rebuild || previousIds !== nextIds) rebuildModels(data.models);
+      attachRequest(data);
+      renderHeads(data.heads || []);
+      document.getElementById("runtimeText").textContent = data.cuda_available ? `${data.gpu_name} · ${data.gpu_memory_gb} GB` : "CUDA 不可用";
+      const badge = document.getElementById("taskBadge"); badge.textContent = ({ idle:"未运行", running:"运行中", stopping:"正在停止", stopped:"已中止", completed:"已完成", failed:"失败" })[data.status] || data.status;
+      badge.className = `state-badge ${data.running ? "running" : data.status === "failed" ? "failed" : ""}`;
+      const progress = Math.round(Number(data.progress || 0) * 100);
+      document.getElementById("progressFill").style.width = `${progress}%`;
+      document.getElementById("progressText").textContent = `${progress}%`;
+      document.getElementById("phaseText").textContent = phaseLabel(data.phase);
+      document.getElementById("jobName").textContent = data.job_name || "-";
+      document.getElementById("stageProgress").textContent = `${data.current || 0} / ${data.total || 0}`;
+      document.getElementById("elapsed").textContent = formatElapsed(data.elapsed_seconds);
+      if (data.logs !== lastLogText) { const nearBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 36; logs.textContent = data.logs || "等待任务日志"; lastLogText = data.logs; if (nearBottom || data.running) logs.scrollTop = logs.scrollHeight; }
+      if (data.status === "failed") setMessage("优化头任务失败，请查看日志中的最后一条错误", true);
+      else if (data.running) setMessage(`${phaseLabel(data.phase)} · 已运行 ${formatElapsed(data.elapsed_seconds)}`);
+      else if (data.status === "completed") setMessage(`优化头 ${data.output?.model || ""} 已生成`);
+      else if (data.blocked_by_student_training) setMessage("学生模型训练正在运行，优化头任务暂不可启动", true);
+      else if (data.blocked_by_lora_training) setMessage("LoRA 训练正在运行，优化头任务暂不可启动", true);
+      applyControlState();
+    }
+
+    async function refreshStatus(force = false) {
+      if (refreshBusy) return;
+      refreshBusy = true;
+      try {
+        const response = await fetch("/api/optimizer/status", { cache:"no-store" }); const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "优化头状态读取失败");
+        renderStatus(data, force);
+      } catch (error) { setMessage(error.message, true); }
+      finally { refreshBusy = false; }
+    }
+
+    async function browseDataset() {
+      const data = new FormData(); data.set("initial_path", controls.datasetDir.value);
+      document.getElementById("browseDataset").disabled = true;
+      try {
+        const response = await fetch("/api/training-datasets/browse", { method:"POST", body:data }); const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "文件夹选择器启动失败");
+        if (!result.cancelled) { controls.datasetDir.value = result.path; controls.datasetDir.title = result.path; datasetReady = false; await inspectDataset(); }
+      } catch (error) { setMessage(error.message, true); }
+      finally { applyControlState(); }
+    }
+
+    async function inspectDataset() {
+      if (!controls.datasetDir.value) { setMessage("请先选择对齐训练集", true); return; }
+      datasetReady = false; document.getElementById("datasetState").textContent = "检查中"; applyControlState();
+      const data = new FormData(); data.set("dataset_dir", controls.datasetDir.value);
+      try {
+        const response = await fetch("/api/optimizer/dataset", { method:"POST", body:data }); const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "训练集检查失败");
+        datasetReady = true; document.getElementById("datasetState").textContent = "训练集可用";
+        document.getElementById("datasetCount").textContent = result.file_count;
+        document.getElementById("datasetMinutes").textContent = `${Number(result.total_minutes).toFixed(2)} min`;
+        document.getElementById("datasetRates").textContent = Object.keys(result.sample_rates).join(" / ");
+        document.getElementById("datasetRange").textContent = `${Number(result.min_duration).toFixed(1)}-${Number(result.max_duration).toFixed(1)} s`;
+        setMessage(`${result.file_count} 条对齐目标 · ${Number(result.total_minutes).toFixed(2)} 分钟`);
+      } catch (error) { document.getElementById("datasetState").textContent = "训练集不可用"; setMessage(error.message, true); }
+      applyControlState();
+    }
+
+    async function startTraining(event) {
+      event.preventDefault();
+      if (!datasetReady || !controls.modelId.value) { setMessage("请先选择模型并检查对齐训练集", true); return; }
+      const data = new FormData(trainingForm);
+      startButton.disabled = true; setMessage("正在创建优化头任务");
+      try {
+        const response = await fetch("/api/optimizer/train", { method:"POST", body:data }); const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "优化头任务启动失败");
+        attachedStartedAt = 0; await refreshStatus(true);
+      } catch (error) { setMessage(error.message, true); applyControlState(); }
+    }
+
+    async function stopTraining() {
+      stopButton.disabled = true;
+      try { const response = await fetch("/api/optimizer/stop", { method:"POST" }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || "中止失败"); await refreshStatus(); }
+      catch (error) { setMessage(error.message, true); applyControlState(); }
+    }
+
+    controls.modelId.addEventListener("change", renderModelSummary);
+    document.getElementById("browseDataset").addEventListener("click", browseDataset);
+    document.getElementById("inspectDataset").addEventListener("click", inspectDataset);
+    trainingForm.addEventListener("submit", startTraining);
+    stopButton.addEventListener("click", stopTraining);
+    setInterval(() => { if (statusData?.running && statusData.started_at) document.getElementById("elapsed").textContent = formatElapsed(Date.now() / 1000 - statusData.started_at); }, 500);
+    setInterval(() => refreshStatus(), 1500);
+    refreshStatus(true).then(() => { if (!statusData?.running && !controls.datasetDir.value && statusData?.default_dataset) controls.datasetDir.value = statusData.default_dataset; if (controls.datasetDir.value) inspectDataset(); });
+  </script>
+</body>
+</html>

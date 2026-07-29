@@ -52,7 +52,7 @@ from safetensors import safe_open
 
 from voxcpm import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
-from piper_web import configure_piper_callbacks, piper_training, router as piper_router
+from piper_web import configure_piper_callbacks, router as piper_router, student_training_running
 
 
 def configure_torch_cpu_threads() -> int:
@@ -1136,6 +1136,8 @@ async def start_lora_training(
 ) -> dict:
     if lora_training.running:
         raise HTTPException(status_code=409, detail="A LoRA training job is already running")
+    if student_training_running():
+        raise HTTPException(status_code=409, detail="学生模型或优化头训练正在运行，请先停止或等待完成")
     if not torch.cuda.is_available():
         raise HTTPException(status_code=400, detail="LoRA training requires CUDA")
     if model_key not in MODEL_PATHS:
@@ -3149,8 +3151,8 @@ async def generate(
 ) -> dict:
     if lora_training.running:
         raise HTTPException(status_code=409, detail="LoRA training is using the GPU; stop training before inference")
-    if piper_training.running:
-        raise HTTPException(status_code=409, detail="Piper training is using the GPU; stop training before inference")
+    if student_training_running():
+        raise HTTPException(status_code=409, detail="Student-model training is using the GPU; stop training before inference")
     request_started = time.perf_counter()
     created_at = datetime.now().astimezone()
     validate_request(

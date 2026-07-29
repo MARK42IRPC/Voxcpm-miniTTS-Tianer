@@ -354,6 +354,164 @@ def test_export_page_contains_model_filters_and_global_navigation():
         assert 'href="/export"' in (piper_web.ROOT / page).read_text(encoding="utf-8")
 
 
+def test_optimizer_head_model_is_identity_initialized_and_under_ten_megabytes():
+    from scripts.train_optimizer_head import TinyCrnHybrid
+
+    model = TinyCrnHybrid().eval()
+    source = torch.rand(1, 1, 257, 41)
+
+    with torch.inference_mode():
+        output = model(source)
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    assert output.shape == source.shape
+    assert torch.allclose(output, source)
+    assert parameter_count == 1_784_018
+    assert parameter_count * 4 < 10 * 1024**2
+
+
+def test_optimizer_spectral_alignment_matches_student_time_axis(tmp_path):
+    from scripts.train_optimizer_head import align_spectra
+
+    sample_rate = 16000
+    clean_time = np.arange(sample_rate, dtype=np.float32) / sample_rate
+    clean = 0.2 * np.sin(2 * np.pi * 220 * clean_time)
+    student = np.concatenate((np.zeros(1600, dtype=np.float32), clean, np.zeros(800, dtype=np.float32)))
+    clean_path = tmp_path / "clean.wav"
+    student_path = tmp_path / "student.wav"
+    sf.write(clean_path, clean, sample_rate)
+    sf.write(student_path, student, sample_rate)
+
+    input_log, target_log, metadata = align_spectra(student_path, clean_path, sample_rate, 512, 128)
+
+    assert input_log.shape == target_log.shape
+    assert input_log.shape[0] == 257
+    assert metadata["student_frames"] == input_log.shape[1]
+    assert metadata["student_seconds"] > metadata["clean_seconds"]
+    assert np.isfinite(target_log).all()
+
+
+def test_optimizer_training_endpoint_writes_job_and_starts_runtime(monkeypatch, tmp_path):
+    models = tmp_path / "models"
+    runs = tmp_path / "runs"
+    heads = tmp_path / "optimization-heads"
+    downloads = tmp_path / "optimizer-downloads"
+    dataset = tmp_path / "dataset"
+    for directory in (models, runs, heads, downloads, dataset):
+        directory.mkdir()
+    model_dir = models / "student"
+    model_dir.mkdir()
+    model_path = model_dir / "student.onnx"
+    model_path.write_bytes(b"onnx")
+    Path(f"{model_path}.json").write_text(
+        json.dumps({"audio": {"sample_rate": 16000, "quality": "x_low"}, "language": {"code": "zh_CN"}}),
+        encoding="utf-8",
+    )
+    for index in range(2):
+        sf.write(dataset / f"sample-{index}.wav", np.zeros(1600, dtype=np.float32), 16000)
+        (dataset / f"sample-{index}.lab").write_text(f"测试文本 {index}", encoding="utf-8")
+
+    class FakeRuntime:
+        running = False
+
+        def __init__(self):
+            self.started = None
+
+        def start(self, config_path, job_name, job_dir):
+            self.started = (config_path, job_name, job_dir)
+
+        def snapshot(self):
+            return {"status": "idle", "running": False, "logs": "", "started_at": 0}
+
+    runtime = FakeRuntime()
+    monkeypatch.setattr(piper_web, "PIPER_ROOT", tmp_path)
+    monkeypatch.setattr(piper_web, "PIPER_MODELS_ROOT", models)
+    monkeypatch.setattr(piper_web, "PIPER_RUNS_ROOT", runs)
+    monkeypatch.setattr(piper_web, "OPTIMIZER_HEAD_ROOT", heads)
+    monkeypatch.setattr(piper_web, "OPTIMIZER_DOWNLOAD_ROOT", downloads)
+    monkeypatch.setattr(piper_web, "optimizer_head_training", runtime)
+    monkeypatch.setattr(piper_web.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(piper_web, "_other_training_running", lambda: False)
+    artifact = piper_web.list_piper_artifacts()[0]
+    app = FastAPI()
+    app.include_router(piper_web.router)
+
+    response = TestClient(app).post(
+        "/api/optimizer/train",
+        data={
+            "model_id": artifact["id"],
+            "dataset_dir": str(dataset),
+            "architecture": "tiny_crn_hybrid",
+            "output_name": "test-head",
+            "epochs": "3",
+            "batch_size": "2",
+            "learning_rate": "0.0003",
+            "training_precision": "fp32",
+            "export_precision": "int8",
+            "validation_split": "0.1",
+            "chunk_frames": "128",
+        },
+    )
+
+    assert response.status_code == 200
+    config_path, job_name, job_dir = runtime.started
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert job_name == "test-head"
+    assert job_dir == heads / "test-head"
+    assert config["model_path"] == str(model_path.resolve())
+    assert config["sample_rate"] == 16000
+    assert config["n_fft"] == 512
+    assert config["export_precision"] == "int8"
+
+
+def test_optimizer_head_scan_download_and_page_navigation(monkeypatch, tmp_path):
+    heads = tmp_path / "heads"
+    downloads = tmp_path / "downloads"
+    head_dir = heads / "voice-cleaner"
+    head_dir.mkdir(parents=True)
+    downloads.mkdir()
+    model_path = head_dir / "optimizer-head.int8.onnx"
+    model_path.write_bytes(b"head-onnx")
+    (head_dir / "optimizer-head.json").write_text(
+        json.dumps(
+            {
+                "format": "voxcpm-optimizer-head-v1",
+                "display_name": "voice-cleaner",
+                "architecture": "tiny_crn_hybrid",
+                "model": model_path.name,
+                "precision": "int8",
+                "parameter_count": 1_784_018,
+                "sample_rate": 22050,
+                "validation_loss": 0.12,
+                "best_epoch": 4,
+                "source_model": {"id": "student", "name": "student"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(piper_web, "OPTIMIZER_HEAD_ROOT", heads)
+    monkeypatch.setattr(piper_web, "OPTIMIZER_DOWNLOAD_ROOT", downloads)
+    app = FastAPI()
+    app.include_router(piper_web.router)
+    client = TestClient(app)
+
+    listed = piper_web.list_optimizer_heads()
+    response = client.get(f"/api/optimizer/download/{listed[0]['id']}")
+
+    assert listed[0]["precision"] == "int8"
+    assert listed[0]["parameter_count"] == 1_784_018
+    assert response.status_code == 200
+    with zipfile.ZipFile(next(downloads.glob("*.zip"))) as archive:
+        assert set(archive.namelist()) == {"optimizer-head.int8.onnx", "optimizer-head.json"}
+    for page in ("web.html", "lora.html", "datasets.html", "distill.html", "optimizer.html", "export.html"):
+        source = (piper_web.ROOT / page).read_text(encoding="utf-8")
+        assert 'href="/optimizer"' in source
+    optimizer_source = (piper_web.ROOT / "optimizer.html").read_text(encoding="utf-8")
+    assert 'fetch("/api/optimizer/train"' in optimizer_source
+    assert 'id="modelId"' in optimizer_source
+    assert 'id="datasetDir"' in optimizer_source
+
+
 def test_melo_base_status_requires_checkpoint_and_config(monkeypatch, tmp_path):
     base_dir = tmp_path / "MeloTTS-Chinese"
     base_dir.mkdir()

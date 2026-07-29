@@ -30,11 +30,14 @@ from fastapi.responses import FileResponse
 ROOT = Path(__file__).resolve().parent
 DISTILL_PAGE = ROOT / "distill.html"
 EXPORT_PAGE = ROOT / "export.html"
+OPTIMIZER_PAGE = ROOT / "optimizer.html"
 PIPER_ROOT = ROOT / "piper"
 PIPER_MODELS_ROOT = PIPER_ROOT / "models"
 PIPER_RUNS_ROOT = PIPER_ROOT / "runs"
 PIPER_DOWNLOAD_ROOT = PIPER_ROOT / "downloads"
 PIPER_OUTPUT_ROOT = ROOT / "outputs" / "piper"
+OPTIMIZER_HEAD_ROOT = PIPER_ROOT / "optimization-heads"
+OPTIMIZER_DOWNLOAD_ROOT = PIPER_ROOT / "optimizer-downloads"
 MELO_BASE_ROOT = PIPER_ROOT / "melo-bases"
 MELO_BASE_DIR = MELO_BASE_ROOT / "MeloTTS-Chinese"
 MELO_BASE_CHECKPOINT = MELO_BASE_DIR / "checkpoint.pth"
@@ -53,7 +56,15 @@ STUDENT_MANIFEST_NAME = "voxcpm-model.json"
 STUDENT_EXPORT_PRECISIONS = ("fp32", "fp16", "int8")
 ONNX_CONVERSION_LOCK = threading.Lock()
 
-for directory in (PIPER_MODELS_ROOT, PIPER_RUNS_ROOT, PIPER_DOWNLOAD_ROOT, PIPER_OUTPUT_ROOT, MELO_BASE_ROOT):
+for directory in (
+    PIPER_MODELS_ROOT,
+    PIPER_RUNS_ROOT,
+    PIPER_DOWNLOAD_ROOT,
+    PIPER_OUTPUT_ROOT,
+    MELO_BASE_ROOT,
+    OPTIMIZER_HEAD_ROOT,
+    OPTIMIZER_DOWNLOAD_ROOT,
+):
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -420,6 +431,54 @@ def resolve_piper_artifact(artifact_id: str, expected_kind: str | None = None) -
             break
         return artifact, path
     raise ValueError("Piper 模型或检查点不存在")
+
+
+def _optimizer_head_id(path: Path) -> str:
+    relative = path.resolve().relative_to(OPTIMIZER_HEAD_ROOT.resolve()).as_posix()
+    return hashlib.sha256(f"optimizer-head:{relative}".encode("utf-8")).hexdigest()[:16]
+
+
+def list_optimizer_heads() -> list[dict]:
+    heads = []
+    for manifest_path in OPTIMIZER_HEAD_ROOT.glob("*/optimizer-head.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        model_name = Path(str(manifest.get("model", ""))).name
+        model_path = manifest_path.parent / model_name
+        if not model_name or not model_path.is_file():
+            continue
+        stat = model_path.stat()
+        heads.append(
+            {
+                "id": _optimizer_head_id(manifest_path.parent),
+                "name": manifest.get("display_name") or manifest_path.parent.name,
+                "architecture": manifest.get("architecture", "tiny_crn_hybrid"),
+                "precision": manifest.get("precision", "fp32"),
+                "size_mb": round(stat.st_size / 1024**2, 3),
+                "parameter_count": manifest.get("parameter_count"),
+                "sample_rate": manifest.get("sample_rate"),
+                "validation_loss": manifest.get("validation_loss"),
+                "best_epoch": manifest.get("best_epoch"),
+                "source_model": manifest.get("source_model"),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+                "model": model_name,
+            }
+        )
+    heads.sort(key=lambda item: item["modified_at"], reverse=True)
+    return heads
+
+
+def resolve_optimizer_head(head_id: str) -> tuple[dict, Path, Path]:
+    for head in list_optimizer_heads():
+        if head["id"] != head_id:
+            continue
+        for manifest_path in OPTIMIZER_HEAD_ROOT.glob("*/optimizer-head.json"):
+            if _optimizer_head_id(manifest_path.parent) == head_id:
+                model_path = manifest_path.parent / head["model"]
+                return head, model_path, manifest_path
+    raise ValueError("优化头不存在")
 
 
 class PiperVoiceRuntime:
@@ -1117,14 +1176,182 @@ class MeloTrainingRuntime:
             }
 
 
+class OptimizerHeadTrainingRuntime:
+    _progress_pattern = re.compile(
+        r"^\[Head\]\[(?P<phase>[^\]]+)\]\s+(?P<current>\d+)/(?P<total>\d+)\s*(?P<detail>.*)$"
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+        self._logs: deque[str] = deque(maxlen=5000)
+        self._status = "idle"
+        self._phase = "idle"
+        self._current = 0
+        self._total = 0
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._returncode: int | None = None
+        self._job_name: str | None = None
+        self._job_dir: Path | None = None
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._process is not None and self._process.poll() is None
+
+    def start(self, job_config: Path, job_name: str, job_dir: Path) -> None:
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                raise RuntimeError("优化头训练任务已经在运行")
+            python_path = ROOT / ".venv" / "Scripts" / "python.exe"
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            env.setdefault("HF_HOME", str(Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm")) / "hf-cache"))
+            self._process = subprocess.Popen(
+                [str(python_path), "-X", "utf8", "scripts/train_optimizer_head.py", str(job_config)],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self._logs.clear()
+            self._logs.append(f"优化头任务已启动: {job_name}")
+            self._status = "running"
+            self._phase = "prepare"
+            self._current = 0
+            self._total = 0
+            self._started_at = time.time()
+            self._finished_at = None
+            self._returncode = None
+            self._job_name = job_name
+            self._job_dir = job_dir
+            process = self._process
+        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+
+    def _read_process(self, process: subprocess.Popen) -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            clean_line = line.rstrip("\r\n")
+            with self._lock:
+                self._logs.append(clean_line)
+                match = self._progress_pattern.match(clean_line)
+                if match:
+                    self._phase = match.group("phase")
+                    self._current = int(match.group("current"))
+                    self._total = int(match.group("total"))
+        returncode = process.wait()
+        with self._lock:
+            stopping = self._status == "stopping"
+            self._returncode = returncode
+            self._finished_at = time.time()
+            self._status = "stopped" if stopping else "completed" if returncode == 0 else "failed"
+            if returncode == 0:
+                self._phase = "complete"
+
+    def stop(self) -> bool:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return False
+            process = self._process
+            self._status = "stopping"
+            self._logs.append("正在停止优化头任务；已生成的学生音频和对齐缓存会保留。")
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            process.terminate()
+        return True
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = self._finished_at or time.time()
+            elapsed = now - self._started_at if self._started_at else 0.0
+            phase_progress = self._current / self._total if self._total else 0.0
+            if self._phase == "synthesize":
+                progress = 0.6 * max(0.0, (self._current - 0.5) / max(1, self._total))
+            elif self._phase in ("prepare", "align"):
+                progress = 0.6 * phase_progress
+            elif self._phase == "train":
+                progress = 0.6 + 0.32 * phase_progress
+            elif self._phase == "validate":
+                progress = min(0.92, 0.6 + 0.32 * phase_progress)
+            elif self._phase == "export":
+                progress = 0.92 + 0.08 * phase_progress
+            elif self._phase == "complete":
+                progress = 1.0
+            else:
+                progress = 0.0
+            output = None
+            request_config = None
+            if self._job_dir is not None:
+                manifest_path = self._job_dir / "optimizer-head.json"
+                if manifest_path.is_file():
+                    try:
+                        output = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        output = None
+                config_path = self._job_dir / "job.json"
+                if config_path.is_file():
+                    try:
+                        config = json.loads(config_path.read_text(encoding="utf-8"))
+                        request_config = {
+                            key: config.get(key)
+                            for key in (
+                                "architecture",
+                                "epochs",
+                                "batch_size",
+                                "learning_rate",
+                                "training_precision",
+                                "export_precision",
+                                "validation_split",
+                                "chunk_frames",
+                                "dataset_dir",
+                            )
+                        }
+                        request_config["model_id"] = (config.get("source_artifact") or {}).get("id")
+                    except (OSError, json.JSONDecodeError):
+                        request_config = None
+            return {
+                "status": self._status,
+                "running": self._process is not None and self._process.poll() is None,
+                "job_name": self._job_name,
+                "returncode": self._returncode,
+                "elapsed_seconds": round(elapsed, 1),
+                "logs": "\n".join(self._logs),
+                "phase": self._phase,
+                "current": self._current,
+                "total": self._total,
+                "progress": round(min(1.0, max(0.0, progress)), 4),
+                "output": output,
+                "request_config": request_config,
+                "started_at": self._started_at or 0,
+            }
+
+
 piper_voice_runtime = PiperVoiceRuntime()
 sherpa_voice_runtime = SherpaVoiceRuntime()
 piper_training = PiperTrainingRuntime()
 melo_training = MeloTrainingRuntime()
+optimizer_head_training = OptimizerHeadTrainingRuntime()
 _release_inference: Callable[[], None] = lambda: None
 _other_training_running: Callable[[], bool] = lambda: False
 _sherpa_ort_dll = None
 _g2pw_local_tokenizer_configured = False
+
+
+def student_training_running() -> bool:
+    return piper_training.running or melo_training.running or optimizer_head_training.running
 
 
 def configure_piper_callbacks(release_inference: Callable[[], None], other_training_running: Callable[[], bool]) -> None:
@@ -1144,6 +1371,11 @@ def distill_index() -> FileResponse:
 @router.get("/export")
 def export_index() -> FileResponse:
     return FileResponse(EXPORT_PAGE)
+
+
+@router.get("/optimizer")
+def optimizer_index() -> FileResponse:
+    return FileResponse(OPTIMIZER_PAGE)
 
 
 @router.get("/api/piper/status")
@@ -1173,6 +1405,7 @@ def piper_status() -> dict:
         "models": [item for item in artifacts if item["kind"] == "onnx"],
         "checkpoints": [item for item in artifacts if item["kind"] == "checkpoint"],
         "melo_checkpoints": [item for item in artifacts if item["kind"] == "melo_checkpoint"],
+        "optimizer_running": optimizer_head_training.running,
     }
 
 
@@ -1190,8 +1423,178 @@ def export_artifacts() -> dict:
             {"id": "fp16", "label": "FP16", "description": "约半体积，依赖运行端 FP16 算子支持"},
             {"id": "int8", "label": "INT8", "description": "边缘 CPU 推荐，体积与内存最低"},
         ],
-        "busy": piper_training.running or melo_training.running,
+        "busy": student_training_running(),
     }
+
+
+@router.get("/api/optimizer/status")
+def optimizer_status() -> dict:
+    artifacts = [
+        item
+        for item in list_piper_artifacts()
+        if item["kind"] == "onnx" and item["previewable"] and item["engine"] in ("piper", "sherpa_onnx")
+    ]
+    return {
+        **optimizer_head_training.snapshot(),
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "gpu_memory_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
+        if torch.cuda.is_available()
+        else 0,
+        "default_dataset": str(DEFAULT_TRAINING_DATASET),
+        "models": artifacts,
+        "heads": list_optimizer_heads(),
+        "architectures": [
+            {
+                "id": "tiny_crn_hybrid",
+                "label": "Tiny-CRN 混合频谱优化",
+                "description": "约 178 万参数，以频谱掩码和有界残差修复沙音并保留源相位。",
+            }
+        ],
+        "training_precisions": ["fp32", "fp16", "bf16"],
+        "export_precisions": list(STUDENT_EXPORT_PRECISIONS),
+        "blocked_by_student_training": piper_training.running or melo_training.running,
+        "blocked_by_lora_training": _other_training_running(),
+    }
+
+
+@router.post("/api/optimizer/dataset")
+async def optimizer_dataset(dataset_dir: str = Form(...)) -> dict:
+    try:
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {key: value for key, value in dataset.items() if key != "records"}
+
+
+@router.post("/api/optimizer/train")
+async def start_optimizer_training(
+    model_id: str = Form(...),
+    dataset_dir: str = Form(...),
+    architecture: str = Form("tiny_crn_hybrid"),
+    output_name: str = Form(""),
+    epochs: int = Form(30),
+    batch_size: int = Form(4),
+    learning_rate: float = Form(0.0003),
+    training_precision: str = Form("fp32"),
+    export_precision: str = Form("fp32"),
+    validation_split: float = Form(0.1),
+    chunk_frames: int = Form(192),
+) -> dict:
+    if optimizer_head_training.running:
+        raise HTTPException(status_code=409, detail="优化头任务已经在运行")
+    if piper_training.running or melo_training.running:
+        raise HTTPException(status_code=409, detail="学生模型训练正在运行，请先停止或等待完成")
+    if _other_training_running():
+        raise HTTPException(status_code=409, detail="LoRA 训练正在运行，请先暂停")
+    if not torch.cuda.is_available():
+        raise HTTPException(status_code=400, detail="优化头训练需要 CUDA")
+    if architecture != "tiny_crn_hybrid":
+        raise HTTPException(status_code=400, detail="未知优化头架构")
+    if training_precision not in ("fp32", "fp16", "bf16"):
+        raise HTTPException(status_code=400, detail="训练精度无效")
+    if export_precision not in STUDENT_EXPORT_PRECISIONS:
+        raise HTTPException(status_code=400, detail="导出精度无效")
+    if not 1 <= epochs <= 500 or not 1 <= batch_size <= 32:
+        raise HTTPException(status_code=400, detail="训练轮数或批大小无效")
+    if not math.isfinite(learning_rate) or not 1e-6 <= learning_rate <= 0.01:
+        raise HTTPException(status_code=400, detail="学习率无效")
+    if not math.isfinite(validation_split) or not 0.05 <= validation_split <= 0.3:
+        raise HTTPException(status_code=400, detail="验证集比例无效")
+    if not 64 <= chunk_frames <= 512:
+        raise HTTPException(status_code=400, detail="频谱片段长度无效")
+
+    try:
+        artifact, model_path = resolve_piper_artifact(model_id, "onnx")
+        if artifact["engine"] not in ("piper", "sherpa_onnx") or not artifact["previewable"]:
+            raise ValueError("该 ONNX 缺少批量合成所需的运行配置")
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
+        if batch_size > dataset["file_count"]:
+            raise ValueError("批大小不能超过训练对数量")
+        manifest_path = model_path.parent / STUDENT_MANIFEST_NAME if artifact["engine"] == "sherpa_onnx" else None
+        config_path = _find_voice_config(model_path) if artifact["engine"] == "piper" else None
+        if manifest_path is not None and not manifest_path.is_file():
+            raise ValueError("MeloTTS ONNX 缺少学生模型清单")
+        if artifact["engine"] == "piper" and config_path is None:
+            raise ValueError("Piper ONNX 缺少语音配置")
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    base_name = output_name.strip() or f"head-{datetime.now():%y%m%d-%H%M%S}"
+    job_name = safe_piper_job_name(base_name)
+    job_dir = OPTIMIZER_HEAD_ROOT / job_name
+    if job_dir.exists() and any(job_dir.iterdir()):
+        raise HTTPException(status_code=409, detail="同名优化头任务已经存在，请更换任务名称")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    sample_rate = int(artifact.get("sample_rate") or 22050)
+    n_fft = 1024 if sample_rate >= 32000 else 512
+    config = {
+        "job_name": job_name,
+        "job_dir": str(job_dir.resolve()),
+        "dataset_dir": dataset["directory"],
+        "model_path": str(model_path.resolve()),
+        "model_engine": artifact["engine"],
+        "manifest_path": str(manifest_path.resolve()) if manifest_path else None,
+        "config_path": str(config_path.resolve()) if config_path else None,
+        "source_artifact": {key: value for key, value in artifact.items() if key != "export_precisions"},
+        "architecture": architecture,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "training_precision": training_precision,
+        "export_precision": export_precision,
+        "validation_split": validation_split,
+        "chunk_frames": chunk_frames,
+        "sample_rate": sample_rate,
+        "n_fft": n_fft,
+        "hop_length": n_fft // 4,
+        "synthesis": {
+            "length_scale": 1.0,
+            "noise_scale": 0.667,
+            "noise_w_scale": 0.8,
+            "volume": 1.0,
+        },
+    }
+    config_path_out = job_dir / "job.json"
+    config_path_out.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    await asyncio.to_thread(_release_inference)
+    piper_voice_runtime.release()
+    sherpa_voice_runtime.release()
+    try:
+        optimizer_head_training.start(config_path_out, job_name, job_dir)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=f"优化头任务启动失败: {exc}") from exc
+    return {
+        "status": "running",
+        "job_name": job_name,
+        "job_dir": str(job_dir),
+        "model": artifact,
+        "dataset": {key: value for key, value in dataset.items() if key != "records"},
+    }
+
+
+@router.post("/api/optimizer/stop")
+def stop_optimizer_training() -> dict:
+    if not optimizer_head_training.stop():
+        raise HTTPException(status_code=409, detail="没有正在运行的优化头任务")
+    return {"status": "stopping"}
+
+
+@router.get("/api/optimizer/download/{head_id}")
+def download_optimizer_head(head_id: str) -> FileResponse:
+    try:
+        head, model_path, manifest_path = resolve_optimizer_head(head_id)
+        bundle_path = OPTIMIZER_DOWNLOAD_ROOT / f"{safe_piper_job_name(head['name'])}-{head['precision']}.zip"
+        source_signature = max(model_path.stat().st_mtime_ns, manifest_path.stat().st_mtime_ns)
+        if not bundle_path.is_file() or bundle_path.stat().st_mtime_ns < source_signature:
+            temporary_path = bundle_path.with_name(f".{bundle_path.stem}-{time.time_ns():x}.tmp.zip")
+            with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.write(model_path, arcname=model_path.name)
+                archive.write(manifest_path, arcname=manifest_path.name)
+            temporary_path.replace(bundle_path)
+        return FileResponse(bundle_path, media_type="application/zip", filename=bundle_path.name)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.post("/api/export/preview")
@@ -1203,6 +1606,8 @@ async def preview_student_artifact(
     noise_w_scale: float = Form(0.8),
     volume: float = Form(1.0),
 ) -> dict:
+    if optimizer_head_training.running:
+        raise HTTPException(status_code=409, detail="优化头任务运行时不能试听学生模型")
     clean_text = text.strip()
     if not clean_text or len(clean_text) > 500:
         raise HTTPException(status_code=400, detail="试听文本长度必须为 1-500 个字符")
@@ -1231,7 +1636,7 @@ async def preview_student_artifact(
             )
         if artifact["kind"] != "checkpoint":
             raise ValueError("该学生资产不支持试听")
-        if piper_training.running or melo_training.running:
+        if student_training_running():
             raise HTTPException(status_code=409, detail="训练运行时不能试听检查点")
         settings = {
             "length_scale": length_scale,
@@ -1264,7 +1669,7 @@ async def piper_dataset(dataset_dir: str = Form(...)) -> dict:
 
 @router.post("/api/melo/base/download")
 async def download_melo_base() -> dict:
-    if piper_training.running or melo_training.running:
+    if student_training_running():
         raise HTTPException(status_code=409, detail="训练运行时不能下载基座")
 
     def download() -> None:
@@ -1293,6 +1698,8 @@ async def piper_preview(
     noise_w_scale: float = Form(0.8),
     volume: float = Form(1.0),
 ) -> dict:
+    if optimizer_head_training.running:
+        raise HTTPException(status_code=409, detail="优化头任务运行时不能试听学生模型")
     clean_text = text.strip()
     if not clean_text or len(clean_text) > 500:
         raise HTTPException(status_code=400, detail="试听文本长度必须为 1-500 个字符")
@@ -1385,7 +1792,7 @@ async def melo_checkpoint_preview(
         raise HTTPException(status_code=400, detail="试听文本长度必须为 1-500 个字符")
     if not math.isfinite(speed) or not math.isfinite(volume) or not 0.3 <= speed <= 3 or not 0.1 <= volume <= 3:
         raise HTTPException(status_code=400, detail="MeloTTS 试听语速超出范围")
-    if piper_training.running or melo_training.running:
+    if student_training_running():
         raise HTTPException(status_code=409, detail="训练运行时不能试听 MeloTTS 检查点")
     try:
         artifact, checkpoint_path = resolve_piper_artifact(checkpoint_id, "melo_checkpoint")
@@ -1442,6 +1849,8 @@ async def start_piper_training(
         raise HTTPException(status_code=409, detail="Piper 训练任务已经在运行")
     if melo_training.running:
         raise HTTPException(status_code=409, detail="MeloTTS 训练正在运行")
+    if optimizer_head_training.running:
+        raise HTTPException(status_code=409, detail="优化头训练正在运行")
     if _other_training_running():
         raise HTTPException(status_code=409, detail="LoRA 训练正在运行，请先暂停")
     if not torch.cuda.is_available():
@@ -1579,6 +1988,8 @@ async def start_melo_training(
         raise HTTPException(status_code=409, detail="MeloTTS 训练任务已经在运行")
     if piper_training.running:
         raise HTTPException(status_code=409, detail="Piper 训练正在运行")
+    if optimizer_head_training.running:
+        raise HTTPException(status_code=409, detail="优化头训练正在运行")
     if _other_training_running():
         raise HTTPException(status_code=409, detail="LoRA 训练正在运行，请先暂停")
     if not torch.cuda.is_available():
@@ -1666,7 +2077,7 @@ def stop_piper_training() -> dict:
 
 @router.post("/api/piper/export/{artifact_id}")
 async def export_piper_artifact(artifact_id: str) -> dict:
-    if piper_training.running or melo_training.running:
+    if student_training_running():
         raise HTTPException(status_code=409, detail="训练运行时不能导出检查点")
     try:
         artifact, checkpoint_path = resolve_piper_artifact(artifact_id)
@@ -1700,7 +2111,7 @@ async def export_piper_artifact(artifact_id: str) -> dict:
 
 @router.post("/api/export/artifact/{artifact_id}")
 async def export_student_artifact(artifact_id: str, precision: str = Form("int8")) -> dict:
-    if piper_training.running or melo_training.running:
+    if student_training_running():
         raise HTTPException(status_code=409, detail="训练运行时不能导出学生模型")
     precision = str(precision).strip().lower()
     try:
@@ -1771,7 +2182,7 @@ async def export_student_artifact(artifact_id: str, precision: str = Form("int8"
 
 @router.delete("/api/piper/artifacts/{artifact_id}")
 def delete_piper_artifact(artifact_id: str) -> dict:
-    if piper_training.running or melo_training.running:
+    if student_training_running():
         raise HTTPException(status_code=409, detail="训练运行时不能删除模型或检查点")
     try:
         artifact, path = resolve_piper_artifact(artifact_id)
