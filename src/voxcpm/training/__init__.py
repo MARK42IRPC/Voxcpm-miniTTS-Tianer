@@ -10,6 +10,7 @@ from .accelerator import Accelerator
 from .tracker import TrainingTracker
 from .data import (
     load_audio_text_datasets,
+    filter_dataset_by_duration,
     HFVoxCPMDataset,
     build_dataloader,
     BatchProcessor,
@@ -24,6 +25,7 @@ __all__ = [
     "BatchProcessor",
     "TrainingState",
     "load_audio_text_datasets",
+    "filter_dataset_by_duration",
     "build_dataloader",
     "validate_manifest",
     "ValidationResult",

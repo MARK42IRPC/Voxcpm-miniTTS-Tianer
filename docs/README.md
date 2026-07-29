@@ -104,6 +104,7 @@ Python、CUDA 运行库和下载缓存会占用额外空间。推荐至少预留
 入口：`http://127.0.0.1:8810/distill`
 
 - Piper：训练、试听、检查点导出和模型管理。
+- Piper Plus：使用六语言 MB-iSTFT-VITS2 基座微调，训练完成后自动导出 FP16 ONNX；检查点也可继续训练、试听并导出 FP32/FP16/INT8。
 - MeloTTS：使用官方中文基座进行中文或中英混合微调。
 - MeloTTS 默认使用 FP32，也可选择 BF16/FP16；loss 或梯度出现 NaN/Inf 时立即停止且不保存无效检查点。
 - MeloTTS 检查点可试听并导出约 50 MB 的 INT8 ONNX 部署包。
@@ -117,6 +118,9 @@ Python、CUDA 运行库和下载缓存会占用额外空间。推荐至少预留
 pretrained_models/   VoxCPM 与 ZipEnhancer 模型
 piper/models/        Piper、MeloTTS ONNX 部署模型
 piper/runs/          学生模型训练检查点
+piper/plus-models/   Piper Plus ONNX 部署模型
+piper/plus-runs/     Piper Plus 训练检查点
+piper/piper-plus-bases/ Piper Plus 多语言训练基座
 piper/melo-bases/    MeloTTS 官方训练基座
 lora/                本机 LoRA 工程、日志和检查点
 outputs/             生成和后处理音频
@@ -152,6 +156,16 @@ LoRA 必须与训练时使用的 VoxCPM 架构匹配。部分编译优化可能�
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Profile recommended -UseChinaMirror
 ```
 
+### Piper Plus 显示独立环境未安装
+
+重新运行总安装器，或只修复 Piper Plus 环境：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_piper_plus.ps1
+```
+
+Piper Plus 固定使用独立的 `.venv-piper-plus`，以免它的 `piper` 包覆盖主 WebUI 使用的 `piper-tts`。
+
 ## 开发与维护
 
 同步依赖并安装开发工具：
@@ -183,6 +197,7 @@ upstream  OpenBMB/VoxCPM 原项目
 | OpenBMB VoxCPM | 基础模型、推理与微调代码 | [项目](https://github.com/OpenBMB/VoxCPM) · [模型](https://huggingface.co/openbmb) · Apache-2.0 |
 | MeloTTS | 中英学生模型训练与导出 | [项目](https://github.com/myshell-ai/MeloTTS) · MIT |
 | Piper | 轻量 VITS 训练和 ONNX 语音 | [项目](https://github.com/OHF-Voice/piper1-gpl) · GPL-3.0 |
+| Piper Plus | 多语言 MB-iSTFT-VITS2 学生模型训练与推理 | [项目](https://github.com/ayutaz/piper-plus) · MIT |
 | sherpa-onnx | MeloTTS ONNX 运行时 | [项目](https://github.com/k2-fsa/sherpa-onnx) · Apache-2.0 |
 | ZipEnhancer | 参考音频降噪 | [模型](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base) · Apache-2.0 |
 

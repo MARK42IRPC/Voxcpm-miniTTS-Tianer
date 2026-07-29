@@ -61,6 +61,42 @@ def load_audio_text_datasets(
     return train_ds, val_ds
 
 
+def filter_dataset_by_duration(
+    ds: Dataset,
+    *,
+    min_duration: float = 0.0,
+    max_duration: float = 0.0,
+) -> Dataset:
+    """Keep samples whose audio duration falls within the configured range.
+
+    A zero bound disables that side of the range. WebUI manifests provide a
+    ``duration`` field, avoiding audio decoding while filtering; generic
+    JSONL manifests are supported by deriving durations from the audio data.
+    """
+    if min_duration < 0 or max_duration < 0:
+        raise ValueError("Duration bounds must be greater than or equal to 0.")
+    if max_duration > 0 and min_duration > max_duration:
+        raise ValueError("min_duration cannot exceed max_duration.")
+    if min_duration == 0 and max_duration == 0:
+        return ds
+
+    if "duration" in ds.column_names:
+        durations = ds["duration"]
+    else:
+        durations = []
+        for index in range(len(ds)):
+            audio = ds[index][DEFAULT_AUDIO_COLUMN]
+            durations.append(len(audio["array"]) / float(audio["sampling_rate"]))
+
+    keep_indices = [
+        index
+        for index, duration in enumerate(durations)
+        if (min_duration == 0 or float(duration) >= min_duration)
+        and (max_duration == 0 or float(duration) <= max_duration)
+    ]
+    return ds.select(keep_indices)
+
+
 def compute_sample_lengths(
     ds: Dataset,
     audio_vae_fps: int = 25,

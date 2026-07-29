@@ -130,6 +130,12 @@ if (-not (Test-Path -LiteralPath $Python)) {
     throw "Dependency installation completed without creating $Python"
 }
 
+Write-Step "Installing the isolated Piper Plus student-model environment"
+& (Join-Path $RepoRoot "scripts\setup_piper_plus.ps1") -UvExe $ResolvedUv
+if ($LASTEXITCODE -ne 0) {
+    throw "Piper Plus environment installation failed with exit code $LASTEXITCODE"
+}
+
 Write-Step "Installing model profile: $SelectedProfile"
 $ModelArgs = @("-X", "utf8", "scripts/install_models.py", "--profile", $SelectedProfile)
 if ($ForceModels) {

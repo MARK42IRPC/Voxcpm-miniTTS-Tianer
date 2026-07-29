@@ -72,7 +72,7 @@ def synthesis_key(job: dict, text: str) -> str:
 
 
 def synthesize_student(job: dict, text: str, output_path: Path) -> None:
-    import piper_web
+    from voxcpm.web import piper_web
 
     model_path = Path(job["model_path"])
     settings = {

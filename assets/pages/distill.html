@@ -177,6 +177,10 @@
             <label class="tooltip-trigger" for="datasetDir" tabindex="0" data-tooltip="使用包含 WAV 和同名 .lab 的训练集。Piper 会自动重采样并生成音素缓存。">训练集</label>
             <div class="dataset-row"><input id="datasetDir" name="dataset_dir" type="text" readonly placeholder="请选择包含 WAV 和同名 LAB 的文件夹"><button class="secondary" id="browseDataset" type="button">选择文件夹</button><button class="secondary" id="inspectDataset" type="button">检查训练集</button></div>
           </div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="minDuration" tabindex="0" data-tooltip="筛掉短于此值的样本。填 0 表示不设置下限。">最短时长（秒）</label><input id="minDuration" name="min_duration" type="number" min="0" max="3600" step="0.1" value="0"></div>
+            <div class="field"><label class="tooltip-trigger" for="maxDuration" tabindex="0" data-tooltip="筛掉长于此值的样本。填 0 表示不设置上限；长文本 Melo 训练建议设置上限以控制显存。">最长时长（秒）</label><input id="maxDuration" name="max_duration" type="number" min="0" max="3600" step="0.1" value="0"></div>
+          </div>
           <div class="stats"><div class="stat"><strong id="fileCount">-</strong><span>训练对</span></div><div class="stat"><strong id="totalMinutes">-</strong><span>分钟</span></div><div class="stat"><strong id="sampleRates">-</strong><span>原采样率</span></div><div class="stat"><strong id="durationRange">-</strong><span>时长范围</span></div></div>
         </section>
 
@@ -188,10 +192,11 @@
             <div class="field"><label class="tooltip-trigger" id="baseCheckpointLabel" for="baseCheckpoint" tabindex="0" data-tooltip="选择与当前学生架构匹配的检查点作为微调起点。">微调起点</label><select id="baseCheckpoint" name="base_checkpoint_id"><option value="">从头训练</option></select></div>
           </div>
           <div class="model-row engine-hidden" id="meloBasePanel" style="margin-top:14px"><div class="model-summary" id="meloBaseSummary" style="margin:0;align-self:center">正在检查官方基座</div><button class="secondary" id="downloadMeloBase" type="button">下载官方基座</button></div>
+          <div class="model-row engine-hidden" id="piperPlusBasePanel" style="margin-top:14px"><div class="model-summary" id="piperPlusBaseSummary" style="margin:0;align-self:center">正在检查 Piper Plus 多语言基座</div><button class="secondary" id="downloadPiperPlusBase" type="button">下载 302MB 基座</button></div>
           <div class="field-grid">
             <div class="field"><label class="tooltip-trigger" id="epochsLabel" for="numEpochs" tabindex="0" data-tooltip="完整遍历训练集的次数，应结合检查点试听判断是否过拟合。">训练轮数</label><input id="numEpochs" name="num_epochs" type="number" min="1" max="5000" value="100"></div>
             <div class="field"><label class="tooltip-trigger" id="learningRateLabel" for="learningRate" tabindex="0" data-tooltip="微调步长。MeloTTS 官方基座建议从 0.00005 开始。">学习率</label><input id="learningRate" name="learning_rate" type="number" min="0.000001" max="0.01" step="0.000001" value="0.0001"></div>
-            <div class="field"><label class="tooltip-trigger" for="batchSize" tabindex="0" data-tooltip="直接影响显存峰值。RTX 3050 4GB 默认保持为 1。">批次大小</label><input id="batchSize" name="batch_size" type="number" min="1" max="16" value="1"></div>
+            <div class="field"><label class="tooltip-trigger" for="batchSize" tabindex="0" data-tooltip="直接影响显存峰值。可输入任意正整数；超出显存时训练会在日志中报告 CUDA OOM。">批次大小</label><input id="batchSize" name="batch_size" type="number" min="1" value="1"></div>
           </div>
           <div class="field-grid">
             <div class="field"><label class="tooltip-trigger" for="validationSplit" tabindex="0" data-tooltip="留作验证和选择检查点的数据比例。400 条左右建议 0.05。">验证集比例</label><input id="validationSplit" name="validation_split" type="number" min="0.01" max="0.3" step="0.01" value="0.05"></div>
@@ -239,8 +244,9 @@
     const engineSettings = {
       piper: { numEpochs: "100", learningRate: "0.0001", batchSize: "1", validationSplit: "0.05", saveEvery: "5", numWorkers: "1" },
       sherpa_onnx: { numEpochs: "50", learningRate: "0.00005", batchSize: "1", validationSplit: "0.05", saveEvery: "5", numWorkers: "1" },
+      piper_plus: { numEpochs: "300", learningRate: "0.00002", batchSize: "4", validationSplit: "0.05", saveEvery: "25", numWorkers: "1" },
     };
-    const checkpointValues = { piper: "", sherpa_onnx: "official-melotts-chinese" };
+    const checkpointValues = { piper: "", sherpa_onnx: "official-melotts-chinese", piper_plus: "ayousanz-piper-plus-base" };
 
     const propertyTooltip = document.createElement("div");
     propertyTooltip.className = "property-tooltip";
@@ -280,7 +286,7 @@
     }
 
     function selectedModel() { return statusData?.models?.find((item) => item.id === onnxModel.value); }
-    function selectedCheckpoint() { return [...(statusData?.checkpoints || []), ...(statusData?.melo_checkpoints || [])].find((item) => item.id === baseCheckpoint.value); }
+    function selectedCheckpoint() { return [...(statusData?.checkpoints || []), ...(statusData?.melo_checkpoints || []), ...(statusData?.piper_plus_checkpoints || [])].find((item) => item.id === baseCheckpoint.value); }
     function visibleModels(data = statusData) { return data?.models?.filter((item) => item.engine === currentEngine) || []; }
 
     function saveEngineSettings() {
@@ -300,41 +306,56 @@
       const busy = data.running || data.optimizer_running;
       form.querySelectorAll("input, select").forEach((input) => { input.disabled = busy; });
       const trainable = data.student_engines.some((engine) => engine.id === currentEngine && engine.trainable);
-      trainingSection.querySelectorAll("input, select").forEach((input) => { input.disabled = busy || !trainable; });
+      trainingSection.querySelectorAll("input, select").forEach((input) => { input.disabled = busy; });
       studentFamily.querySelectorAll("button").forEach((button) => { button.disabled = busy; });
       document.getElementById("browseDataset").disabled = busy;
       stopButton.disabled = !data.running;
-      const meloStartReady = currentEngine !== "sherpa_onnx" || baseCheckpoint.value !== "official-melotts-chinese" || data.melo_base?.installed;
-      startButton.disabled = busy || !trainable || !datasetReady || !data.cuda_available || !meloStartReady;
+      const baseReady = currentEngine === "sherpa_onnx"
+        ? baseCheckpoint.value !== "official-melotts-chinese" || data.melo_base?.installed
+        : currentEngine !== "piper_plus" || baseCheckpoint.value !== "ayousanz-piper-plus-base" || data.piper_plus_base?.installed;
+      startButton.disabled = busy || !trainable || !datasetReady || !data.cuda_available || !baseReady;
       previewButton.disabled = busy || !selectedModel();
     }
 
     function updateTrainingMode() {
       const isPiper = currentEngine === "piper";
+      const isMelo = currentEngine === "sherpa_onnx";
+      const isPiperPlus = currentEngine === "piper_plus";
       trainingSection.classList.remove("inactive");
       document.getElementById("piperQualityField").classList.toggle("engine-hidden", !isPiper);
       document.getElementById("piperTrimRow").classList.toggle("engine-hidden", !isPiper);
-      document.getElementById("meloOptions").classList.toggle("engine-hidden", isPiper);
-      document.getElementById("meloBasePanel").classList.toggle("engine-hidden", isPiper);
-      document.getElementById("trainingTitle").textContent = isPiper ? "Piper 微调设置" : "MeloTTS 微调设置";
-      document.getElementById("trainingHint").textContent = isPiper ? "4GB 默认配置" : `44.1kHz · ${document.getElementById("meloPrecision").value.toUpperCase()} · 非有限值自动停止`;
-      startButton.textContent = isPiper ? "开始 Piper 微调" : "开始 MeloTTS 微调";
+      document.getElementById("meloOptions").classList.toggle("engine-hidden", !isMelo);
+      document.getElementById("meloBasePanel").classList.toggle("engine-hidden", !isMelo);
+      document.getElementById("piperPlusBasePanel").classList.toggle("engine-hidden", !isPiperPlus);
+      document.getElementById("trainingTitle").textContent = isPiper ? "Piper 微调设置" : isMelo ? "MeloTTS 微调设置" : "Piper Plus 多语言微调设置";
+      document.getElementById("trainingHint").textContent = isPiper ? "4GB 默认配置" : isMelo ? `44.1kHz · ${document.getElementById("meloPrecision").value.toUpperCase()} · 非有限值自动停止` : statusData?.student_engines?.find((engine) => engine.id === "piper_plus")?.trainable ? "22.05kHz · 6 语言代码切换 · MB-iSTFT-VITS2" : "请重新运行 install.ps1 安装独立环境";
+      startButton.textContent = isPiper ? "开始 Piper 微调" : isMelo ? "开始 MeloTTS 微调" : "开始 Piper Plus 微调";
       const baseLabel = document.getElementById("baseCheckpointLabel");
-      baseLabel.dataset.tooltip = isPiper ? "选择 CKPT 作为权重热启动；规格必须与 Piper 模型一致。" : "默认从官方 MeloTTS-Chinese 生成器开始，也可选择已有 G_*.pth 继续微调。";
+      baseLabel.dataset.tooltip = isPiper ? "选择 CKPT 作为权重热启动；规格必须与 Piper 模型一致。" : isMelo ? "默认从官方 MeloTTS-Chinese 生成器开始，也可选择已有 G_*.pth 继续微调。" : "固定使用 Piper Plus 302MB 六语言多说话人基座，并自动转为单说话人微调。";
       const base = statusData?.melo_base;
       document.getElementById("meloBaseSummary").textContent = base?.installed
         ? `${base.name} · ${base.size_mb.toFixed(2)} MB · ${base.sample_rate} Hz · ${base.license}`
         : "官方 MeloTTS-Chinese 基座尚未下载";
       document.getElementById("downloadMeloBase").textContent = base?.installed ? "重新校验" : "下载官方基座";
+      const plusBase = statusData?.piper_plus_base;
+      const plusEnvironment = statusData?.piper_plus_environment;
+      document.getElementById("piperPlusBaseSummary").textContent = plusBase?.installed
+        ? `${plusBase.name} · ${plusBase.size_mb.toFixed(2)} MB · ${plusBase.sample_rate} Hz · ${plusBase.architecture}${plusEnvironment?.installed ? ` · 环境 ${plusEnvironment.version || "就绪"}` : " · 独立环境未安装"}`
+        : `Piper Plus 六语言 302MB 训练基座尚未下载${plusEnvironment?.installed ? "" : " · 独立环境未安装"}`;
+      document.getElementById("downloadPiperPlusBase").textContent = plusBase?.installed ? "重新校验" : "下载 302MB 基座";
       applyControlState();
     }
 
     function rebuildCheckpointSelector(data) {
       const isPiper = currentEngine === "piper";
-      const items = isPiper ? data.checkpoints : data.melo_checkpoints;
+      const isPiperPlus = currentEngine === "piper_plus";
+      const items = isPiper ? data.checkpoints : isPiperPlus ? (data.piper_plus_checkpoints || []) : data.melo_checkpoints;
       baseCheckpoint.replaceChildren();
       if (isPiper) {
         baseCheckpoint.add(new Option("从头训练", ""));
+      } else if (isPiperPlus) {
+        const label = data.piper_plus_base?.installed ? `Piper Plus 六语言基座 · ${data.piper_plus_base.size_mb.toFixed(1)}MB` : "Piper Plus 六语言基座 · 尚未下载";
+        baseCheckpoint.add(new Option(label, "ayousanz-piper-plus-base"));
       } else {
         const label = data.melo_base?.installed ? `官方 MeloTTS-Chinese · ${data.melo_base.size_mb.toFixed(1)}MB` : "官方 MeloTTS-Chinese · 尚未下载";
         baseCheckpoint.add(new Option(label, "official-melotts-chinese"));
@@ -342,7 +363,7 @@
       items.forEach((item) => baseCheckpoint.add(new Option(`${item.recommended ? "推荐 · " : ""}${item.name} · ${item.size_mb.toFixed(1)}MB`, item.id)));
       let preferred = checkpointValues[currentEngine];
       if (![...baseCheckpoint.options].some((option) => option.value === preferred)) {
-        preferred = isPiper ? data.checkpoints.find((item) => item.recommended)?.id || "" : "official-melotts-chinese";
+        preferred = isPiper ? data.checkpoints.find((item) => item.recommended)?.id || "" : isPiperPlus ? "ayousanz-piper-plus-base" : "official-melotts-chinese";
       }
       baseCheckpoint.value = preferred;
       checkpointValues[currentEngine] = preferred;
@@ -477,7 +498,7 @@
     }
 
     function renderArtifacts(data) {
-      const items = [...data.models, ...data.checkpoints, ...(data.melo_checkpoints || [])].sort((a, b) => b.modified_at.localeCompare(a.modified_at));
+      const items = [...data.models, ...data.checkpoints, ...(data.melo_checkpoints || []), ...(data.piper_plus_checkpoints || [])].sort((a, b) => b.modified_at.localeCompare(a.modified_at));
       const list = document.getElementById("artifactList");
       document.getElementById("artifactCount").textContent = String(items.length);
       list.replaceChildren();
@@ -486,7 +507,7 @@
         const row = document.createElement("div"); row.className = "artifact";
         const title = document.createElement("div"); title.className = "artifact-title";
         const strong = document.createElement("strong"); strong.textContent = item.name;
-        const kind = document.createElement("span"); kind.className = "kind"; kind.textContent = item.kind === "onnx" ? item.engine_label : item.kind === "melo_checkpoint" ? "Melo PTH" : "Piper CKPT";
+        const kind = document.createElement("span"); kind.className = "kind"; kind.textContent = item.kind === "onnx" ? item.engine_label : item.kind === "melo_checkpoint" ? "Melo PTH" : item.kind === "piper_plus_checkpoint" ? "Piper Plus CKPT" : "Piper CKPT";
         title.append(strong, kind);
         const meta = document.createElement("div"); meta.className = "artifact-meta"; meta.textContent = `${item.size_mb.toFixed(2)} MB · ${item.language || ""} · ${item.relative_path}`;
         const actions = document.createElement("div"); actions.className = "artifact-actions";
@@ -501,7 +522,8 @@
           const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 PTH";
           actions.append(preview, use, exportButton, download);
         } else {
-          const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "作为起点"; use.onclick = () => { saveEngineSettings(); currentEngine = "piper"; loadEngineSettings(); checkpointValues.piper = item.id; rebuildSelectors(statusData); baseCheckpoint.value = item.id; };
+          const targetEngine = item.kind === "piper_plus_checkpoint" ? "piper_plus" : "piper";
+          const use = document.createElement("button"); use.type = "button"; use.className = "text-action"; use.textContent = "作为起点"; use.onclick = () => { saveEngineSettings(); currentEngine = targetEngine; loadEngineSettings(); checkpointValues[targetEngine] = item.id; rebuildSelectors(statusData); baseCheckpoint.value = item.id; };
           const exportButton = document.createElement("button"); exportButton.type = "button"; exportButton.className = "text-action"; exportButton.textContent = "导出 ONNX"; exportButton.onclick = () => exportCheckpoint(item, exportButton);
           const download = document.createElement("a"); download.className = "text-action"; download.href = `/api/piper/download/${item.id}`; download.textContent = "下载 CKPT";
           actions.append(use, exportButton, download);
@@ -519,7 +541,7 @@
       document.getElementById("runDot").className = `status-dot ${data.running ? "running" : data.status === "failed" ? "error" : data.status === "completed" ? "ready" : ""}`;
       document.getElementById("elapsed").textContent = formatElapsed(data.elapsed_seconds);
       const nearBottom = logs.scrollHeight - logs.scrollTop - logs.clientHeight < 48;
-      logs.textContent = data.logs || `等待 ${data.active_engine === "sherpa_onnx" ? "MeloTTS" : "Piper"} 训练任务`;
+      logs.textContent = data.logs || `等待 ${data.active_engine === "sherpa_onnx" ? "MeloTTS" : data.active_engine === "piper_plus" ? "Piper Plus" : "Piper"} 训练任务`;
       if (nearBottom) logs.scrollTop = logs.scrollHeight;
       const device = document.getElementById("deviceStatus");
       device.querySelector(".status-dot").className = `status-dot ${data.cuda_available ? "ready" : "error"}`;
@@ -537,7 +559,7 @@
         const response = await fetch("/api/piper/status", { cache: "no-store" });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "Piper 状态读取失败");
-        const changed = !statusData || data.models.length !== statusData.models.length || data.checkpoints.length !== statusData.checkpoints.length || (data.melo_checkpoints || []).length !== (statusData.melo_checkpoints || []).length || data.melo_base?.installed !== statusData.melo_base?.installed;
+        const changed = !statusData || data.models.length !== statusData.models.length || data.checkpoints.length !== statusData.checkpoints.length || (data.melo_checkpoints || []).length !== (statusData.melo_checkpoints || []).length || (data.piper_plus_checkpoints || []).length !== (statusData.piper_plus_checkpoints || []).length || data.melo_base?.installed !== statusData.melo_base?.installed || data.piper_plus_base?.installed !== statusData.piper_plus_base?.installed || data.piper_plus_environment?.installed !== statusData.piper_plus_environment?.installed;
         renderStatus(data, forceRebuild || changed);
       } catch (error) {
         message.className = "message error"; message.textContent = error.message;
@@ -592,7 +614,7 @@
       }
       datasetReady = false;
       document.getElementById("datasetState").textContent = "检查中";
-      const data = new FormData(); data.set("dataset_dir", datasetDir.value);
+      const data = new FormData(); data.set("dataset_dir", datasetDir.value); data.set("min_duration", document.getElementById("minDuration").value); data.set("max_duration", document.getElementById("maxDuration").value);
       try {
         const response = await fetch("/api/piper/dataset", { method: "POST", body: data });
         const result = await response.json();
@@ -632,8 +654,34 @@
         updateTrainingMode();
       }
     });
+    document.getElementById("downloadPiperPlusBase").addEventListener("click", async () => {
+      const button = document.getElementById("downloadPiperPlusBase");
+      button.disabled = true;
+      button.textContent = "下载中";
+      message.className = "message";
+      message.textContent = "正在下载 Piper Plus 六语言 302MB 训练基座";
+      try {
+        const response = await fetch("/api/piper-plus/base/download", { method: "POST" });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Piper Plus 基座下载失败");
+        message.textContent = `Piper Plus 基座已就绪 · ${result.base.size_mb.toFixed(2)} MB`;
+        await refreshStatus(true);
+      } catch (error) {
+        message.className = "message error";
+        message.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        updateTrainingMode();
+      }
+    });
     document.getElementById("browseDataset").addEventListener("click", browseDatasetDirectory);
     document.getElementById("inspectDataset").addEventListener("click", inspectDataset);
+    ["minDuration", "maxDuration"].forEach((id) => document.getElementById(id).addEventListener("input", () => {
+      if (!datasetDir.value) return;
+      datasetReady = false;
+      document.getElementById("datasetState").textContent = "范围已变更";
+      if (statusData) applyControlState(statusData);
+    }));
     baseCheckpoint.addEventListener("change", () => { checkpointValues[currentEngine] = baseCheckpoint.value; if (statusData) applyControlState(statusData); });
     onnxModel.addEventListener("change", updateModelSummary);
     document.getElementById("quality").addEventListener("change", (event) => {
@@ -662,18 +710,19 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       saveEngineSettings();
-      const isPiper = currentEngine === "piper";
-      startButton.disabled = true; message.className = "message"; message.textContent = `正在启动 ${isPiper ? "Piper" : "MeloTTS"} 微调`;
+      const engineLabels = { piper: "Piper", sherpa_onnx: "MeloTTS", piper_plus: "Piper Plus" };
+      const endpoint = { piper: "/api/piper/train", sherpa_onnx: "/api/melo/train", piper_plus: "/api/piper-plus/train" }[currentEngine];
+      startButton.disabled = true; message.className = "message"; message.textContent = `正在启动 ${engineLabels[currentEngine]} 微调`;
       const data = new FormData(form); data.set("base_checkpoint_id", baseCheckpoint.value); data.set("trim_silence", document.getElementById("trimSilence").checked ? "true" : "false");
       try {
-        const response = await fetch(isPiper ? "/api/piper/train" : "/api/melo/train", { method: "POST", body: data });
-        const result = await response.json(); if (!response.ok) throw new Error(result.detail || `${isPiper ? "Piper" : "MeloTTS"} 训练启动失败`);
+        const response = await fetch(endpoint, { method: "POST", body: data });
+        const result = await response.json(); if (!response.ok) throw new Error(result.detail || `${engineLabels[currentEngine]} 训练启动失败`);
         message.textContent = `${result.job_name} · ${result.quality} · 已启动`; await refreshStatus(true);
       } catch (error) { message.className = "message error"; message.textContent = error.message; startButton.disabled = !datasetReady; }
     });
 
     stopButton.addEventListener("click", async () => {
-      const activeName = statusData?.active_engine === "sherpa_onnx" ? "MeloTTS" : "Piper";
+      const activeName = { piper: "Piper", sherpa_onnx: "MeloTTS", piper_plus: "Piper Plus" }[statusData?.active_engine] || "Piper";
       if (!confirm(`停止当前 ${activeName} 训练？已经保存的检查点与输入缓存会保留，当前批次不会保存。`)) return;
       stopButton.disabled = true;
       try { const response = await fetch("/api/piper/stop", { method: "POST" }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || "停止失败"); message.textContent = `正在停止 ${activeName} 训练`; }

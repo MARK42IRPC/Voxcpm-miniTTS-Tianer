@@ -38,6 +38,7 @@ from voxcpm.training import (
     BatchProcessor,
     TrainingTracker,
     build_dataloader,
+    filter_dataset_by_duration,
     load_audio_text_datasets,
 )
 
@@ -61,6 +62,8 @@ def train(
     warmup_steps: int = 1_000,
     max_steps: int = 100_000,
     max_batch_tokens: int = 0,
+    min_duration: float = 0.0,
+    max_duration: float = 0.0,
     save_path: str = "checkpoints",
     tensorboard: str = "",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
@@ -117,6 +120,45 @@ def train(
         val_manifest=val_manifest,
         sample_rate=sample_rate,
     )
+
+    if min_duration < 0 or max_duration < 0:
+        raise ValueError("min_duration and max_duration must be greater than or equal to 0")
+    if max_duration > 0 and min_duration > max_duration:
+        raise ValueError("min_duration cannot exceed max_duration")
+    if min_duration > 0 or max_duration > 0:
+        original_train_count = len(train_ds)
+        train_ds = filter_dataset_by_duration(
+            train_ds,
+            min_duration=min_duration,
+            max_duration=max_duration,
+        )
+        if accelerator.rank == 0:
+            range_label = (
+                f"{min_duration:g}s to {max_duration:g}s"
+                if max_duration > 0
+                else f"at least {min_duration:g}s"
+            )
+            tracker.print(
+                f"Duration filtering ({range_label}) kept {len(train_ds)} / {original_train_count} training samples."
+            )
+        if not len(train_ds):
+            raise ValueError("No training samples remain after duration filtering")
+
+        if val_ds is not None:
+            original_val_count = len(val_ds)
+            val_ds = filter_dataset_by_duration(
+                val_ds,
+                min_duration=min_duration,
+                max_duration=max_duration,
+            )
+            if accelerator.rank == 0:
+                tracker.print(
+                    f"Duration filtering kept {len(val_ds)} / {original_val_count} validation samples."
+                )
+            if not len(val_ds):
+                val_ds = None
+                if accelerator.rank == 0:
+                    tracker.print("No validation samples remain after duration filtering; validation is disabled.")
 
     def tokenize(batch):
         text_list = batch["text"]

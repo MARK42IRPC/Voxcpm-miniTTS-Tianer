@@ -52,8 +52,10 @@ from safetensors import safe_open
 
 from voxcpm import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
-from piper_web import (
+from voxcpm.web.piper_web import (
+    convert_onnx_precision,
     configure_piper_callbacks,
+    onnx_session_options,
     release_native_melo_frontend,
     router as piper_router,
     student_training_running,
@@ -84,11 +86,15 @@ TORCH_CPU_THREADS = configure_torch_cpu_threads()
 
 
 ROOT = Path(__file__).resolve().parent
-WEB_PAGE = ROOT / "web.html"
-LORA_PAGE = ROOT / "lora.html"
-DATASETS_PAGE = ROOT / "datasets.html"
+PAGES_ROOT = ROOT / "assets" / "pages"
+WEB_PAGE = PAGES_ROOT / "web.html"
+LORA_PAGE = PAGES_ROOT / "lora.html"
+DATASETS_PAGE = PAGES_ROOT / "datasets.html"
+LABS_PAGE = PAGES_ROOT / "labs.html"
+ASSEMBLY_PAGE = PAGES_ROOT / "assembly.html"
 OUTPUT_ROOT = ROOT / "outputs" / "web"
 LORA_ROOT = ROOT / "lora"
+ONNX_COMPONENT_ROOT = ROOT / "pretrained_models" / "onnx"
 MODEL_PATHS = {
     "voxcpm2": ROOT / "pretrained_models" / "VoxCPM2",
     "voxcpm1.5": ROOT / "pretrained_models" / "VoxCPM1.5",
@@ -265,6 +271,54 @@ class InferenceJobRuntime:
                 state["completed_segments"] / state["total_segments"] if state["total_segments"] else 0.0
             )
             return state
+
+
+class OnnxComponentExportRuntime:
+    """Serialize component exports and expose their state to the assembly UI."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = self._idle_state()
+
+    @staticmethod
+    def _idle_state() -> dict:
+        return {
+            "running": False,
+            "status": "idle",
+            "component": None,
+            "model_key": None,
+            "precision": None,
+            "artifact": None,
+            "error": None,
+            "started_at": 0.0,
+            "finished_at": 0.0,
+        }
+
+    def start(self, component: str, model_key: str, precision: str) -> None:
+        with self._lock:
+            if self._state["running"]:
+                raise RuntimeError("已有 ONNX 导出任务正在运行")
+            self._state = {
+                **self._idle_state(),
+                "running": True,
+                "status": "running",
+                "component": component,
+                "model_key": model_key,
+                "precision": precision,
+                "started_at": time.time(),
+            }
+
+    def finish(self, artifact: dict | None = None, error: str | None = None) -> None:
+        with self._lock:
+            self._state["running"] = False
+            self._state["finished_at"] = time.time()
+            self._state["artifact"] = dict(artifact) if artifact else None
+            self._state["error"] = error
+            self._state["status"] = "error" if error else "completed"
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {**self._state, "artifact": dict(self._state["artifact"]) if self._state["artifact"] else None}
 
 
 class ModelRuntime:
@@ -520,6 +574,124 @@ class ModelRuntime:
 
 runtime = ModelRuntime()
 inference_job = InferenceJobRuntime()
+onnx_component_export = OnnxComponentExportRuntime()
+
+
+def export_audio_vae_decoder_onnx(model_key: str, precision: str) -> dict:
+    """Export and execute-check a standalone AudioVAE decoder ONNX component."""
+    model_path = MODEL_PATHS[model_key]
+    if not (model_path / "config.json").is_file():
+        raise FileNotFoundError(f"Model is not installed: {model_path}")
+
+    # Deliberately load only the VAE checkpoint. Loading the full LM merely to
+    # export this component consumes gigabytes and makes the "quick export"
+    # action impractical on a workstation already doing inference.
+    config_data = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    architecture = str(config_data.get("architecture", "voxcpm")).lower()
+    if architecture == "voxcpm2":
+        from voxcpm.modules.audiovae.audio_vae_v2 import AudioVAE, AudioVAEConfig
+    elif architecture == "voxcpm":
+        from voxcpm.modules.audiovae.audio_vae import AudioVAE, AudioVAEConfig
+    else:
+        raise ValueError(f"Unsupported VoxCPM architecture: {architecture}")
+    vae = AudioVAE(config=AudioVAEConfig(**config_data.get("audio_vae_config", {})))
+    vae_checkpoint = model_path / "audiovae.safetensors"
+    if vae_checkpoint.is_file():
+        from safetensors.torch import load_file
+
+        vae_state = load_file(vae_checkpoint, device="cpu")
+    else:
+        vae_checkpoint = model_path / "audiovae.pth"
+        if not vae_checkpoint.is_file():
+            raise FileNotFoundError(f"AudioVAE checkpoint not found: {vae_checkpoint}")
+        checkpoint = torch.load(vae_checkpoint, map_location="cpu", weights_only=True)
+        vae_state = checkpoint.get("state_dict", checkpoint)
+    vae.load_state_dict(vae_state, strict=True)
+    try:
+        vae = vae.eval().cpu()
+        decoder = vae.decoder.eval().cpu()
+        latent = torch.zeros((1, int(vae.latent_dim), 8), dtype=torch.float32)
+        has_sample_rate = getattr(decoder, "sr_bin_boundaries", None) is not None
+        sample_rate = torch.tensor(
+            [int(getattr(vae, "out_sample_rate", vae.sample_rate))], dtype=torch.int32
+        )
+        inputs = (latent, sample_rate) if has_sample_rate else (latent,)
+        input_names = ["latent", "sample_rate"] if has_sample_rate else ["latent"]
+        dynamic_axes = {"latent": {0: "batch", 2: "frames"}, "audio": {0: "batch", 2: "samples"}}
+
+        output_dir = ONNX_COMPONENT_ROOT / model_key / "audio_vae_decoder"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"audio_vae_decoder.{precision}.onnx"
+        source_path = output_dir / f".audio_vae_decoder.{time.time_ns():x}.fp32.onnx"
+        converted_path = output_dir / f".audio_vae_decoder.{time.time_ns():x}.converted.{precision}.onnx"
+        try:
+            with torch.inference_mode():
+                torch.onnx.export(
+                    decoder,
+                    inputs,
+                    str(source_path),
+                    input_names=input_names,
+                    output_names=["audio"],
+                    dynamic_axes=dynamic_axes,
+                    opset_version=17,
+                    do_constant_folding=True,
+                    dynamo=False,
+                )
+            convert_onnx_precision(source_path, converted_path, precision, low_memory=True)
+
+            import onnx
+            import onnxruntime as ort
+
+            onnx_model = onnx.load(converted_path)
+            onnx.checker.check_model(onnx_model)
+            session = ort.InferenceSession(
+                str(converted_path),
+                sess_options=onnx_session_options(ort),
+                providers=["CPUExecutionProvider"],
+            )
+            feed = {"latent": latent.numpy()}
+            if has_sample_rate:
+                feed["sample_rate"] = sample_rate.numpy()
+            output = session.run(["audio"], feed)[0]
+            if output.ndim != 3 or output.shape[0] != 1 or output.shape[1] != 1 or output.shape[2] <= 0:
+                raise RuntimeError(f"ONNX Runtime returned an invalid decoder output shape: {output.shape}")
+            converted_path.replace(output_path)
+        finally:
+            source_path.unlink(missing_ok=True)
+            converted_path.unlink(missing_ok=True)
+
+        manifest = {
+            "component": "audio_vae_decoder",
+            "model_key": model_key,
+            "architecture": architecture,
+            "source_model": str(model_path),
+            "precision": precision,
+            "inputs": input_names,
+            "output": "audio",
+            "dynamic_axes": {"latent": [0, 2], "audio": [0, 2]},
+            "validated_with": "onnxruntime",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "file": output_path.name,
+            "size_bytes": output_path.stat().st_size,
+        }
+        (output_dir / f"audio_vae_decoder.{precision}.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return {"path": str(output_path), "relative_path": str(output_path.relative_to(ROOT)), **manifest}
+    finally:
+        del vae
+        gc.collect()
+
+
+def run_onnx_component_export(component: str, model_key: str, precision: str) -> None:
+    try:
+        if component != "vae_decoder":
+            raise ValueError("当前仅支持导出 AudioVAE Decoder；其余组件仍在接口验证阶段")
+        artifact = export_audio_vae_decoder_onnx(model_key, precision)
+    except Exception as exc:
+        onnx_component_export.finish(error=str(exc))
+    else:
+        onnx_component_export.finish(artifact=artifact)
 
 
 def read_lab_text(path: Path) -> str:
@@ -755,6 +927,51 @@ def lora_index() -> FileResponse:
 @app.get("/datasets")
 def datasets_index() -> FileResponse:
     return FileResponse(DATASETS_PAGE)
+
+
+@app.get("/labs")
+def labs_index() -> FileResponse:
+    return FileResponse(LABS_PAGE)
+
+
+@app.get("/labs/assembly")
+def assembly_index() -> FileResponse:
+    return FileResponse(ASSEMBLY_PAGE)
+
+
+@app.get("/api/labs/assembly/onnx/status")
+def assembly_onnx_export_status() -> dict:
+    return onnx_component_export.snapshot()
+
+
+@app.post("/api/labs/assembly/onnx/export")
+async def start_assembly_onnx_export(
+    component: str = Form(...),
+    model_key: str = Form(...),
+    precision: str = Form("fp32"),
+) -> dict:
+    component = component.strip().lower()
+    model_key = model_key.strip()
+    precision = precision.strip().lower()
+    if model_key not in MODEL_PATHS:
+        raise HTTPException(status_code=400, detail="未知 VoxCPM 模型")
+    if not (MODEL_PATHS[model_key] / "config.json").is_file():
+        raise HTTPException(status_code=400, detail="所选模型尚未安装")
+    if precision not in {"fp32", "fp16", "int8"}:
+        raise HTTPException(status_code=400, detail="导出精度仅支持 FP32、FP16 或 INT8")
+    if component != "vae_decoder":
+        raise HTTPException(status_code=400, detail="该组件尚未具备已验证的 ONNX 导出接口")
+    try:
+        onnx_component_export.start(component, model_key, precision)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    threading.Thread(
+        target=run_onnx_component_export,
+        args=(component, model_key, precision),
+        daemon=True,
+        name="voxcpm-onnx-export",
+    ).start()
+    return onnx_component_export.snapshot()
 
 
 @app.get("/api/status")
@@ -1139,6 +1356,8 @@ async def start_lora_training(
     enable_dit: bool = Form(True),
     enable_proj: bool = Form(False),
     low_vram: bool = Form(True),
+    min_duration: float = Form(0.0),
+    max_duration: float = Form(0.0),
 ) -> dict:
     if lora_training.running:
         raise HTTPException(status_code=409, detail="A LoRA training job is already running")
@@ -1163,6 +1382,10 @@ async def start_lora_training(
         raise HTTPException(status_code=400, detail="Training epochs or checkpoint interval is invalid")
     if not 1e-7 <= learning_rate <= 0.1:
         raise HTTPException(status_code=400, detail="Learning rate is invalid")
+    if min_duration < 0 or max_duration < 0:
+        raise HTTPException(status_code=400, detail="Duration bounds must be greater than or equal to 0")
+    if max_duration > 0 and min_duration > max_duration:
+        raise HTTPException(status_code=400, detail="Minimum duration cannot exceed maximum duration")
 
     try:
         dataset = await asyncio.to_thread(inspect_lora_dataset, dataset_dir)
@@ -1210,6 +1433,8 @@ async def start_lora_training(
         "warmup_steps": min(30, max(1, num_iters // 10)),
         "max_steps": num_iters,
         "max_batch_tokens": 0,
+        "min_duration": min_duration,
+        "max_duration": max_duration,
         "max_grad_norm": 1.0,
         "save_path": str(checkpoints_dir),
         "tensorboard": str(logs_dir),

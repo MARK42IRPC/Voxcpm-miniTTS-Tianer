@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoxCPM 实验室</title>
+  <style>
+    :root { color-scheme: light; --canvas:#f4f6f7; --surface:#fff; --surface-muted:#eef1f2; --ink:#171a1c; --muted:#657078; --line:#d9dfe2; --line-strong:#aeb8bd; --green:#147a55; --green-hover:#0f6848; --teal:#147684; --red:#b43b3b; }
+    * { box-sizing:border-box; } body { margin:0; min-width:320px; background:var(--canvas); color:var(--ink); font:14px/1.5 Inter,"Segoe UI","Microsoft YaHei",sans-serif; }
+    button,input,select,textarea { font:inherit; } button,select { cursor:pointer; }
+    .topbar { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:18px; padding:10px 24px; background:var(--surface); border-bottom:1px solid var(--line); }
+    .brand { display:flex; align-items:center; gap:10px; white-space:nowrap; } .brand img { width:28px; height:28px; object-fit:contain; }
+    .nav { display:flex; align-items:center; gap:3px; overflow:auto; } .nav a { color:var(--muted); text-decoration:none; padding:7px 9px; border-radius:4px; white-space:nowrap; font-weight:700; font-size:12px; } .nav a:hover,.nav a.active { color:var(--teal); background:#e7f3f5; }
+    main { max-width:1180px; margin:0 auto; padding:28px 24px 48px; } .page-head { display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:20px; } h1 { margin:0; font-size:22px; } h2 { margin:0; font-size:15px; } .hint { color:var(--muted); font-size:12px; }
+    .layout { display:grid; grid-template-columns:210px minmax(0,1fr); gap:18px; } .labs-nav,.panel { border:1px solid var(--line); background:var(--surface); border-radius:6px; } .labs-nav { padding:8px; align-self:start; } .lab-link { display:block; padding:10px; color:var(--muted); text-decoration:none; border-radius:4px; font-weight:700; } .lab-link.active { color:var(--teal); background:#e7f3f5; } .lab-link.disabled { opacity:.5; cursor:not-allowed; }
+    .panel { padding:20px; } .panel-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px; } .tag { display:inline-flex; align-items:center; min-height:22px; padding:2px 7px; border:1px solid #8bbac2; border-radius:3px; background:#eef8f9; color:var(--teal); font-size:11px; font-weight:700; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; } .field { min-width:0; } label { display:block; margin-bottom:6px; color:var(--muted); font-size:12px; font-weight:700; } input,select,textarea { width:100%; border:1px solid var(--line-strong); border-radius:5px; background:#fff; color:var(--ink); outline:none; } input,select { height:40px; padding:0 10px; } textarea { min-height:142px; padding:10px; resize:vertical; } input:focus,select:focus,textarea:focus { border-color:var(--teal); box-shadow:0 0 0 3px rgba(20,118,132,.12); }
+    .summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1px; overflow:hidden; margin:18px 0; border:1px solid var(--line); border-radius:5px; background:var(--line); } .summary div { min-width:0; padding:10px; background:var(--surface-muted); } .summary span { display:block; color:var(--muted); font-size:11px; } .summary strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+    .actions { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:16px; } .message { color:var(--muted); font-size:12px; } .message.error { color:var(--red); } .primary { height:40px; padding:0 16px; border:0; border-radius:5px; background:var(--green); color:#fff; font-weight:700; } .primary:hover { background:var(--green-hover); } .primary:disabled { cursor:wait; opacity:.55; }
+    .result { display:none; margin-top:18px; padding-top:18px; border-top:1px solid var(--line); } .result.visible { display:block; } audio { width:100%; margin-top:9px; } .download { color:var(--teal); font-weight:700; font-size:12px; } .notice { margin:0 0 16px; padding:10px 12px; border-left:3px solid var(--teal); background:#eef8f9; color:#35555b; font-size:12px; }
+    @media (max-width:760px) { .topbar { align-items:flex-start; flex-direction:column; padding:12px 16px; } main { padding:20px 12px 36px; } .layout { grid-template-columns:1fr; } .labs-nav { display:flex; gap:6px; overflow:auto; } .lab-link { white-space:nowrap; } .grid,.summary { grid-template-columns:1fr; } .actions { align-items:stretch; flex-direction:column; } .primary { width:100%; } }
+  </style>
+</head>
+<body>
+  <header class="topbar"><div class="brand"><img src="/assets/voxcpm_logo.png" alt="VoxCPM"><strong>VoxCPM 实验室</strong></div><nav class="nav" aria-label="页面切换"><a href="/">推理</a><a href="/lora">LoRA 训练</a><a href="/datasets">训练集</a><a href="/distill">蒸馏</a><a href="/export">导出</a><a class="active" href="/labs">实验室</a></nav></header>
+  <main>
+    <div class="page-head"><div><h1>实验室</h1><div class="hint">验证模型组合、运行时和部署路径的独立工作区</div></div><span class="tag">实验功能</span></div>
+    <div class="layout">
+      <nav class="labs-nav" aria-label="实验项目"><a class="lab-link active" href="#lora-fusion">LoRA 融合试听</a><a class="lab-link" href="/labs/assembly">运行时装配</a><span class="lab-link disabled">VoxCPM1.5 ONNX Runtime</span></nav>
+      <section class="panel" id="lora-fusion">
+        <div class="panel-head"><div><h2>LoRA 融合试听</h2><div class="hint">以推理时融合方式将适配器叠加到基础模型，不修改原始检查点。</div></div><span class="tag" id="modelState">正在读取</span></div>
+        <p class="notice">融合会话与主推理共用 GPU。生成时会自动选择兼容 LoRA，并以所选强度应用到线性层；原模型和 LoRA 文件均保持不变。</p>
+        <div class="grid">
+          <div class="field"><label for="modelKey">基础模型</label><select id="modelKey"><option value="voxcpm1.5">VoxCPM1.5 0.6B</option><option value="voxcpm-0.5b">VoxCPM 0.5B</option><option value="voxcpm2">VoxCPM2 2B</option></select></div>
+          <div class="field"><label for="loraId">兼容 LoRA</label><select id="loraId"><option value="">正在读取 LoRA</option></select></div>
+          <div class="field"><label for="loraStrength">融合强度</label><input id="loraStrength" type="number" min="0" max="2" step="0.05" value="1"></div>
+          <div class="field"><label for="device">执行设备</label><select id="device"><option value="cuda">CUDA</option><option value="cpu">CPU</option></select></div>
+        </div>
+        <div class="summary"><div><span>基础模型</span><strong id="summaryModel">VoxCPM1.5</strong></div><div><span>适配器</span><strong id="summaryLora">未选择</strong></div><div><span>融合规格</span><strong id="summarySpec">-</strong></div></div>
+        <div class="field"><label for="previewText">试听文本</label><textarea id="previewText">你好，这是融合 LoRA 后的 VoxCPM 试听。</textarea></div>
+        <div class="grid" style="margin-top:14px"><div class="field"><label for="timesteps">扩散步数</label><input id="timesteps" type="number" min="1" max="100" value="10"></div><div class="field"><label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42"></div></div>
+        <div class="actions"><span class="message" id="message">选择 LoRA 后可开始试听</span><button class="primary" id="previewButton" type="button" disabled>融合并试听</button></div>
+        <div class="result" id="result"><div class="hint" id="resultMeta"></div><audio id="player" controls></audio><a class="download" id="download" download>下载 WAV</a></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const modelKey = document.getElementById('modelKey'), loraId = document.getElementById('loraId'), loraStrength = document.getElementById('loraStrength'), device = document.getElementById('device'), message = document.getElementById('message'), previewButton = document.getElementById('previewButton');
+    let status = null;
+    const names = { 'voxcpm1.5':'VoxCPM1.5 0.6B', 'voxcpm-0.5b':'VoxCPM 0.5B', voxcpm2:'VoxCPM2 2B' };
+    function compatibleLoras() { return (status?.lora_checkpoints || []).filter(item => item.model_key === modelKey.value); }
+    function renderLoras() { const previous = loraId.value; loraId.replaceChildren(); const items = compatibleLoras(); if (!items.length) loraId.add(new Option('当前模型没有兼容 LoRA', '')); items.forEach(item => loraId.add(new Option(item.display_name, item.id))); if (items.some(item => item.id === previous)) loraId.value = previous; updateSummary(); }
+    function updateSummary() { const selected = compatibleLoras().find(item => item.id === loraId.value); document.getElementById('summaryModel').textContent = names[modelKey.value]; document.getElementById('summaryLora').textContent = selected?.display_name || '未选择'; document.getElementById('summarySpec').textContent = selected ? `Rank ${selected.rank} · Alpha ${selected.alpha} · ${Number(loraStrength.value || 1).toFixed(2)}x` : '-'; const installed = Boolean(status?.models?.[modelKey.value]); previewButton.disabled = !installed || !selected; document.getElementById('modelState').textContent = installed ? (selected ? '融合就绪' : '请选择 LoRA') : '模型未安装'; }
+    async function loadStatus() { try { const response = await fetch('/api/status', { cache:'no-store' }); status = await response.json(); if (!response.ok) throw new Error(status.detail || '状态读取失败'); if (!status.cuda_available) device.value = 'cpu'; renderLoras(); } catch (error) { message.className='message error'; message.textContent=error.message; } }
+    async function preview() { const selected = compatibleLoras().find(item => item.id === loraId.value); if (!selected) return; previewButton.disabled=true; message.className='message'; message.textContent='正在加载融合会话并生成试听'; const data = new FormData(); data.set('text', document.getElementById('previewText').value); data.set('model_key', modelKey.value); data.set('lora_id', selected.id); data.set('lora_strength', loraStrength.value); data.set('device', device.value); data.set('mode','design'); data.set('batch_mode','ordinary'); data.set('split_mode','none'); data.set('split_value','1'); data.set('cfg_value','2'); data.set('inference_timesteps', document.getElementById('timesteps').value); data.set('min_len','2'); data.set('max_len','4096'); data.set('seed', document.getElementById('seed').value); data.set('normalize','true'); data.set('denoise','false'); data.set('optimize','false'); try { const response = await fetch('/api/generate', { method:'POST', body:data }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || '融合试听失败'); const src = `/api/audio/${encodeURIComponent(result.filename)}`; const player=document.getElementById('player'); player.src=src; document.getElementById('download').href=src; document.getElementById('resultMeta').textContent=`${names[modelKey.value]} · ${selected.display_name} · ${Number(result.duration).toFixed(2)} 秒`; document.getElementById('result').classList.add('visible'); message.textContent='融合试听已生成'; player.play().catch(() => {}); } catch (error) { message.className='message error'; message.textContent=error.message; } finally { updateSummary(); } }
+    modelKey.addEventListener('change', renderLoras); loraId.addEventListener('change', updateSummary); loraStrength.addEventListener('input', updateSummary); previewButton.addEventListener('click', preview); loadStatus();
+  </script>
+</body>
+</html>

@@ -11,7 +11,8 @@ import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import piper_web
+from voxcpm.web import piper_web
+from scripts import train_piper_plus_local
 
 
 def test_safe_piper_job_name():
@@ -45,6 +46,240 @@ def test_inspect_piper_dataset_requires_complete_wav_lab_pairs(tmp_path):
     (tmp_path / "sample-1.lab").unlink()
     with pytest.raises(ValueError, match="缺少 1 个同名 .lab"):
         piper_web.inspect_piper_dataset(str(tmp_path))
+
+
+def test_inspect_piper_dataset_filters_duration_bounds(tmp_path):
+    for index, frames in enumerate((8000, 32000, 40000)):
+        sf.write(tmp_path / f"sample-{index}.wav", np.zeros(frames, dtype=np.float32), 16000)
+        (tmp_path / f"sample-{index}.lab").write_text(f"测试文本 {index}", encoding="utf-8")
+
+    dataset = piper_web.inspect_piper_dataset(str(tmp_path), min_duration=1.5, max_duration=3.0)
+
+    assert dataset["file_count"] == 2
+    assert dataset["records"][0]["audio"].endswith("sample-1.wav")
+    assert dataset["min_duration_filter"] == 1.5
+    assert dataset["max_duration_filter"] == 3.0
+    with pytest.raises(ValueError, match="最短时长不能超过最长时长"):
+        piper_web.inspect_piper_dataset(str(tmp_path), min_duration=4, max_duration=2)
+
+
+def test_piper_plus_training_command_uses_upstream_v113_argument_names(tmp_path):
+    command = train_piper_plus_local.build_training_command(
+        "python",
+        tmp_path / "dataset",
+        tmp_path / "job",
+        {
+            "num_epochs": 20,
+            "batch_size": 2,
+            "save_every_epochs": 5,
+            "learning_rate": 0.00002,
+            "validation_split": 0.05,
+            "num_workers": 1,
+            "base_checkpoint": str(tmp_path / "base.ckpt"),
+            "resume_mode": "multispeaker",
+        },
+    )
+
+    assert "--max_epochs" in command
+    assert "--base_lr" in command
+    assert "--disable_auto_lr_scaling" in command
+    assert "--default_root_dir" in command
+    assert "--validation-split" in command
+    assert "--num-workers" in command
+    assert "--resume-from-multispeaker-checkpoint" in command
+    assert "--max-epochs" not in command
+    assert "--base-lr" not in command
+    assert "--disable-auto-lr-scaling" not in command
+
+    preprocess = train_piper_plus_local.build_preprocess_command(
+        "python", tmp_path / "input", tmp_path / "dataset", max_workers=1
+    )
+    assert preprocess[preprocess.index("--max-workers") + 1] == "1"
+
+
+def test_piper_plus_artifacts_are_discovered_as_student_models(monkeypatch, tmp_path):
+    models = tmp_path / "models"
+    runs = tmp_path / "runs"
+    plus_models = tmp_path / "plus-models"
+    plus_runs = tmp_path / "plus-runs"
+    for directory in (models, runs, plus_models, plus_runs):
+        directory.mkdir()
+
+    model_dir = plus_models / "voice"
+    model_dir.mkdir()
+    model_path = model_dir / "model.fp16.onnx"
+    model_path.write_bytes(b"piper-plus-onnx")
+    (model_dir / "config.json").write_text(
+        json.dumps({"audio": {"sample_rate": 22050}, "language": {"code": "ja-en-zh-es-fr-pt"}}),
+        encoding="utf-8",
+    )
+    (model_dir / piper_web.STUDENT_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "engine": "piper_plus",
+                "engine_label": "Piper Plus",
+                "model": model_path.name,
+                "config": "config.json",
+                "sample_rate": 22050,
+                "quality": "fp16-finetuned",
+                "precision": "fp16",
+                "language": "ja+en+zh+es+fr+pt",
+                "bundle_files": [model_path.name, "config.json", piper_web.STUDENT_MANIFEST_NAME],
+            }
+        ),
+        encoding="utf-8",
+    )
+    job_dir = plus_runs / "voice-job"
+    checkpoint_dir = job_dir / "lightning_logs" / "version_0" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint_path = checkpoint_dir / "epoch=4.ckpt"
+    checkpoint_path.write_bytes(b"piper-plus-checkpoint")
+    (job_dir / "dataset").mkdir()
+    (job_dir / "dataset" / "config.json").write_text(
+        json.dumps({"audio": {"sample_rate": 22050}, "language": {"code": "ja-en-zh-es-fr-pt"}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(piper_web, "PIPER_ROOT", tmp_path)
+    monkeypatch.setattr(piper_web, "PIPER_MODELS_ROOT", models)
+    monkeypatch.setattr(piper_web, "PIPER_RUNS_ROOT", runs)
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_MODELS_ROOT", plus_models)
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_RUNS_ROOT", plus_runs)
+
+    artifacts = piper_web.list_piper_artifacts()
+    model = next(item for item in artifacts if item["kind"] == "onnx")
+    checkpoint = next(item for item in artifacts if item["kind"] == "piper_plus_checkpoint")
+
+    assert model["engine"] == "piper_plus"
+    assert model["architecture"] == "piper_plus"
+    assert model["previewable"] is True
+    assert model["precision"] == "fp16"
+    assert checkpoint["engine"] == "piper_plus"
+    assert checkpoint["previewable"] is True
+    assert checkpoint["export_precisions"] == ["fp32", "fp16", "int8"]
+
+
+def test_piper_plus_onnx_preview_uses_isolated_runtime(monkeypatch, tmp_path):
+    model_dir = tmp_path / "plus-models" / "voice"
+    output_dir = tmp_path / "outputs"
+    model_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    model_path = model_dir / "model.fp16.onnx"
+    model_path.write_bytes(b"onnx")
+    config_path = model_dir / "config.json"
+    config_path.write_text(json.dumps({"audio": {"sample_rate": 22050}}), encoding="utf-8")
+    (model_dir / piper_web.STUDENT_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "engine": "piper_plus",
+                "model": model_path.name,
+                "config": config_path.name,
+                "bundle_files": [model_path.name, config_path.name, piper_web.STUDENT_MANIFEST_NAME],
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact = {"id": "plus-model", "kind": "onnx", "name": "voice", "engine": "piper_plus"}
+    captured = {}
+
+    def synthesize(model, config, text, output, settings):
+        captured.update(model=model, config=config, text=text, settings=settings)
+        sf.write(output, np.zeros(2205, dtype=np.float32), 22050)
+
+    monkeypatch.setattr(piper_web, "PIPER_OUTPUT_ROOT", output_dir)
+    monkeypatch.setattr(piper_web, "resolve_piper_artifact", lambda artifact_id, expected_kind=None: (artifact, model_path))
+    monkeypatch.setattr(piper_web, "preview_piper_plus_model", synthesize)
+    app = FastAPI()
+    app.include_router(piper_web.router)
+
+    response = TestClient(app).post(
+        "/api/piper/preview",
+        data={"model_id": artifact["id"], "text": "Piper Plus 测试", "length_scale": "1.1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["duration"] == 0.1
+    assert captured["model"] == model_path
+    assert captured["config"] == config_path
+    assert captured["text"] == "Piper Plus 测试"
+    assert captured["settings"]["length_scale"] == 1.1
+
+
+def test_piper_plus_preview_command_uses_v113_positional_text(tmp_path):
+    command = piper_web.build_piper_plus_preview_command(
+        tmp_path / "model.onnx",
+        tmp_path / "config.json",
+        "多语言试听",
+        tmp_path / "preview.wav",
+        {
+            "speaker_id": 0,
+            "length_scale": 1.0,
+            "noise_scale": 0.667,
+            "noise_w_scale": 0.8,
+            "volume": 1.0,
+        },
+    )
+
+    assert "--text" not in command
+    assert command[-1] == "多语言试听"
+    assert command[command.index("--model") + 1].endswith("model.onnx")
+
+
+def test_piper_plus_training_endpoint_writes_export_and_runtime_config(monkeypatch, tmp_path):
+    dataset = tmp_path / "dataset"
+    plus_runs = tmp_path / "plus-runs"
+    plus_models = tmp_path / "plus-models"
+    source_root = tmp_path / "piper-plus-source"
+    base_checkpoint = tmp_path / "base" / "model.ckpt"
+    for directory in (dataset, plus_runs, plus_models, source_root, base_checkpoint.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    base_checkpoint.write_bytes(b"checkpoint")
+    for index in range(2):
+        sf.write(dataset / f"sample-{index}.wav", np.zeros(1600, dtype=np.float32), 16000)
+        (dataset / f"sample-{index}.lab").write_text(f"测试文本 {index}", encoding="utf-8")
+
+    started = {}
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_RUNS_ROOT", plus_runs)
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_MODELS_ROOT", plus_models)
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_SOURCE_ROOT", source_root)
+    monkeypatch.setattr(piper_web, "PIPER_PLUS_BASE_CHECKPOINT", base_checkpoint)
+    monkeypatch.setattr(piper_web, "student_training_running", lambda: False)
+    monkeypatch.setattr(piper_web, "piper_plus_training_available", lambda: True)
+    monkeypatch.setattr(piper_web, "piper_plus_base_status", lambda: {"installed": True})
+    monkeypatch.setattr(piper_web, "_other_training_running", lambda: False)
+    monkeypatch.setattr(piper_web.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(piper_web, "_release_inference", lambda: None)
+    monkeypatch.setattr(piper_web.piper_voice_runtime, "release", lambda: None)
+    monkeypatch.setattr(piper_web.sherpa_voice_runtime, "release", lambda: None)
+    monkeypatch.setattr(piper_web.melo_native_voice_runtime, "release", lambda: None)
+    monkeypatch.setattr(
+        piper_web.piper_plus_training,
+        "start",
+        lambda config, name: started.update(config=config, name=name),
+    )
+    app = FastAPI()
+    app.include_router(piper_web.router)
+
+    response = TestClient(app).post(
+        "/api/piper-plus/train",
+        data={
+            "dataset_dir": str(dataset),
+            "output_name": "integration",
+            "num_epochs": 1,
+            "save_every_epochs": 1,
+            "batch_size": 1,
+            "num_workers": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    config = json.loads(Path(started["config"]).read_text(encoding="utf-8"))
+    assert started["name"] == "piper-plus-integration"
+    assert config["model_dir"] == str((plus_models / "piper-plus-integration").resolve())
+    assert config["source_root"] == str(source_root.resolve())
+    assert config["base_checkpoint"] == str(base_checkpoint.resolve())
+    assert config["resume_mode"] == "multispeaker"
+    assert config["num_workers"] == 2
 
 
 def test_piper_model_bundle_download_and_restricted_delete(monkeypatch, tmp_path):
@@ -472,7 +707,7 @@ def test_export_page_contains_model_filters_and_global_navigation():
     assert 'fetch("/api/export/preview"' in source
     assert 'fetch(`/api/export/artifact/${item.id}`' in source
     for page in ("web.html", "lora.html", "datasets.html", "distill.html", "export.html"):
-        assert 'href="/export"' in (piper_web.ROOT / page).read_text(encoding="utf-8")
+        assert 'href="/export"' in (piper_web.PAGES_ROOT / page).read_text(encoding="utf-8")
 
 
 def test_optimizer_head_model_is_identity_initialized_and_under_ten_megabytes():
@@ -625,9 +860,9 @@ def test_optimizer_head_scan_download_and_page_navigation(monkeypatch, tmp_path)
     with zipfile.ZipFile(next(downloads.glob("*.zip"))) as archive:
         assert set(archive.namelist()) == {"optimizer-head.int8.onnx", "optimizer-head.json"}
     for page in ("web.html", "lora.html", "datasets.html", "distill.html", "optimizer.html", "export.html"):
-        source = (piper_web.ROOT / page).read_text(encoding="utf-8")
+        source = (piper_web.PAGES_ROOT / page).read_text(encoding="utf-8")
         assert 'href="/optimizer"' in source
-    optimizer_source = (piper_web.ROOT / "optimizer.html").read_text(encoding="utf-8")
+    optimizer_source = (piper_web.PAGES_ROOT / "optimizer.html").read_text(encoding="utf-8")
     assert 'fetch("/api/optimizer/train"' in optimizer_source
     assert 'id="modelId"' in optimizer_source
     assert 'id="datasetDir"' in optimizer_source

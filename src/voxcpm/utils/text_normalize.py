@@ -1,8 +1,49 @@
 # some functions are copied from https://github.com/FunAudioLLM/CosyVoice/blob/main/cosyvoice/utils/frontend_utils.py
+import importlib.util
+import os
 import re
+import shutil
+import sys
+from pathlib import Path
+
 import regex
 import inflect
-from wetext import Normalizer
+
+
+def _prepare_wetext_import() -> None:
+    """Mirror WeText assets to an ASCII path for kaldifst on Windows.
+
+    kaldifst opens FST files through a narrow C++ file API on some Windows
+    builds. The installed package can live under a non-ASCII user profile,
+    which makes otherwise valid FST assets fail to open.
+    """
+    if os.name != "nt":
+        return
+    spec = importlib.util.find_spec("wetext")
+    if spec is None or not spec.origin:
+        return
+    source_dir = Path(spec.origin).parent
+    try:
+        str(source_dir).encode("ascii")
+        return
+    except UnicodeEncodeError:
+        pass
+
+    cache_root = Path(r"C:\tmp\voxcpm\wetext-runtime")
+    target_dir = cache_root / "wetext"
+    marker = target_dir / "fsts" / "traditional_to_simple.fst"
+    if not marker.is_file() or marker.stat().st_size != (source_dir / "fsts" / "traditional_to_simple.fst").stat().st_size:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+    if str(cache_root) not in sys.path:
+        sys.path.insert(0, str(cache_root))
+
+
+try:
+    _prepare_wetext_import()
+    from wetext import Normalizer
+except Exception:  # WeText is optional; inference must remain usable without it.
+    Normalizer = None
 
 chinese_char_pattern = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -163,8 +204,8 @@ def clean_text(text):
 class TextNormalizer:
     def __init__(self, tokenizer=None):
         self.tokenizer = tokenizer
-        self.zh_tn_model = Normalizer(lang="zh", operator="tn", remove_erhua=True)
-        self.en_tn_model = Normalizer(lang="en", operator="tn")
+        self.zh_tn_model = Normalizer(lang="zh", operator="tn", remove_erhua=True) if Normalizer else None
+        self.en_tn_model = Normalizer(lang="en", operator="tn") if Normalizer else None
         self.inflect_parser = inflect.engine()
 
     def normalize(self, text, split=False):
@@ -177,12 +218,14 @@ class TextNormalizer:
             )  # 修复 ”550 + 320 等于 870 千卡。“ 被错误正则为 ”五百五十加三百二十等于八七十千卡.“
             if re.search(r"([\d$%^*_+≥≤≠×÷?=])", text):  # 避免 英文连字符被错误正则为减
                 text = re.sub(r"(?<=[a-zA-Z0-9])-(?=\d)", " - ", text)  # 修复 x-2 被正则为 x负2
-            text = self.zh_tn_model.normalize(text)
+            if self.zh_tn_model is not None:
+                text = self.zh_tn_model.normalize(text)
             text = replace_blank(text)
             text = replace_corner_mark(text)
             text = remove_bracket(text)
         else:
-            text = self.en_tn_model.normalize(text)
+            if self.en_tn_model is not None:
+                text = self.en_tn_model.normalize(text)
             text = spell_out_number(text, self.inflect_parser)
         if split is False:
             return text

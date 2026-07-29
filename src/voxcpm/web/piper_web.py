@@ -27,14 +27,17 @@ from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import FileResponse
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[3]
+PAGES_ROOT = ROOT / "assets" / "pages"
 VOXCPM_CACHE_ROOT = Path(os.environ.get("VOXCPM_CACHE_DIR", r"C:\tmp\voxcpm"))
-DISTILL_PAGE = ROOT / "distill.html"
-EXPORT_PAGE = ROOT / "export.html"
-OPTIMIZER_PAGE = ROOT / "optimizer.html"
+DISTILL_PAGE = PAGES_ROOT / "distill.html"
+EXPORT_PAGE = PAGES_ROOT / "export.html"
+OPTIMIZER_PAGE = PAGES_ROOT / "optimizer.html"
 PIPER_ROOT = ROOT / "piper"
 PIPER_MODELS_ROOT = PIPER_ROOT / "models"
 PIPER_RUNS_ROOT = PIPER_ROOT / "runs"
+PIPER_PLUS_MODELS_ROOT = PIPER_ROOT / "plus-models"
+PIPER_PLUS_RUNS_ROOT = PIPER_ROOT / "plus-runs"
 PIPER_DOWNLOAD_ROOT = PIPER_ROOT / "downloads"
 PIPER_OUTPUT_ROOT = ROOT / "outputs" / "piper"
 OPTIMIZER_HEAD_ROOT = PIPER_ROOT / "optimization-heads"
@@ -42,6 +45,13 @@ OPTIMIZER_DOWNLOAD_ROOT = PIPER_ROOT / "optimizer-downloads"
 MELO_BASE_ROOT = PIPER_ROOT / "melo-bases"
 MELO_BASE_DIR = MELO_BASE_ROOT / "MeloTTS-Chinese"
 MELO_BASE_CHECKPOINT = MELO_BASE_DIR / "checkpoint.pth"
+PIPER_PLUS_BASE_ROOT = PIPER_ROOT / "piper-plus-bases" / "piper-plus-base"
+PIPER_PLUS_BASE_CHECKPOINT = PIPER_PLUS_BASE_ROOT / "model.ckpt"
+PIPER_PLUS_BASE_CONFIG = PIPER_PLUS_BASE_ROOT / "config.json"
+PIPER_PLUS_SOURCE_ROOT = ROOT / "third_party" / "piper-plus"
+PIPER_PLUS_VENV_ROOT = ROOT / ".venv-piper-plus"
+PIPER_PLUS_PYTHON = PIPER_PLUS_VENV_ROOT / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+PIPER_PLUS_VERSION = "1.13.0"
 MELO_SOURCE_ROOT = ROOT / "third_party" / "MeloTTS"
 MELO_EXPORT_CACHE_ROOT = VOXCPM_CACHE_ROOT / "melo-exports"
 STUDENT_PREVIEW_CACHE_ROOT = VOXCPM_CACHE_ROOT / "student-previews"
@@ -56,6 +66,28 @@ STUDENT_MANIFEST_NAME = "voxcpm-model.json"
 STUDENT_EXPORT_PRECISIONS = ("fp32", "fp16", "int8")
 ONNX_CONVERSION_LOCK = threading.Lock()
 
+
+def onnx_cpu_thread_count() -> int:
+    """Return the process-wide ONNX CPU parallelism, defaulting to all cores."""
+    override = os.environ.get("VOXCPM_ONNX_THREADS", "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError as exc:
+            raise ValueError("VOXCPM_ONNX_THREADS 必须为正整数") from exc
+    return max(1, os.cpu_count() or 1)
+
+
+def onnx_session_options(ort):
+    """Build CPU session options without ONNX Runtime's machine-dependent default."""
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = onnx_cpu_thread_count()
+    # VoxCPM/Piper graphs are mostly sequential. One inter-op scheduler avoids
+    # oversubscribing the same cores while each operator uses all of them.
+    options.inter_op_num_threads = 1
+    return options
+
+
 # Native Melo ONNX keeps the original BERT frontend.  Set this before the
 # frontend imports transformers so a standalone piper_web process uses the
 # same local cache as the main WebUI.
@@ -67,6 +99,9 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 for directory in (
     PIPER_MODELS_ROOT,
     PIPER_RUNS_ROOT,
+    PIPER_PLUS_MODELS_ROOT,
+    PIPER_PLUS_RUNS_ROOT,
+    PIPER_PLUS_BASE_ROOT,
     PIPER_DOWNLOAD_ROOT,
     PIPER_OUTPUT_ROOT,
     MELO_BASE_ROOT,
@@ -153,10 +188,18 @@ def safe_piper_job_name(value: str) -> str:
     return name[:80]
 
 
-def inspect_piper_dataset(directory: str) -> dict:
+def inspect_piper_dataset(
+    directory: str,
+    min_duration: float = 0.0,
+    max_duration: float = 0.0,
+) -> dict:
     dataset_dir = Path(directory).expanduser().resolve()
     if not dataset_dir.is_dir():
         raise ValueError(f"训练集目录不存在: {dataset_dir}")
+    if not math.isfinite(min_duration) or not math.isfinite(max_duration) or min_duration < 0 or max_duration < 0:
+        raise ValueError("时长范围必须是大于或等于 0 的数字")
+    if max_duration > 0 and min_duration > max_duration:
+        raise ValueError("最短时长不能超过最长时长")
 
     wav_paths = sorted(dataset_dir.glob("*.wav"))
     if len(wav_paths) < 2:
@@ -178,16 +221,18 @@ def inspect_piper_dataset(directory: str) -> dict:
         if info.frames <= 0 or info.samplerate <= 0:
             raise ValueError(f"无效音频: {wav_path.name}")
         duration = float(info.duration)
+        if (min_duration > 0 and duration < min_duration) or (max_duration > 0 and duration > max_duration):
+            continue
         sample_rates[info.samplerate] = sample_rates.get(info.samplerate, 0) + 1
         durations.append(duration)
-        records.append({"audio": str(wav_path), "text": text})
+        records.append({"audio": str(wav_path), "text": text, "duration": duration})
 
     if missing_labs:
         preview = ", ".join(missing_labs[:5])
         suffix = "..." if len(missing_labs) > 5 else ""
         raise ValueError(f"缺少 {len(missing_labs)} 个同名 .lab: {preview}{suffix}")
     if len(records) < 2:
-        raise ValueError("有效训练对不足 2 条")
+        raise ValueError("按当前时长范围筛选后，有效训练对不足 2 条")
 
     return {
         "directory": str(dataset_dir),
@@ -196,6 +241,8 @@ def inspect_piper_dataset(directory: str) -> dict:
         "min_duration": round(min(durations), 3),
         "max_duration": round(max(durations), 3),
         "sample_rates": sample_rates,
+        "min_duration_filter": min_duration,
+        "max_duration_filter": max_duration,
         "records": records,
     }
 
@@ -206,6 +253,13 @@ def write_piper_manifest(dataset: dict, manifest_path: Path) -> None:
         writer = csv.writer(manifest, delimiter="|", lineterminator="\n")
         for record in dataset["records"]:
             writer.writerow([Path(record["audio"]).name, record["text"]])
+
+
+def write_melo_manifest(dataset: dict, manifest_path: Path) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8", newline="\n") as manifest:
+        for record in dataset["records"]:
+            manifest.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def _artifact_id(kind: str, path: Path) -> str:
@@ -330,7 +384,7 @@ def _artifact_precision(kind: str, path: Path, manifest: dict | None, quality: s
 
 
 def _artifact_export_precisions(kind: str, precision: str) -> list[str]:
-    if kind in ("checkpoint", "melo_checkpoint"):
+    if kind in ("checkpoint", "melo_checkpoint", "piper_plus_checkpoint"):
         return list(STUDENT_EXPORT_PRECISIONS)
     if precision == "fp32":
         return list(STUDENT_EXPORT_PRECISIONS)
@@ -350,6 +404,20 @@ def _find_melo_config(path: Path) -> Path | None:
     return None
 
 
+def _find_piper_plus_config(path: Path, manifest: dict | None = None) -> Path | None:
+    if manifest is not None:
+        relative_name = str(manifest.get("config", "config.json"))
+        config_path = _manifest_resource(path, relative_name)
+        return config_path if config_path.is_file() else None
+    for directory in (path.parent, *path.parents):
+        for candidate in (directory / "config.json", directory / "dataset" / "config.json"):
+            if candidate.is_file():
+                return candidate
+        if directory == PIPER_PLUS_RUNS_ROOT or directory == PIPER_ROOT:
+            break
+    return None
+
+
 def melo_base_status() -> dict:
     installed = MELO_BASE_CHECKPOINT.is_file() and (MELO_BASE_DIR / "config.json").is_file()
     return {
@@ -364,11 +432,75 @@ def melo_base_status() -> dict:
     }
 
 
+def piper_plus_base_status() -> dict:
+    installed = (
+        PIPER_PLUS_BASE_CHECKPOINT.is_file()
+        and PIPER_PLUS_BASE_CONFIG.is_file()
+        and (PIPER_PLUS_BASE_ROOT / "voice" / "mei_normal.htsvoice").is_file()
+    )
+    return {
+        "id": "ayousanz-piper-plus-base",
+        "name": "ayousanz/piper-plus-base 多语言基座",
+        "installed": installed,
+        "checkpoint": str(PIPER_PLUS_BASE_CHECKPOINT) if installed else None,
+        "size_mb": round(PIPER_PLUS_BASE_CHECKPOINT.stat().st_size / 1024**2, 2) if installed else 0,
+        "sample_rate": 22050,
+        "language": "ja + en + zh + es + fr + pt",
+        "license": "CC-BY-4.0",
+        "architecture": "MB-iSTFT-VITS2",
+    }
+
+
+def piper_plus_training_available() -> bool:
+    required = (
+        PIPER_PLUS_PYTHON,
+        PIPER_PLUS_SOURCE_ROOT / "src" / "python" / "piper_train" / "__main__.py",
+        PIPER_PLUS_SOURCE_ROOT / "src" / "python_run" / "piper" / "voice.py",
+        PIPER_PLUS_SOURCE_ROOT / "src" / "python" / "g2p" / "piper_plus_g2p" / "__init__.py",
+    )
+    return all(path.is_file() for path in required)
+
+
+def piper_plus_environment_status() -> dict:
+    version_path = PIPER_PLUS_SOURCE_ROOT / "VERSION"
+    try:
+        version = version_path.read_text(encoding="utf-8").strip() if version_path.is_file() else None
+    except OSError:
+        version = None
+    installed = piper_plus_training_available()
+    return {
+        "installed": installed,
+        "version": version,
+        "expected_version": PIPER_PLUS_VERSION,
+        "python": str(PIPER_PLUS_PYTHON) if PIPER_PLUS_PYTHON.is_file() else None,
+        "source": str(PIPER_PLUS_SOURCE_ROOT) if PIPER_PLUS_SOURCE_ROOT.is_dir() else None,
+    }
+
+
+def download_piper_plus_base() -> dict:
+    from huggingface_hub import hf_hub_download
+
+    PIPER_PLUS_BASE_ROOT.mkdir(parents=True, exist_ok=True)
+    required = ("model.ckpt", "config.json", "voice/mei_normal.htsvoice")
+    for filename in required:
+        source = hf_hub_download(repo_id="ayousanz/piper-plus-base", filename=filename)
+        destination = PIPER_PLUS_BASE_ROOT / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    status = piper_plus_base_status()
+    if not status["installed"]:
+        raise RuntimeError("Piper Plus 多语言基座下载不完整")
+    return status
+
+
 def list_piper_artifacts() -> list[dict]:
     paths: list[tuple[str, Path]] = []
     for root in (PIPER_MODELS_ROOT, PIPER_RUNS_ROOT):
         paths.extend(("onnx", path) for path in root.rglob("*.onnx") if path.is_file())
+    for root in (PIPER_PLUS_MODELS_ROOT, PIPER_PLUS_RUNS_ROOT):
+        paths.extend(("onnx", path) for path in root.rglob("*.onnx") if path.is_file())
     paths.extend(("checkpoint", path) for path in PIPER_RUNS_ROOT.rglob("*.ckpt") if path.is_file())
+    paths.extend(("piper_plus_checkpoint", path) for path in PIPER_PLUS_RUNS_ROOT.rglob("*.ckpt") if path.is_file())
     paths.extend(("melo_checkpoint", path) for path in PIPER_RUNS_ROOT.rglob("G_*.pth") if path.is_file())
 
     seen = set()
@@ -379,7 +511,18 @@ def list_piper_artifacts() -> list[dict]:
             continue
         seen.add(resolved)
         manifest = _read_student_manifest(path) if kind == "onnx" else None
-        config_path = _find_melo_config(path) if kind == "melo_checkpoint" else _find_voice_config(path) if manifest is None else None
+        is_piper_plus = kind == "piper_plus_checkpoint" or any(
+            root.resolve() in resolved.parents for root in (PIPER_PLUS_MODELS_ROOT, PIPER_PLUS_RUNS_ROOT)
+        )
+        config_path = (
+            _find_melo_config(path)
+            if kind == "melo_checkpoint"
+            else _find_piper_plus_config(path, manifest)
+            if is_piper_plus or (manifest or {}).get("engine") == "piper_plus"
+            else _find_voice_config(path)
+            if manifest is None
+            else None
+        )
         stat = path.stat()
         relative = path.relative_to(PIPER_ROOT)
         summary = (
@@ -397,7 +540,15 @@ def list_piper_artifacts() -> list[dict]:
             if kind == "melo_checkpoint"
             else _read_voice_summary(config_path, path)
         )
-        engine = "sherpa_onnx" if kind == "melo_checkpoint" else manifest.get("engine", "piper") if manifest else "piper"
+        engine = (
+            "sherpa_onnx"
+            if kind == "melo_checkpoint"
+            else manifest.get("engine", "piper_plus" if is_piper_plus else "piper")
+            if manifest
+            else "piper_plus"
+            if is_piper_plus
+            else "piper"
+        )
         precision = _artifact_precision(kind, path, manifest, summary.get("quality"))
         recommended = kind == "checkpoint" and DEFAULT_PIPER_CHECKPOINT_DIR in relative.parts
         display_name = path.stem
@@ -412,11 +563,23 @@ def list_piper_artifacts() -> list[dict]:
                 "size_mb": round(stat.st_size / 1024**2, 2),
                 "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
                 "has_config": config_path is not None or manifest is not None,
-                "previewable": (kind == "onnx" and (config_path is not None or manifest is not None)) or (kind == "melo_checkpoint" and config_path is not None),
-                "downloadable": kind in ("checkpoint", "melo_checkpoint") or (kind == "onnx" and (config_path is not None or manifest is not None)),
+                "previewable": (kind == "onnx" and (config_path is not None or manifest is not None))
+                or (kind in ("melo_checkpoint", "piper_plus_checkpoint") and config_path is not None),
+                "downloadable": kind in ("checkpoint", "melo_checkpoint", "piper_plus_checkpoint")
+                or (kind == "onnx" and (config_path is not None or manifest is not None)),
                 "engine": engine,
-                "architecture": "melotts" if engine in ("sherpa_onnx", "melo_onnx_native") else "piper",
-                "engine_label": "MeloTTS" if kind == "melo_checkpoint" else manifest.get("engine_label", "Piper") if manifest else "Piper",
+                "architecture": "melotts"
+                if engine in ("sherpa_onnx", "melo_onnx_native")
+                else "piper_plus"
+                if engine == "piper_plus"
+                else "piper",
+                "engine_label": "MeloTTS"
+                if kind == "melo_checkpoint"
+                else manifest.get("engine_label", "Piper Plus" if engine == "piper_plus" else "Piper")
+                if manifest
+                else "Piper Plus"
+                if engine == "piper_plus"
+                else "Piper",
                 "precision": precision,
                 "export_precisions": _artifact_export_precisions(kind, precision),
                 "license": manifest.get("license") if manifest else None,
@@ -593,7 +756,7 @@ class SherpaVoiceRuntime:
                     noise_scale_w=settings["noise_w_scale"],
                     length_scale=settings["length_scale"],
                 )
-                model = sherpa_onnx.OfflineTtsModelConfig(vits=vits, num_threads=max(1, min(4, os.cpu_count() or 1)))
+                model = sherpa_onnx.OfflineTtsModelConfig(vits=vits, num_threads=onnx_cpu_thread_count())
                 config = sherpa_onnx.OfflineTtsConfig(
                     model=model,
                     rule_fsts=",".join(str(path) for path in rule_paths),
@@ -677,6 +840,7 @@ class NativeMeloVoiceRuntime:
             if self._session is None or self._identity != identity:
                 self._session = ort.InferenceSession(
                     str(model_path),
+                    sess_options=onnx_session_options(ort),
                     providers=["CPUExecutionProvider"],
                 )
                 self._hps = get_hparams_from_file(str(config_path))
@@ -771,7 +935,171 @@ def export_piper_checkpoint(checkpoint_path: Path, output_path: Path, config_pat
     return output_path
 
 
-def convert_onnx_precision(source_path: Path, output_path: Path, precision: str) -> Path:
+def export_piper_plus_checkpoint(
+    checkpoint_path: Path,
+    output_path: Path,
+    config_path: Path,
+    precision: str = "fp16",
+) -> Path:
+    precision = str(precision).strip().lower()
+    if precision not in STUDENT_EXPORT_PRECISIONS:
+        raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
+    if not piper_plus_training_available():
+        raise RuntimeError("Piper Plus 独立运行环境未安装")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    export_path = output_path
+    temporary_dir: Path | None = None
+    if precision == "int8":
+        STUDENT_PREVIEW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        temporary_dir = Path(tempfile.mkdtemp(prefix="piper-plus-export-", dir=STUDENT_PREVIEW_CACHE_ROOT))
+        export_path = temporary_dir / "model.fp32.onnx"
+    command = [
+        str(PIPER_PLUS_PYTHON),
+        "-X",
+        "utf8",
+        "-m",
+        "piper_train.export_onnx",
+        str(checkpoint_path),
+        str(export_path),
+    ]
+    if precision in ("fp32", "int8"):
+        command.append("--no-fp16")
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["WANDB_MODE"] = "disabled"
+    completed = subprocess.run(
+        command,
+        cwd=PIPER_PLUS_SOURCE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if completed.returncode != 0:
+        if temporary_dir is not None:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError((completed.stdout + "\n" + completed.stderr).strip()[-5000:])
+    try:
+        if precision == "int8":
+            convert_onnx_precision(export_path, output_path, precision, low_memory=True)
+        elif export_path.resolve() != output_path.resolve():
+            shutil.copy2(export_path, output_path)
+    finally:
+        if temporary_dir is not None:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+
+    bundled_config = output_path.parent / "config.json"
+    shutil.copy2(config_path, bundled_config)
+    bundle_files = [output_path.name, bundled_config.name]
+    license_path = PIPER_PLUS_SOURCE_ROOT / "LICENSE.md"
+    if license_path.is_file():
+        shutil.copy2(license_path, output_path.parent / license_path.name)
+        bundle_files.append(license_path.name)
+    bundle_files.append(STUDENT_MANIFEST_NAME)
+    try:
+        source_checkpoint = str(checkpoint_path.resolve().relative_to(PIPER_ROOT.resolve()))
+    except ValueError:
+        source_checkpoint = str(checkpoint_path.resolve())
+    manifest = {
+        "engine": "piper_plus",
+        "engine_label": "Piper Plus",
+        "display_name": f"{output_path.parent.name} · {precision.upper()}",
+        "model": output_path.name,
+        "config": bundled_config.name,
+        "sample_rate": 22050,
+        "quality": f"{precision}-finetuned",
+        "precision": precision,
+        "language": "ja+en+zh+es+fr+pt",
+        "license": "MIT",
+        "speaker_id": 0,
+        "runtime_requirement": f"piper-plus>={PIPER_PLUS_VERSION}",
+        "source_checkpoint": source_checkpoint,
+        "bundle_files": bundle_files,
+    }
+    (output_path.parent / STUDENT_MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output_path
+
+
+def preview_piper_plus_model(
+    model_path: Path,
+    config_path: Path,
+    text: str,
+    output_path: Path,
+    settings: dict,
+) -> Path:
+    if not piper_plus_training_available():
+        raise RuntimeError("Piper Plus 独立运行环境未安装")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = build_piper_plus_preview_command(model_path, config_path, text, output_path, settings)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    completed = subprocess.run(
+        command,
+        cwd=PIPER_PLUS_SOURCE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if completed.returncode != 0 or not output_path.is_file():
+        output_path.unlink(missing_ok=True)
+        message = (completed.stdout + "\n" + completed.stderr).strip()[-5000:]
+        raise RuntimeError(message or "Piper Plus 没有生成试听音频")
+    return output_path
+
+
+def build_piper_plus_preview_command(
+    model_path: Path,
+    config_path: Path,
+    text: str,
+    output_path: Path,
+    settings: dict,
+) -> list[str]:
+    return [
+        str(PIPER_PLUS_PYTHON),
+        "-X",
+        "utf8",
+        "-m",
+        "piper",
+        "--model",
+        str(model_path),
+        "--config",
+        str(config_path),
+        "--output_file",
+        str(output_path),
+        "--speaker",
+        str(settings.get("speaker_id") or 0),
+        "--length-scale",
+        str(settings["length_scale"]),
+        "--noise-scale",
+        str(settings["noise_scale"]),
+        "--noise-w",
+        str(settings["noise_w_scale"]),
+        "--volume",
+        str(settings["volume"]),
+        text,
+    ]
+
+
+def convert_onnx_precision(
+    source_path: Path,
+    output_path: Path,
+    precision: str,
+    *,
+    low_memory: bool = False,
+) -> Path:
     precision = str(precision).strip().lower()
     if precision not in STUDENT_EXPORT_PRECISIONS:
         raise ValueError("导出精度仅支持 FP32、FP16 或 INT8")
@@ -788,7 +1116,14 @@ def convert_onnx_precision(source_path: Path, output_path: Path, precision: str)
             from onnxruntime.transformers.float16 import convert_float_to_float16
 
             model = onnx.load(source_path)
-            converted = convert_float_to_float16(model, keep_io_types=True)
+            converted = convert_float_to_float16(
+                model,
+                keep_io_types=True,
+                # Component exports can be hundreds of MB. Shape inference
+                # duplicates the graph on Windows, while checker + runtime
+                # execution below provide the validation we need here.
+                disable_shape_infer=low_memory,
+            )
             _sort_onnx_graph(converted.graph)
             onnx.checker.check_model(converted)
             onnx.save(converted, temporary_path)
@@ -1011,7 +1346,8 @@ def export_existing_onnx_precision(artifact: dict, source_path: Path, precision:
     if precision == artifact["precision"]:
         return source_path
     output_name = safe_piper_job_name(f"{source_path.parent.name}-{source_path.stem}-{precision}")
-    output_dir = PIPER_MODELS_ROOT / output_name
+    output_root = PIPER_PLUS_MODELS_ROOT if artifact.get("engine") == "piper_plus" else PIPER_MODELS_ROOT
+    output_dir = output_root / output_name
     manifest = _read_student_manifest(source_path)
     if manifest is not None:
         output_path = output_dir / f"model.{precision}.onnx"
@@ -1087,6 +1423,51 @@ def preview_piper_checkpoint(
     cached = output_path.is_file()
     if not cached:
         piper_voice_runtime.synthesize(model_path, Path(f"{model_path}.json"), text, output_path, settings)
+    info = sf.info(output_path)
+    return {
+        "filename": output_path.name,
+        "audio_url": f"/api/piper/audio/{output_path.name}",
+        "duration": round(float(info.duration), 3),
+        "cached": cached,
+        "model": artifact["name"],
+    }
+
+
+def preview_piper_plus_checkpoint(
+    artifact: dict,
+    checkpoint_path: Path,
+    text: str,
+    settings: dict,
+) -> dict:
+    config_path = _find_piper_plus_config(checkpoint_path)
+    if config_path is None:
+        raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+    model_cache = STUDENT_PREVIEW_CACHE_ROOT / artifact["id"]
+    model_path = model_cache / "model.fp16.onnx"
+    signature_path = model_cache / "source.json"
+    signature = {
+        "checkpoint": str(checkpoint_path.resolve()),
+        "size": checkpoint_path.stat().st_size,
+        "mtime_ns": checkpoint_path.stat().st_mtime_ns,
+        "config_mtime_ns": config_path.stat().st_mtime_ns,
+    }
+    cached_signature = None
+    if signature_path.is_file():
+        try:
+            cached_signature = json.loads(signature_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if cached_signature != signature or not model_path.is_file():
+        model_cache.mkdir(parents=True, exist_ok=True)
+        export_piper_plus_checkpoint(checkpoint_path, model_path, config_path, "fp16")
+        signature_path.write_text(json.dumps(signature, ensure_ascii=False, indent=2), encoding="utf-8")
+    digest = hashlib.sha256(
+        json.dumps({"source": signature, "text": text, **settings}, sort_keys=True, ensure_ascii=True).encode("ascii")
+    ).hexdigest()[:8]
+    output_path = PIPER_OUTPUT_ROOT / f"piper-plus-ckpt-{datetime.now():%y%m%d}-{digest}.wav"
+    cached = output_path.is_file()
+    if not cached:
+        preview_piper_plus_model(model_path, model_cache / "config.json", text, output_path, settings)
     info = sf.info(output_path)
     return {
         "filename": output_path.name,
@@ -1305,6 +1686,102 @@ class MeloTrainingRuntime:
                 "auto_export": None,
                 "started_at": self._started_at or 0,
                 "engine": "sherpa_onnx",
+        }
+
+
+class PiperPlusTrainingRuntime:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+        self._logs: deque[str] = deque(maxlen=5000)
+        self._status = "idle"
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._returncode: int | None = None
+        self._job_name: str | None = None
+        self._auto_export: str | None = None
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._process is not None and self._process.poll() is None
+
+    def start(self, job_config: Path, job_name: str) -> None:
+        if not piper_plus_training_available():
+            raise RuntimeError("Piper Plus 上游训练环境未就绪。需要独立 .venv-piper-plus 与 third_party/piper-plus 源码。")
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                raise RuntimeError("Piper Plus 训练任务已经在运行")
+            python_path = PIPER_PLUS_PYTHON
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            self._process = subprocess.Popen(
+                [str(python_path), "-X", "utf8", str(ROOT / "scripts" / "train_piper_plus_local.py"), str(job_config)],
+                cwd=PIPER_PLUS_SOURCE_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self._logs.clear()
+            self._logs.append(f"Piper Plus multilingual training started: {job_name}")
+            self._status = "running"
+            self._started_at = time.time()
+            self._finished_at = None
+            self._returncode = None
+            self._job_name = job_name
+            self._auto_export = None
+            process = self._process
+        threading.Thread(target=self._read_process, args=(process,), daemon=True).start()
+
+    def _read_process(self, process: subprocess.Popen) -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            with self._lock:
+                clean_line = line.rstrip("\r\n")
+                self._logs.append(clean_line)
+                marker = "[Piper Plus] Exported student model: "
+                if clean_line.startswith(marker):
+                    self._auto_export = clean_line.removeprefix(marker).strip()
+        returncode = process.wait()
+        with self._lock:
+            stopping = self._status == "stopping"
+            self._returncode = returncode
+            self._finished_at = time.time()
+            self._status = "stopped" if stopping else "completed" if returncode == 0 else "failed"
+
+    def stop(self) -> bool:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return False
+            process = self._process
+            self._status = "stopping"
+            self._logs.append("Stopping Piper Plus training; prepared data and checkpoints will be kept.")
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            process.terminate()
+        return True
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = self._finished_at or time.time()
+            elapsed = now - self._started_at if self._started_at else 0.0
+            return {
+                "status": self._status,
+                "running": self._process is not None and self._process.poll() is None,
+                "job_name": self._job_name,
+                "returncode": self._returncode,
+                "elapsed_seconds": round(elapsed, 1),
+                "logs": "\n".join(self._logs),
+                "auto_export": self._auto_export,
+                "started_at": self._started_at or 0,
+                "engine": "piper_plus",
             }
 
 
@@ -1476,6 +1953,7 @@ sherpa_voice_runtime = SherpaVoiceRuntime()
 melo_native_voice_runtime = NativeMeloVoiceRuntime()
 piper_training = PiperTrainingRuntime()
 melo_training = MeloTrainingRuntime()
+piper_plus_training = PiperPlusTrainingRuntime()
 optimizer_head_training = OptimizerHeadTrainingRuntime()
 _release_inference: Callable[[], None] = lambda: None
 _other_training_running: Callable[[], bool] = lambda: False
@@ -1484,7 +1962,7 @@ _g2pw_local_tokenizer_configured = False
 
 
 def student_training_running() -> bool:
-    return piper_training.running or melo_training.running or optimizer_head_training.running
+    return piper_training.running or melo_training.running or piper_plus_training.running or optimizer_head_training.running
 
 
 def configure_piper_callbacks(release_inference: Callable[[], None], other_training_running: Callable[[], bool]) -> None:
@@ -1519,7 +1997,7 @@ def optimizer_index() -> FileResponse:
 @router.get("/api/piper/status")
 def piper_status() -> dict:
     artifacts = list_piper_artifacts()
-    training_states = [piper_training.snapshot(), melo_training.snapshot()]
+    training_states = [piper_training.snapshot(), melo_training.snapshot(), piper_plus_training.snapshot()]
     running_state = next((state for state in training_states if state["running"]), None)
     active_state = running_state or max(training_states, key=lambda state: state["started_at"])
     return {
@@ -1536,12 +2014,21 @@ def piper_status() -> dict:
         "default_dataset": str(DEFAULT_TRAINING_DATASET),
         "quality_profiles": QUALITY_PROFILES,
         "melo_base": melo_base_status(),
+        "piper_plus_base": piper_plus_base_status(),
+        "piper_plus_environment": piper_plus_environment_status(),
         "student_engines": [
             {"id": "piper", "label": "Piper", "trainable": True},
             {"id": "sherpa_onnx", "label": "MeloTTS 中英双语", "trainable": True},
+            {
+                "id": "piper_plus",
+                "label": "Piper Plus 多语言",
+                "trainable": piper_plus_training_available(),
+                "requires_base": True,
+            },
         ],
         "models": [item for item in artifacts if item["kind"] == "onnx"],
         "checkpoints": [item for item in artifacts if item["kind"] == "checkpoint"],
+        "piper_plus_checkpoints": [item for item in artifacts if item["kind"] == "piper_plus_checkpoint"],
         "melo_checkpoints": [item for item in artifacts if item["kind"] == "melo_checkpoint"],
         "optimizer_running": optimizer_head_training.running,
     }
@@ -1554,6 +2041,7 @@ def export_artifacts() -> dict:
         "artifacts": artifacts,
         "architectures": [
             {"id": "piper", "label": "Piper"},
+            {"id": "piper_plus", "label": "Piper Plus"},
             {"id": "melotts", "label": "MeloTTS / Sherpa-ONNX"},
         ],
         "precisions": [
@@ -1591,7 +2079,7 @@ def optimizer_status() -> dict:
         ],
         "training_precisions": ["fp32", "fp16", "bf16"],
         "export_precisions": list(STUDENT_EXPORT_PRECISIONS),
-        "blocked_by_student_training": piper_training.running or melo_training.running,
+        "blocked_by_student_training": piper_training.running or melo_training.running or piper_plus_training.running,
         "blocked_by_lora_training": _other_training_running(),
     }
 
@@ -1621,7 +2109,7 @@ async def start_optimizer_training(
 ) -> dict:
     if optimizer_head_training.running:
         raise HTTPException(status_code=409, detail="优化头任务已经在运行")
-    if piper_training.running or melo_training.running:
+    if piper_training.running or melo_training.running or piper_plus_training.running:
         raise HTTPException(status_code=409, detail="学生模型训练正在运行，请先停止或等待完成")
     if _other_training_running():
         raise HTTPException(status_code=409, detail="LoRA 训练正在运行，请先暂停")
@@ -1773,6 +2261,23 @@ async def preview_student_artifact(
                 speed=1 / length_scale,
                 volume=volume,
             )
+        if artifact["kind"] == "piper_plus_checkpoint":
+            if student_training_running():
+                raise HTTPException(status_code=409, detail="训练运行时不能试听检查点")
+            settings = {
+                "length_scale": length_scale,
+                "noise_scale": noise_scale,
+                "noise_w_scale": noise_w_scale,
+                "volume": volume,
+                "speaker_id": 0,
+            }
+            return await asyncio.to_thread(
+                preview_piper_plus_checkpoint,
+                artifact,
+                artifact_path,
+                clean_text,
+                settings,
+            )
         if artifact["kind"] != "checkpoint":
             raise ValueError("该学生资产不支持试听")
         if student_training_running():
@@ -1798,9 +2303,13 @@ async def preview_student_artifact(
 
 
 @router.post("/api/piper/dataset")
-async def piper_dataset(dataset_dir: str = Form(...)) -> dict:
+async def piper_dataset(
+    dataset_dir: str = Form(...),
+    min_duration: float = Form(0.0),
+    max_duration: float = Form(0.0),
+) -> dict:
     try:
-        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir, min_duration, max_duration)
     except (OSError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {key: value for key, value in dataset.items() if key != "records"}
@@ -1850,7 +2359,13 @@ async def piper_preview(
     try:
         artifact, model_path = resolve_piper_artifact(model_id, "onnx")
         manifest = _read_student_manifest(model_path)
-        config_path = _find_voice_config(model_path) if manifest is None else None
+        config_path = (
+            _find_piper_plus_config(model_path, manifest)
+            if artifact.get("engine") == "piper_plus"
+            else _find_voice_config(model_path)
+            if manifest is None
+            else None
+        )
         if manifest is None and config_path is None:
             raise ValueError("模型缺少运行配置")
         if artifact.get("engine") == "melo_onnx_native":
@@ -1916,6 +2431,17 @@ async def piper_preview(
                         clean_text,
                         output_path,
                         cache_settings,
+                    )
+                elif artifact.get("engine") == "piper_plus":
+                    if config_path is None:
+                        raise ValueError("Piper Plus ONNX 缺少 config.json")
+                    await asyncio.to_thread(
+                        preview_piper_plus_model,
+                        model_path,
+                        config_path,
+                        clean_text,
+                        output_path,
+                        settings,
                     )
                 else:
                     await asyncio.to_thread(
@@ -2015,11 +2541,15 @@ async def start_piper_training(
     save_every_epochs: int = Form(5),
     num_workers: int = Form(1),
     trim_silence: bool = Form(True),
+    min_duration: float = Form(0.0),
+    max_duration: float = Form(0.0),
 ) -> dict:
     if piper_training.running:
         raise HTTPException(status_code=409, detail="Piper 训练任务已经在运行")
     if melo_training.running:
         raise HTTPException(status_code=409, detail="MeloTTS 训练正在运行")
+    if piper_plus_training.running:
+        raise HTTPException(status_code=409, detail="Piper Plus 训练正在运行")
     if optimizer_head_training.running:
         raise HTTPException(status_code=409, detail="优化头训练正在运行")
     if _other_training_running():
@@ -2036,7 +2566,7 @@ async def start_piper_training(
         raise HTTPException(status_code=400, detail="学习率或验证集比例无效")
 
     try:
-        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir, min_duration, max_duration)
         if batch_size > dataset["file_count"]:
             raise ValueError("批次大小不能超过训练集条数")
         warmstart_path = None
@@ -2115,6 +2645,8 @@ async def start_piper_training(
                 "job_name": job_name,
                 "quality": quality,
                 "dataset": dataset["directory"],
+                "min_duration": min_duration,
+                "max_duration": max_duration,
                 "base_checkpoint_id": base_checkpoint_id or None,
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             },
@@ -2140,6 +2672,114 @@ async def start_piper_training(
     }
 
 
+@router.post("/api/piper-plus/base/download")
+async def download_piper_plus_training_base() -> dict:
+    if student_training_running() or _other_training_running():
+        raise HTTPException(status_code=409, detail="训练运行时不能下载 Piper Plus 基座")
+    try:
+        return {"status": "ready", "base": await asyncio.to_thread(download_piper_plus_base)}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"Piper Plus 基座下载失败: {exc}") from exc
+
+
+@router.post("/api/piper-plus/train")
+async def start_piper_plus_training(
+    dataset_dir: str = Form(...),
+    output_name: str = Form(""),
+    base_checkpoint_id: str = Form("ayousanz-piper-plus-base"),
+    num_epochs: int = Form(300),
+    learning_rate: float = Form(0.00002),
+    batch_size: int = Form(4),
+    validation_split: float = Form(0.05),
+    save_every_epochs: int = Form(25),
+    num_workers: int = Form(1),
+    min_duration: float = Form(0.0),
+    max_duration: float = Form(0.0),
+) -> dict:
+    if student_training_running():
+        raise HTTPException(status_code=409, detail="已有学生模型训练正在运行")
+    if optimizer_head_training.running or _other_training_running():
+        raise HTTPException(status_code=409, detail="其他训练任务正在运行")
+    if not torch.cuda.is_available():
+        raise HTTPException(status_code=400, detail="Piper Plus 微调需要 CUDA")
+    if not piper_plus_training_available():
+        raise HTTPException(
+            status_code=400,
+            detail="Piper Plus 上游训练环境未就绪。该项目必须使用独立环境，不能安装到主 WebUI 虚拟环境。",
+        )
+    if base_checkpoint_id in ("", "ayousanz-piper-plus-base") and not piper_plus_base_status()["installed"]:
+        raise HTTPException(status_code=400, detail="Piper Plus 多语言基座尚未下载")
+    if not 1 <= num_epochs <= 5000 or not 1 <= save_every_epochs <= num_epochs:
+        raise HTTPException(status_code=400, detail="训练轮数或保存间隔无效")
+    if (
+        not 1 <= batch_size <= 16
+        or not 1e-6 <= learning_rate <= 0.001
+        or not 0.01 <= validation_split <= 0.3
+        or not 0 <= num_workers <= 16
+    ):
+        raise HTTPException(status_code=400, detail="Piper Plus 训练参数无效")
+    try:
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir, min_duration, max_duration)
+        if batch_size > dataset["file_count"] - 1:
+            raise ValueError("批次大小不能超过扣除验证集后的训练条数")
+        if base_checkpoint_id in ("", "ayousanz-piper-plus-base"):
+            base_checkpoint = PIPER_PLUS_BASE_CHECKPOINT
+            resume_mode = "multispeaker"
+        else:
+            _, base_checkpoint = resolve_piper_artifact(base_checkpoint_id, "piper_plus_checkpoint")
+            resume_mode = "checkpoint"
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    requested_name = safe_piper_job_name(output_name)
+    job_name = requested_name if requested_name.startswith("piper-plus-") else f"piper-plus-{requested_name}"
+    job_dir = PIPER_PLUS_RUNS_ROOT / job_name
+    model_dir = PIPER_PLUS_MODELS_ROOT / job_name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_config_path = job_dir / "piper-plus-job.json"
+    job_config_path.write_text(
+        json.dumps(
+            {
+                "job_name": job_name,
+                "job_dir": str(job_dir.resolve()),
+                "model_dir": str(model_dir.resolve()),
+                "source_root": str(PIPER_PLUS_SOURCE_ROOT.resolve()),
+                "records": dataset["records"],
+                "base_checkpoint": str(base_checkpoint.resolve()),
+                "base_checkpoint_id": base_checkpoint_id or "ayousanz-piper-plus-base",
+                "resume_mode": resume_mode,
+                "num_epochs": num_epochs,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "validation_split": validation_split,
+                "save_every_epochs": save_every_epochs,
+                "num_workers": num_workers,
+                "min_duration": min_duration,
+                "max_duration": max_duration,
+                "frontend": "ja-en-zh-es-fr-pt",
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    await asyncio.to_thread(_release_inference)
+    piper_voice_runtime.release()
+    sherpa_voice_runtime.release()
+    melo_native_voice_runtime.release()
+    try:
+        piper_plus_training.start(job_config_path, job_name)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Piper Plus 训练启动失败: {exc}") from exc
+    return {
+        "status": "running",
+        "job_name": job_name,
+        "quality": "Piper Plus · 22.05kHz · MB-iSTFT-VITS2",
+        "dataset": {key: value for key, value in dataset.items() if key != "records"},
+    }
+
+
 @router.post("/api/melo/train")
 async def start_melo_training(
     dataset_dir: str = Form(...),
@@ -2155,11 +2795,15 @@ async def start_melo_training(
     segment_size: int = Form(8192),
     keep_checkpoints: int = Form(5),
     precision: str = Form("fp32"),
+    min_duration: float = Form(0.0),
+    max_duration: float = Form(0.0),
 ) -> dict:
     if melo_training.running:
         raise HTTPException(status_code=409, detail="MeloTTS 训练任务已经在运行")
     if piper_training.running:
         raise HTTPException(status_code=409, detail="Piper 训练正在运行")
+    if piper_plus_training.running:
+        raise HTTPException(status_code=409, detail="Piper Plus 训练正在运行")
     if optimizer_head_training.running:
         raise HTTPException(status_code=409, detail="优化头训练正在运行")
     if _other_training_running():
@@ -2174,7 +2818,7 @@ async def start_melo_training(
         raise HTTPException(status_code=400, detail="MeloTTS 训练精度无效")
     if not 1 <= num_epochs <= 1000 or not 1 <= save_every_epochs <= num_epochs:
         raise HTTPException(status_code=400, detail="训练轮数或保存间隔无效")
-    if not 1 <= batch_size <= 4 or not 0 <= num_workers <= 4:
+    if batch_size < 1 or not 0 <= num_workers <= 4:
         raise HTTPException(status_code=400, detail="批次大小或数据线程无效")
     if not 1e-6 <= learning_rate <= 0.001 or not 0.01 <= validation_split <= 0.3:
         raise HTTPException(status_code=400, detail="学习率或验证集比例无效")
@@ -2182,7 +2826,7 @@ async def start_melo_training(
         raise HTTPException(status_code=400, detail="音频片段或检查点保留数量无效")
 
     try:
-        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir)
+        dataset = await asyncio.to_thread(inspect_piper_dataset, dataset_dir, min_duration, max_duration)
         if batch_size > dataset["file_count"] - 1:
             raise ValueError("批次大小不能超过扣除验证集后的训练条数")
         if base_checkpoint_id in ("", "official-melotts-chinese"):
@@ -2201,10 +2845,15 @@ async def start_melo_training(
     job_dir = PIPER_RUNS_ROOT / job_name
     job_dir.mkdir(parents=True, exist_ok=True)
     job_config_path = job_dir / "melo-job.json"
+    filtered_manifest_path = job_dir / "filtered-records.jsonl"
+    write_melo_manifest(dataset, filtered_manifest_path)
     job_config = {
         "job_name": job_name,
         "job_dir": str(job_dir.resolve()),
         "dataset_dir": dataset["directory"],
+        "filtered_manifest": str(filtered_manifest_path.resolve()),
+        "min_duration": min_duration,
+        "max_duration": max_duration,
         "base_checkpoint": str(base_checkpoint.resolve()),
         "base_checkpoint_id": base_label,
         "speaker_name": "VOXCPM",
@@ -2240,6 +2889,9 @@ async def start_melo_training(
 
 @router.post("/api/piper/stop")
 def stop_piper_training() -> dict:
+    if piper_plus_training.running:
+        piper_plus_training.stop()
+        return {"status": "stopping", "engine": "piper_plus"}
     if melo_training.running:
         melo_training.stop()
         return {"status": "stopping", "engine": "sherpa_onnx"}
@@ -2254,6 +2906,26 @@ async def export_piper_artifact(artifact_id: str) -> dict:
         raise HTTPException(status_code=409, detail="训练运行时不能导出检查点")
     try:
         artifact, checkpoint_path = resolve_piper_artifact(artifact_id)
+        if artifact["kind"] == "piper_plus_checkpoint":
+            config_path = _find_piper_plus_config(checkpoint_path)
+            if config_path is None:
+                raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+            job_name = safe_piper_job_name(checkpoint_path.relative_to(PIPER_PLUS_RUNS_ROOT).parts[0])
+            output_dir = PIPER_PLUS_MODELS_ROOT / f"{job_name}-{safe_piper_job_name(checkpoint_path.stem)}-fp16"
+            output_path = output_dir / "model.fp16.onnx"
+            await asyncio.to_thread(
+                export_piper_plus_checkpoint,
+                checkpoint_path,
+                output_path,
+                config_path,
+                "fp16",
+            )
+            exported = next(
+                item
+                for item in list_piper_artifacts()
+                if item["kind"] == "onnx" and item["relative_path"] == str(output_path.relative_to(PIPER_ROOT))
+            )
+            return {"artifact": exported, "source": artifact}
         if artifact["kind"] == "melo_checkpoint":
             config_path = _find_melo_config(checkpoint_path)
             if config_path is None:
@@ -2269,7 +2941,7 @@ async def export_piper_artifact(artifact_id: str) -> dict:
             )
             return {"artifact": exported, "source": artifact}
         if artifact["kind"] != "checkpoint":
-            raise ValueError("只能导出 Piper CKPT 或 MeloTTS PTH")
+            raise ValueError("只能导出 Piper/Piper Plus CKPT 或 MeloTTS PTH")
         config_path = _find_voice_config(checkpoint_path)
         if config_path is None:
             raise ValueError("检查点目录缺少 voice.json/config.json")
@@ -2313,6 +2985,22 @@ async def export_student_artifact(artifact_id: str, precision: str = Form("int8"
                 export_melo_checkpoint,
                 source_path,
                 output_dir,
+                config_path,
+                precision,
+            )
+        elif artifact["kind"] == "piper_plus_checkpoint":
+            config_path = _find_piper_plus_config(source_path)
+            if config_path is None:
+                raise ValueError("Piper Plus 检查点目录缺少 dataset/config.json")
+            job_name = safe_piper_job_name(source_path.relative_to(PIPER_PLUS_RUNS_ROOT).parts[0])
+            output_dir = PIPER_PLUS_MODELS_ROOT / safe_piper_job_name(
+                f"{job_name}-{source_path.stem}-{precision}"
+            )
+            output_path = output_dir / f"model.{precision}.onnx"
+            await asyncio.to_thread(
+                export_piper_plus_checkpoint,
+                source_path,
+                output_path,
                 config_path,
                 precision,
             )
@@ -2362,7 +3050,8 @@ def delete_piper_artifact(artifact_id: str) -> dict:
         manifest = _read_student_manifest(path) if artifact["kind"] == "onnx" else None
         if manifest is not None:
             model_dir = path.parent.resolve()
-            if model_dir.parent != PIPER_MODELS_ROOT.resolve():
+            allowed_model_roots = (PIPER_MODELS_ROOT.resolve(), PIPER_PLUS_MODELS_ROOT.resolve())
+            if model_dir.parent not in allowed_model_roots:
                 raise ValueError("只能删除模型目录中的学生模型")
             runtime_dir = _sherpa_runtime_dir(path)
             shutil.rmtree(model_dir)
@@ -2377,6 +3066,11 @@ def delete_piper_artifact(artifact_id: str) -> dict:
             if match:
                 for prefix in ("D", "DUR"):
                     path.with_name(f"{prefix}_{match.group(1)}.pth").unlink(missing_ok=True)
+        elif artifact["kind"] == "piper_plus_checkpoint":
+            checkpoint_path = path.resolve()
+            if PIPER_PLUS_RUNS_ROOT.resolve() not in checkpoint_path.parents:
+                raise ValueError("只能删除 Piper Plus 训练目录中的检查点")
+            path.unlink()
         else:
             config_path = _find_voice_config(path) if artifact["kind"] == "onnx" else None
             path.unlink()
@@ -2394,7 +3088,7 @@ def delete_piper_artifact(artifact_id: str) -> dict:
 def download_piper_artifact(artifact_id: str) -> FileResponse:
     try:
         artifact, path = resolve_piper_artifact(artifact_id)
-        if artifact["kind"] in ("checkpoint", "melo_checkpoint"):
+        if artifact["kind"] in ("checkpoint", "melo_checkpoint", "piper_plus_checkpoint"):
             return FileResponse(path, media_type="application/octet-stream", filename=path.name)
         manifest = _read_student_manifest(path)
         if manifest is not None:
@@ -2418,7 +3112,7 @@ def download_piper_artifact(artifact_id: str) -> FileResponse:
             return FileResponse(
                 bundle_path,
                 media_type="application/zip",
-                filename=f"{path.parent.name}-sherpa-onnx.zip",
+                filename=f"{path.parent.name}-{'piper-plus' if artifact.get('engine') == 'piper_plus' else 'student'}.zip",
             )
         config_path = _find_voice_config(path)
         if config_path is None:

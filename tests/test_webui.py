@@ -1715,6 +1715,22 @@ def test_browse_batch_output_directory_endpoint_handles_cancel(monkeypatch):
     assert response.json() == {"cancelled": True}
 
 
+def test_labs_page_serves_lora_fusion_workspace():
+    response = TestClient(webui.app).get("/labs")
+
+    assert response.status_code == 200
+    assert "LoRA 融合试听" in response.text
+    assert "/api/generate" in response.text
+
+
+def test_assembly_page_serves_component_workbench():
+    response = TestClient(webui.app).get("/labs/assembly")
+
+    assert response.status_code == 200
+    assert "按当前装配推理" in response.text
+    assert "AudioVAE Decoder" in response.text
+
+
 @pytest.mark.parametrize("name", ["", "..", "角色/语音", "角色:语音", "CON", "LPT1.txt", "尾部."])
 def test_create_training_dataset_rejects_invalid_windows_names(monkeypatch, tmp_path, name):
     monkeypatch.setattr(webui, "TRAINING_DATASET_ROOT", tmp_path)

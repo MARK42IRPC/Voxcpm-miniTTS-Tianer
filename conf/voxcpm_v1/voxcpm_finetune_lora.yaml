@@ -14,6 +14,8 @@ weight_decay: 0.01
 warmup_steps: 100
 max_steps: 2000
 max_batch_tokens: 8192  # Example: single batch can have at most 16k tokens, with batch_size=4, each sample can have at most 4096 tokens
+min_duration: 0.0       # seconds; 0 disables the lower bound
+max_duration: 0.0       # seconds; 0 disables the upper bound
 save_path: /path/to/checkpoints/finetune_lora
 tensorboard: /path/to/logs/finetune_lora
 lambdas:
@@ -33,4 +35,4 @@ lora:
 # - If distribute=false (default): save pretrained_path as base_model in lora_config.json
 # - If distribute=true: save hf_model_id as base_model (hf_model_id is required)
 # hf_model_id: "openbmb/VoxCPM-0.5B"
-# distribute: true       
+# distribute: true

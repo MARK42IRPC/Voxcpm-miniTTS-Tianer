@@ -229,6 +229,7 @@
         <a href="/distill">蒸馏</a>
         <a href="/optimizer">优化头</a>
         <a href="/export">导出</a>
+        <a href="/labs">实验室</a>
       </nav>
       <div class="device-status" id="deviceStatus"><span class="status-dot"></span><span>正在检查设备</span></div>
     </div>
@@ -288,6 +289,10 @@
           <div class="field-grid">
             <div class="field"><label class="tooltip-trigger" for="loraRank" tabindex="0" data-tooltip="LoRA 低秩矩阵的容量。更高 Rank 可学习更复杂的变化，但会增加可训练参数、显存占用和检查点大小。">LoRA Rank</label><input id="loraRank" name="lora_rank" type="number" min="1" max="256" value="4"></div>
             <div class="field"><label class="tooltip-trigger" for="loraAlpha" tabindex="0" data-tooltip="LoRA 更新的缩放强度，实际缩放约为 Alpha 除以 Rank。默认 Alpha 为 Rank 的两倍。">LoRA Alpha</label><input id="loraAlpha" name="lora_alpha" type="number" min="1" max="1024" value="8"></div>
+          </div>
+          <div class="field-grid">
+            <div class="field"><label class="tooltip-trigger" for="minDuration" tabindex="0" data-tooltip="保留时长不低于此值的音频，单位为秒。设为 0 表示不设下限。提高该值可让模型更多接触完整的长句。">最小时长</label><input id="minDuration" name="min_duration" type="number" min="0" step="0.1" value="0"></div>
+            <div class="field"><label class="tooltip-trigger" for="maxDuration" tabindex="0" data-tooltip="保留时长不高于此值的音频，单位为秒。设为 0 表示不设上限。提高上限可保留长文本朗读样本，但会增加显存占用。">最大时长</label><input id="maxDuration" name="max_duration" type="number" min="0" step="0.1" value="0"></div>
           </div>
         </section>
 

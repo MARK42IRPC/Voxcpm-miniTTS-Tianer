@@ -30,16 +30,30 @@ def _load_job(path: Path) -> dict:
     return data
 
 
-def _source_records(dataset_dir: Path) -> list[tuple[Path, str]]:
+def _source_records(dataset_dir: Path, filtered_manifest: Path | None = None) -> list[tuple[Path, str]]:
     records = []
-    for wav_path in sorted(dataset_dir.glob("*.wav")):
-        lab_path = wav_path.with_suffix(".lab")
-        if not lab_path.is_file():
-            raise ValueError(f"Missing transcript: {lab_path.name}")
-        text = lab_path.read_text(encoding="utf-8-sig").strip()
-        if not text:
-            raise ValueError(f"Empty transcript: {lab_path.name}")
-        records.append((wav_path, text))
+    if filtered_manifest is not None:
+        if not filtered_manifest.is_file():
+            raise ValueError(f"Filtered dataset manifest not found: {filtered_manifest}")
+        dataset_root = dataset_dir.resolve()
+        for line_number, line in enumerate(filtered_manifest.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            wav_path = Path(str(record.get("audio", ""))).resolve()
+            text = str(record.get("text", "")).strip()
+            if wav_path.parent != dataset_root or not wav_path.is_file() or not text:
+                raise ValueError(f"Invalid filtered dataset record at line {line_number}")
+            records.append((wav_path, text))
+    else:
+        for wav_path in sorted(dataset_dir.glob("*.wav")):
+            lab_path = wav_path.with_suffix(".lab")
+            if not lab_path.is_file():
+                raise ValueError(f"Missing transcript: {lab_path.name}")
+            text = lab_path.read_text(encoding="utf-8-sig").strip()
+            if not text:
+                raise ValueError(f"Empty transcript: {lab_path.name}")
+            records.append((wav_path, text))
     if len(records) < 2:
         raise ValueError("MeloTTS training requires at least 2 WAV/LAB pairs")
     return records
@@ -60,7 +74,8 @@ def preprocess(job_path: Path) -> None:
     dataset_dir = Path(job["dataset_dir"])
     audio_dir = job_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    records = _source_records(dataset_dir)
+    manifest_value = str(job.get("filtered_manifest", "")).strip()
+    records = _source_records(dataset_dir, Path(manifest_value) if manifest_value else None)
     language = job.get("language", "ZH")
     speaker_name = job.get("speaker_name", "VOXCPM")
     sampling_rate = 44100

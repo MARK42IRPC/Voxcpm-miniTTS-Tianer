@@ -176,7 +176,7 @@
     let busy = false;
 
     function selectedArtifact() { return state?.artifacts.find((item) => item.id === selectedId) || null; }
-    function kindLabel(item) { return item.kind === "onnx" ? "ONNX" : item.kind === "melo_checkpoint" ? "Melo PTH" : "Piper CKPT"; }
+    function kindLabel(item) { return item.kind === "onnx" ? "ONNX" : item.kind === "melo_checkpoint" ? "Melo PTH" : item.kind === "piper_plus_checkpoint" ? "Piper Plus CKPT" : "Piper CKPT"; }
     function setFeedback(text, error = false) { feedback.textContent = text; feedback.classList.toggle("error", error); }
     function setBusy(value) { busy = value; previewButton.disabled = value || !selectedArtifact(); exportButton.disabled = value || !selectedArtifact() || state?.busy; refreshButton.disabled = value; }
     function formatDate(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString("zh-CN", { hour12:false }); }

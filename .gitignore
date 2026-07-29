@@ -1,5 +1,6 @@
 launch.json
 .venv/
+.venv-piper-plus/
 .tools/
 .cache/
 __pycache__
@@ -10,6 +11,9 @@ outputs/
 lora/
 piper/models/
 piper/runs/
+piper/plus-models/
+piper/plus-runs/
+piper/piper-plus-bases/
 piper/downloads/
 piper/melo-bases/
 webui-test.stdout.log
@@ -18,4 +22,6 @@ webui-runtime.stdout.log
 webui-runtime.stderr.log
 webui-live.stdout.log
 webui-live.stderr.log
+logs/
 app_local.py
+third_party/piper-plus/
